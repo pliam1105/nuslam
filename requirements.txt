@@ -1,0 +1,29 @@
+# nuslam -- monocular metric SLAM on nuScenes (GTSAM backend).
+#
+# torch / torchvision are expected from the environment (this repo was set up
+# against the system build, torch 2.9.1+cu129). Create the venv with
+# --system-site-packages to reuse it (see scripts/setup_env.sh), then:
+#     .venv/bin/pip install -r requirements.txt
+
+# --- estimator backend ---
+gtsam>=4.2                 # factor graph / ISAM2 (the author writes the factors)
+
+# --- data ---
+nuscenes-devkit>=1.1.11    # nuScenes tables, calibration, CAN-bus expansion
+numpy<2
+pyquaternion
+pillow
+
+# --- delegated frontend ---
+# CoTracker is pulled at runtime via torch.hub (facebookresearch/co-tracker);
+# only its light deps are needed here.
+transformers>=4.40         # CLIPSeg prompt-based road segmentation
+einops
+opencv-python-headless     # mask resize (system cv2 also fine)
+
+# --- viz + eval ---
+foxglove-websocket         # live 3D/image streaming to the Foxglove app
+matplotlib
+
+# --- dev ---
+pytest

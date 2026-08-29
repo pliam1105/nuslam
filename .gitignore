@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+CLAUDE.md
+
+# --- nuslam project ---
+# nuScenes install / symlink (see scripts/setup_env.sh)
+data/
+# frontend cache, figures, logs
+out/
+*.npz
+# CoTracker weights if redirected here
+torch_hub/
