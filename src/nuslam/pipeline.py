@@ -1,10 +1,9 @@
 """End-to-end orchestration: data -> frontend -> [factor graph] -> eval + viz.
 
-This is the seam wiring the author runs from step 0. It assembles a scene's
+This is the seam wired for a run from step 0. It assembles a scene's
 :class:`SlamInputs` -- keyframes, cached CoTracker tracks, road masks, IMU/wheel/
-GPS streams -- hands them to :meth:`MonocularSLAM.run` (the author's graph), and
-routes the returned :class:`SlamEstimate` into ATE/RPE eval and the trajectory
-figure.
+GPS streams -- hands them to :meth:`MonocularSLAM.run`, and routes the returned
+:class:`SlamEstimate` into ATE/RPE eval and the trajectory figure.
 
 Until the backend is written, :func:`run_scene` catches ``NotImplementedError`` and
 reports exactly what reached the seam, so the whole pipeline is verifiable before

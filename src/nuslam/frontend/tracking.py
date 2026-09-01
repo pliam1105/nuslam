@@ -13,9 +13,9 @@ across the scene instead of decaying from a single frame-0 seeding:
   with fresh Shi-Tomasi corners each frame. A fast, fully-classical baseline to
   compare against the learned tracker.
 
-Both are delegated frontend (CLAUDE.md s1): correspondence quality feeds the graph
-but neither tracker is part of the backend authorship bar. Choose with
-``TrackConfig.backend`` or :func:`make_tracker`.
+Both are delegated frontend: correspondence quality feeds the graph but neither
+tracker is estimator substance. Choose with ``TrackConfig.backend`` or
+:func:`make_tracker`.
 """
 from __future__ import annotations
 

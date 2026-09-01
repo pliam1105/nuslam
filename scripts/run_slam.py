@@ -4,10 +4,10 @@
     python scripts/run_slam.py --dataroot data/nuscenes --scene scene-0061
 
 Assembles the scene's SlamInputs (keyframes + cached CoTracker tracks + road
-masks + IMU/wheel/GPS streams), calls the author's factor graph
-(``MonocularSLAM.run``), and -- when it returns an estimate -- evaluates ATE/RPE
-against nuScenes GT and writes the trajectory figure (``--out``), optionally
-streaming the reconstruction to Foxglove (``--live``).
+masks + IMU/wheel/GPS streams), calls the factor graph (``MonocularSLAM.run``),
+and -- when it returns an estimate -- evaluates ATE/RPE against nuScenes GT and
+writes the trajectory figure (``--out``), optionally streaming the reconstruction
+to Foxglove (``--live``).
 
 Until the backend is written this reports exactly what reached the seam and
 exits cleanly, so the whole pipeline is verifiable from day one. Run
@@ -57,10 +57,10 @@ def main() -> int:
 
     if not result.backend_ready:
         print("\n" + "=" * 74)
-        print("Pipeline reached the factor-graph seam. MonocularSLAM.run is unwritten")
-        print("(core backend substance, CLAUDE.md s3 -- the author's to design).")
-        print("Everything above is live: the inputs it printed are exactly what your")
-        print("graph will receive. Implement nuslam.backend.graph.MonocularSLAM.run,")
+        print("Pipeline reached the factor-graph seam. MonocularSLAM.run is unimplemented")
+        print("(core estimator substance, left unimplemented by design).")
+        print("Everything above is live: the inputs it printed are exactly what the")
+        print("graph receives. Implement nuslam.backend.graph.MonocularSLAM.run,")
         print("then re-run this script for eval + the trajectory figure.")
         print("=" * 74)
         return 0

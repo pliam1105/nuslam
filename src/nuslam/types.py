@@ -1,12 +1,11 @@
 """Shared data types for the monocular SLAM pipeline.
 
 These are the *data contract* between the plumbing (data loading, frontend
-tracking/segmentation, viz, eval) and the estimator backend the author writes.
-They describe what is available to the graph -- calibration, keyframe images,
-tracked correspondences, ground masks, and the IMU/wheel/GPS streams -- without
+tracking/segmentation, viz, eval) and the estimator backend. They describe what
+is available to the graph -- calibration, keyframe images, tracked
+correspondences, ground masks, and the IMU/wheel/GPS streams -- without
 prescribing how the factor graph consumes them. Deciding which of these become
-variables and factors, and how, is core backend design (see CLAUDE.md s3 and
-``nuslam.backend``).
+variables and factors, and how, is core backend design (see ``nuslam.backend``).
 
 Everything here is numpy / plain Python so the contract stays framework-neutral;
 the frontend converts to torch internally only where a model needs it.
@@ -145,7 +144,7 @@ class GroundMask:
 # These back build ladder rungs 3-5 (IMU, wheel odometry, GPS). They are present
 # only if the nuScenes-CAN expansion is downloaded; the loader returns empty lists
 # otherwise (see nuslam.data.can_streams). Raw measurements only -- preintegration,
-# velocity factors and the GPS robust kernel are the author's to design.
+# velocity factors and the GPS robust kernel are part of the estimator design.
 
 
 @dataclass(frozen=True)

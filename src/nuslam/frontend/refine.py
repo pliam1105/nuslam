@@ -15,7 +15,7 @@ implicit "is this really a corner" test, so the pass is safe to run on every
 point rather than only detected corners.
 
 Pure post-process on coordinates -- visibility, seed frames and ground labels are
-untouched. Nothing here concerns the factor graph (CLAUDE.md s4 plumbing).
+untouched. Nothing here concerns the factor graph -- frontend plumbing.
 """
 from __future__ import annotations
 

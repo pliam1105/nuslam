@@ -8,7 +8,7 @@ Runs prompt-based road segmentation (CLIPSeg) and point tracking (CoTracker) ove
 a scene's CAM_FRONT keyframes and writes ``tracks.npz`` / ``masks.npz`` under the
 cache root, ready for ``scripts/run_slam.py``. With ``--preview DIR`` it also
 writes a few overlay PNGs so the mask and tracks can be verified visually before
-the graph is built on them (CLAUDE.md s7).
+the graph is built on them.
 
 First run downloads the CLIPSeg (~150 MB) and CoTracker weights.
 """

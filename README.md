@@ -6,24 +6,24 @@ estimated ground plane and constrains the vehicle's wheel-contact points to that
 plane — resolving monocular scale from semantic geometry, then fusing IMU, wheel
 odometry, and GPS in the same graph.
 
-> **Authorship note.** The estimator backend — the factor-graph design, the
-> custom ground-plane / wheel-contact factors and their Jacobians, the
-> scale-resolution logic, and the sensor fusion — is written by the author and is
-> intentionally left unimplemented here (see `CLAUDE.md` §3). This repository
-> provides everything *around* that seam: data, delegated frontend, visualization,
-> evaluation, and the orchestration that feeds the graph and renders its output.
+> **Scope.** The estimator backend — the factor-graph design, the custom
+> ground-plane / wheel-contact factors and their Jacobians, the scale-resolution
+> logic, and the sensor fusion — is core substance and is intentionally left
+> unimplemented here. This repository provides everything *around* that seam:
+> data, delegated frontend, visualization, evaluation, and the orchestration that
+> feeds the graph and renders its output.
 
-## What's built vs. what you write
+## What's built vs. what remains
 
 | Layer | Module | Status |
 |---|---|---|
-| nuScenes monocular keyframe stream + calibration/GT | `nuslam.data` | ✅ built |
-| CAN-bus IMU / wheel / GPS streams (rungs 3–5) | `nuslam.data.can_streams` | ✅ built (needs CAN download) |
-| Offline tracking (CoTracker / KLT) + CLIPSeg road masks | `nuslam.frontend` | ✅ built |
-| **Factor graph: variables, factors, Jacobians, fusion** | `nuslam.backend` | ✍️ **you** (seam only) |
-| Live Foxglove bridge + trajectory/reconstruction figures | `nuslam.viz` | ✅ built |
-| ATE / RPE vs. GT, Sim(3) scale read-out | `nuslam.eval` | ✅ built |
-| data → frontend → graph → eval + viz orchestration | `nuslam.pipeline` | ✅ built |
+| nuScenes monocular keyframe stream + calibration/GT | `nuslam.data` | built |
+| CAN-bus IMU / wheel / GPS streams (rungs 3–5) | `nuslam.data.can_streams` | built (needs CAN download) |
+| Offline tracking (CoTracker / KLT) + CLIPSeg road masks | `nuslam.frontend` | built |
+| **Factor graph: variables, factors, Jacobians, fusion** | `nuslam.backend` | **to build** (seam only) |
+| Live Foxglove bridge + trajectory/reconstruction figures | `nuslam.viz` | built |
+| ATE / RPE vs. GT, Sim(3) scale read-out | `nuslam.eval` | built |
+| data → frontend → graph → eval + viz orchestration | `nuslam.pipeline` | built |
 
 ## Setup
 
@@ -31,7 +31,7 @@ odometry, and GPS in the same graph.
 ./scripts/setup_env.sh          # venv (reuses system torch) + pip install + import check
 ```
 
-Data: the nuScenes **v1.0-mini** split. If you already have it, symlink it:
+Data: the nuScenes **v1.0-mini** split. If it is already available, symlink it:
 
 ```bash
 ln -s /path/to/nuscenes data/nuscenes
@@ -43,7 +43,7 @@ Otherwise fetch it (~4.2 GB, no login):
 ./scripts/download_data.sh data/nuscenes
 ```
 
-## Verify the plumbing (do this first — CLAUDE.md §7)
+## Verify the plumbing (do this first)
 
 ```bash
 # 1. calibration check: GT 3D boxes projected into CAM_FRONT via our calib
@@ -89,25 +89,27 @@ Render a mask+tracks video from the cache: `scripts/render_frontend_video.py
 ```
 
 This assembles the scene's `SlamInputs` (keyframes + tracks + masks + IMU/wheel/
-GPS), calls `MonocularSLAM.run`, and — once you've written it — evaluates ATE/RPE
+GPS), calls `MonocularSLAM.run`, and — once it is implemented — evaluates ATE/RPE
 and writes `out/trajectory.png` (add `--live` to stream the reconstruction to
 Foxglove). Until then it prints exactly what reaches the seam and exits cleanly,
 so the whole pipeline is verifiable before a single factor exists.
 
-## Where you write the backend
+## Where the backend is built
 
 `src/nuslam/backend/`:
 
-- `graph.py` — `MonocularSLAM.run(inputs) -> SlamEstimate`. Design the state and
-  the graph here. `SlamInputs` (what you consume) and `SlamEstimate` (what viz/
-  eval consume) are the fixed contract; everything else is yours.
+- `graph.py` — `MonocularSLAM.run(inputs) -> SlamEstimate`. The state and the
+  graph are designed here. `SlamInputs` (consumed) and `SlamEstimate` (read by
+  viz/eval) are the fixed contract; everything else is open.
 - `factors.py` — `GroundPlaneFactor`, `WheelContactToPlaneFactor` stubs. Their
-  residuals and Jacobians are the deep-dive centerpiece.
+  residuals and Jacobians are the core of the metric-anchor mechanism.
 
-Follow the build ladder (`CLAUDE.md` §1): scale-free graph → **+ ground plane +
-wheel contact (scale should resolve)** → IMU → wheel odometry → GPS. The Sim(3)
-scale reported by `nuslam.eval` on rung 2 is the direct read-out of whether metric
-scale locked.
+Build ladder: scale-free graph → **+ ground plane + wheel contact (scale should
+resolve)** → IMU → wheel odometry → GPS. The monocular ambiguity is a single
+scalar (the metric scale); the remaining 6 DOF of Sim(3) are the ordinary SE(3)
+reference-frame gauge. The scalar recovered by the Sim(3) evaluation alignment in
+`nuslam.eval` on rung 2 is the direct read-out of whether that scale locked
+(≈ 1.0 = locked); once it has, an SE(3) alignment should already fit well.
 
 ### IMU / wheel / GPS (rungs 3–5)
 
@@ -124,7 +126,7 @@ src/nuslam/
   data/                  nuScenes monocular source + CAN streams
   frontend/              tracking (CoTracker + KLT), Shi-Tomasi seeding, subpixel
                          refine, CLIPSeg segmentation, on-disk cache
-  backend/               THE FACTOR GRAPH — seam only; author writes the bodies
+  backend/               the factor graph — seam only; bodies built here
   viz/                   Foxglove bridge, trajectory/reconstruction figures
   eval/                  ATE/RPE, Umeyama Sim(3) alignment
   pipeline.py            end-to-end orchestration

@@ -1,11 +1,18 @@
 """Trajectory evaluation against nuScenes ground truth (ATE / RPE).
 
-Standard SLAM metrics, plus the Umeyama alignment they need. For monocular SLAM
-the Sim(3) alignment is the important one: its recovered *scale* is the direct
-read-out of whether metric scale resolved (build ladder rung 2) -- a scale far
-from 1.0 against a metric estimate means scale did not lock.
+Standard SLAM metrics, plus the Umeyama alignment they need.
 
-Plumbing: this scores the author's estimate; it makes no estimation decisions.
+On gauge: the monocular ambiguity is a single scalar (the unknown metric scale,
+1 DOF). The full 7-DOF Sim(3) freedom of a reconstruction is that scalar plus the
+6-DOF SE(3) reference-frame gauge, and the SE(3) part is present in every SLAM
+system, metric ones included. Sim(3) enters here only as the *evaluation*
+alignment: comparing an estimate to GT must factor out the SE(3) frame offset
+always, and the scale scalar too when it is unknown. The recovered scalar is then
+the diagnostic -- on a scale-free run it is an arbitrary gauge; on a run that
+claims metric scale (build ladder rung 2+), a scalar far from 1.0 means scale did
+not lock, and an SE(3) alignment (scale fixed = 1) should already fit well.
+
+Plumbing: this scores the estimate; it makes no estimation decisions.
 """
 from __future__ import annotations
 

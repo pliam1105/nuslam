@@ -5,10 +5,10 @@ produce a per-keyframe ground mask. CLIPSeg is small (~150 MB) and prompt-driven
 which matches the project's "prompt-based road segmentation" plan and keeps the
 ground definition swappable without retraining.
 
-Delegated on purpose (CLAUDE.md s1): the mask quality gates the ground-plane /
-wheel-contact factors, so the segmentation is verified visually before the graph
-is built around it (``scripts/run_frontend.py --preview``), but the segmentation
-model itself is not part of the backend authorship bar.
+Delegated frontend: the mask quality gates the ground-plane / wheel-contact
+factors, so the segmentation is verified visually before the graph is built
+around it (``scripts/run_frontend.py --preview``). The segmentation model itself
+is not estimator substance.
 """
 from __future__ import annotations
 

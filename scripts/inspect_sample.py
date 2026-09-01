@@ -8,7 +8,7 @@ Prints keyframe count, intrinsics and per-frame GT pose deltas, then (with --out
 projects the keyframe's ground-truth 3D annotation boxes into the CAM_FRONT image
 using the calibration extracted by ``nuslam.data`` + ``nuslam.transforms``. If the
 box wireframes land on the objects, the intrinsics and the sensor->ego->global
-chain are correct -- run this before trusting anything downstream (CLAUDE.md s7).
+chain are correct -- run this before trusting anything downstream.
 """
 from __future__ import annotations
 
