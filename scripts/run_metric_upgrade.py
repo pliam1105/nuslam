@@ -92,14 +92,20 @@ def main() -> int:
         print("cache has no DA3-Base pose/intrinsics -- run run_recon.py (not run_depth.py) first")
         return 1
 
-    # Per-frame mismatch M_i = K_true^{-1} K_da3_i, and the focal spread across frames.
+    # Per-frame mismatch M_i = K_true^{-1} K_da3_i. These enter the DAQ per camera
+    # (each folded into its own P~_i) and NEED NOT be equal -- DA3's per-frame focal
+    # is expected to drift. The block form H = [[M,0],[v^T,s]] uses one M: the
+    # REFERENCE (first) camera's, in the gauge where camera 0 is canonical (the
+    # other cameras' K_da3 live in their P~_i). Feasibility hinges on DA3 being
+    # projectively self-consistent -- read off the DAQ residual / Sim(3) below, not
+    # the focal spread.
     K_true = frames[0][0].calib.intrinsic
     Ms = [np.linalg.inv(K_true) @ dm.intrinsic for _, dm in frames]
     f_da3 = np.array([dm.intrinsic[0, 0] for _, dm in frames])
     print(f"scene {scene_name!r}: {len(frames)} frames")
     print(f"K_da3 focal: mean={f_da3.mean():.0f}  std={f_da3.std():.0f}  "
-          f"spread={100 * f_da3.std() / f_da3.mean():.1f}%   (single-M premise wants this small)")
-    M = np.median(np.stack(Ms), axis=0)  # plumbing default; the M choice is a core design call
+          f"spread={100 * f_da3.std() / f_da3.mean():.1f}%   (drift expected; per-camera known)")
+    M = Ms[0]  # reference-camera M for the block form; the M choice is a core design call
 
     def stage(name, fn):
         try:

@@ -18,19 +18,29 @@ Setting.
   related to it by a single 4x4 homography ``H``.
 
 The geometry to derive and defend (the reason each function exists).
-  * Normalize each DA3 camera by the true intrinsics:
-        P~_i = K_true^{-1} K_da3 [R_i | t_i] = M [R_i | t_i],   M = K_true^{-1} K_da3.
-    ``M`` is the residual (known) intrinsic mismatch. The metric target camera
-    ``[R_i* | t_i*]`` is calibrated (DIAC = I), and  P~_i = [R_i*|t_i*] H  with
-        H = [[ M,  0 ],
-             [ v^T, s ]].
+  * Normalize each DA3 camera by the true intrinsics, PER FRAME:
+        P~_i = K_true^{-1} K_da3_i [R_i | t_i] = M_i [R_i | t_i],  M_i = K_true^{-1} K_da3_i.
+    Each ``M_i`` is a per-frame (known) mismatch; they NEED NOT be equal -- DA3's
+    focal drifts per frame, and that is fine because each is folded into its own
+    known ``P~_i``. Every ``P~_i`` equals a calibrated metric camera times ONE
+    world homography, ``P~_i = [R_i*|t_i*] H_w`` (``[R_i*|t_i*]`` calibrated, so
+    DIAC = I). ``H_w`` is single because DA3-Base outputs one jointly-consistent
+    reconstruction (a single 3-space transform maps it to the true metric scene).
   * Dual absolute quadric in the projective frame:
-        Omega*_proj = H^{-1} diag(1,1,1,0) H^{-T}.
+        Omega*_proj = H_w^{-1} diag(1,1,1,0) H_w^{-T}.
     It satisfies, for every camera and up to a per-camera scale,
-        P~_i Omega*_proj P~_i^T = lambda_i^2 I.
-    The mismatch ``M`` is absorbed into Omega*_proj (its conic part / H's top-left
-    block); the plane at infinity ``pi_inf = (v, s)`` is its null space (H's
-    bottom row).
+        P~_i Omega*_proj P~_i^T = lambda_i^2 I,
+    with the per-frame ``K_da3_i`` KNOWN and living in each ``P~_i`` -- so the
+    single unknown is ``Omega*_proj``, over-determined by the frames.
+  * Recovering ``H_w`` from ``Omega*_proj``: the plane at infinity
+    ``pi_inf = (v, s)`` is its null space. In the reference-camera gauge (fix the
+    projective frame so camera 0 is canonical) ``H_w`` takes the block form
+    ``H = [[M_0, 0], [v^T, s]]`` with ``M_0`` the REFERENCE camera's mismatch; the
+    other cameras' ``K_da3_i`` remain in their ``P~_i``. Equivalently, recover the
+    general ``H_w`` from ``Omega*_proj`` directly (then the ``M_0`` block is a
+    consistency check, not an input). The reference-M block form is what the
+    ``M``-taking helpers below assume; ``normalized_projective_camera`` is still
+    called per frame with each ``K_da3_i``.
   * Eliminate the nuisance scale lambda_i^2 by encoding "proportional to I"
     (off-diagonals zero + diagonals equal) rather than "equals lambda_i^2 I".
     Each such constraint is linear and homogeneous in Omega*_proj, so it stacks
@@ -47,11 +57,14 @@ The geometry to derive and defend (the reason each function exists).
     resolved separately by the ground / wheel anchor.
 
 Caveat to keep in view.
-  A single ``Omega*_proj`` (hence a single ``H``) exists only if a single ``M``
-  relates DA3 to the truth. If ``K_da3`` drifts per frame, ``M_i`` varies, no
-  single quadric fits, and the DLT's "proportional to I" residual -- together
-  with the null-space eigenvalue gap -- will not collapse. Those two numbers are
-  the live test of whether the single-homography premise holds on real output.
+  A single ``Omega*_proj`` (hence a single ``H_w``) exists iff DA3's reconstruction
+  is projectively self-consistent with the true scene -- NOT a condition on the
+  per-frame ``K_da3_i`` (those may drift freely; each is known). A joint
+  reconstruction should satisfy this; when it does not (DA3's cameras + depth are
+  mutually inconsistent), no single quadric fits and the DLT's "proportional to I"
+  residual, together with the null-space eigenvalue gap, will not collapse. Those
+  two numbers -- plus the post-upgrade reprojection / Sim(3) error -- are the live
+  test, and the focal spread of ``K_da3`` is NOT (drift is expected and harmless).
 """
 from __future__ import annotations
 
@@ -122,15 +135,17 @@ def plane_at_infinity(omega_star: np.ndarray) -> np.ndarray:
 
 
 def rectifying_homography(pi_inf: np.ndarray, M: np.ndarray) -> np.ndarray:
-    """Assemble the rectifying homography ``H = [[M, 0], [v^T, s]]``.
+    """Assemble the rectifying homography ``H = [[M, 0], [v^T, s]]`` (reference gauge).
 
-    ``M`` is known (``K_true^{-1} K_da3``); ``(v, s)`` come from
-    :func:`plane_at_infinity`. ``H`` upgrades projective points to metric
-    (``X_metric = H X_proj``).
+    ``M`` is the REFERENCE camera's known mismatch ``M_0 = K_true^{-1} K_da3_0``
+    (the block form holds in the gauge where camera 0 is canonical); ``(v, s)``
+    come from :func:`plane_at_infinity`. ``H`` upgrades projective points to metric
+    (``X_metric = H X_proj``). If instead recovering the general ``H_w`` directly
+    from ``Omega*_proj``, this helper is unused and ``M_0`` becomes a check.
 
     Args:
         pi_inf: (4,) ``(v, s)`` from :func:`plane_at_infinity`.
-        M:      (3, 3) known intrinsic mismatch ``K_true^{-1} K_da3``.
+        M:      (3, 3) reference-camera mismatch ``K_true^{-1} K_da3_0``.
 
     Returns:
         (4, 4) rectifying homography ``H``.
@@ -142,11 +157,13 @@ def metric_upgrade(cameras: np.ndarray, M: np.ndarray) -> np.ndarray:
     """End-to-end: normalized projective cameras + known ``M`` -> rectifier ``H``.
 
     Ties :func:`build_daq_system` -> :func:`solve_daq` -> :func:`plane_at_infinity`
-    -> :func:`rectifying_homography`.
+    -> :func:`rectifying_homography`. The per-frame ``K_da3_i`` are already in
+    ``cameras``; ``M`` here is only the reference-camera block for
+    :func:`rectifying_homography` (or drop it and recover ``H_w`` from ``Omega*``).
 
     Args:
-        cameras: (N, 3, 4) normalized projective cameras ``P~_i``.
-        M:       (3, 3) known intrinsic mismatch ``K_true^{-1} K_da3``.
+        cameras: (N, 3, 4) normalized projective cameras ``P~_i`` (per-frame K_da3).
+        M:       (3, 3) reference-camera mismatch ``K_true^{-1} K_da3_0``.
 
     Returns:
         (4, 4) rectifying homography ``H`` (projective -> metric).
