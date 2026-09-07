@@ -1,16 +1,16 @@
 """Output-visualization path: estimated trajectory & reconstruction vs. GT.
 
-Two renderers, both consuming a :class:`~nuslam.backend.SlamEstimate`:
+Two renderers, consuming plain arrays (estimated poses ``(T, 4, 4)`` and optional
+landmark points ``(K, 3)``) so they serve any reconstruction output:
 
 * :func:`plot_trajectory` -- static matplotlib figure (top-down + height + error),
   estimate overlaid on nuScenes ground truth after optional Sim(3)/SE(3)
-  alignment. This is the figure to eyeball after each run.
-* :func:`publish_estimate` -- push the estimate (trajectory line, landmark cloud,
-  camera pose) to a live :class:`FoxgloveBridge` so the reconstruction can be
-  inspected in 3D next to the GT trajectory.
+  alignment. The figure to eyeball after a run.
+* :func:`log_estimate` -- log the estimate (trajectory line, landmark cloud) to
+  Rerun, aligned to GT so both sit in the same world frame in the 3D view.
 
-Alignment for plotting only borrows :mod:`nuslam.eval.metrics` so the picture and
-the reported ATE agree.
+Alignment borrows :mod:`nuslam.eval.metrics` so the picture and the reported ATE
+agree. Visualization infrastructure only.
 """
 from __future__ import annotations
 
@@ -18,9 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..backend import SlamEstimate
 from ..eval.metrics import align_trajectories
-from .foxglove_bridge import FoxgloveBridge
 
 
 def _positions(poses: np.ndarray) -> np.ndarray:
@@ -29,9 +27,10 @@ def _positions(poses: np.ndarray) -> np.ndarray:
 
 
 def plot_trajectory(
-    estimate: SlamEstimate,
+    est_poses: np.ndarray,
     gt_poses: np.ndarray,
     *,
+    landmarks: np.ndarray | None = None,
     align: str = "sim3",
     save_path: Path | str | None = None,
     show: bool = False,
@@ -39,9 +38,9 @@ def plot_trajectory(
 ):
     """Render estimate vs. GT. ``align`` in {"none", "se3", "sim3"}.
 
-    ``sim3`` (default) also solves the scale factor -- the number that reveals
-    whether metric scale resolved (build ladder rung 2). The estimated scale is
-    printed in the panel title. Returns the matplotlib figure.
+    ``sim3`` (default) also solves the scale factor -- the scalar that reveals
+    whether metric scale resolved. It is printed in the panel title. Returns the
+    matplotlib figure.
     """
     import matplotlib
 
@@ -49,9 +48,8 @@ def plot_trajectory(
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    est = _positions(estimate.poses_ego2global)
+    est = _positions(est_poses)
     gt = _positions(gt_poses)[: len(est)]
-
     aligned, s, T = align_trajectories(est, gt, mode=align)
     err = np.linalg.norm(aligned - gt, axis=1)
     ate = float(np.sqrt(np.mean(err**2)))
@@ -62,9 +60,9 @@ def plot_trajectory(
     ax.plot(gt[:, 0], gt[:, 1], "-", color="0.4", lw=2, label="ground truth")
     ax.plot(aligned[:, 0], aligned[:, 1], "-", color="tab:orange", lw=1.6, label="estimate")
     ax.scatter(gt[0, 0], gt[0, 1], c="green", s=40, zorder=5, label="start")
-    if estimate.landmarks is not None:
-        lm = np.asarray(estimate.landmarks)
-        lm_h = lm @ T[:3, :3].T + T[:3, 3]  # same alignment as the trajectory
+    if landmarks is not None:
+        lm = np.asarray(landmarks)
+        lm_h = lm @ T[:3, :3].T + T[:3, 3]
         ax.scatter(lm_h[:, 0], lm_h[:, 1], s=1, c="tab:blue", alpha=0.3)
     ax.set_aspect("equal")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
@@ -82,7 +80,7 @@ def plot_trajectory(
     ax.set_xlabel("keyframe"); ax.set_ylabel("position error [m]")
     ax.set_title(f"ATE (RMSE) = {ate:.3f} m"); ax.grid(alpha=0.3)
 
-    fig.suptitle(title or "monocular SLAM: estimate vs. nuScenes GT", fontsize=12)
+    fig.suptitle(title or "monocular reconstruction: estimate vs. nuScenes GT", fontsize=12)
     fig.tight_layout()
     if save_path is not None:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -92,35 +90,37 @@ def plot_trajectory(
     return fig
 
 
-def publish_estimate(
-    bridge: FoxgloveBridge,
-    estimate: SlamEstimate,
+def log_estimate(
+    est_poses: np.ndarray,
     gt_poses: np.ndarray,
-    timestamp_us: int,
     *,
-    frame: str = "global",
+    landmarks: np.ndarray | None = None,
+    landmark_is_ground: np.ndarray | None = None,
     align: str = "sim3",
 ) -> None:
-    """Publish estimate + GT trajectory (and landmarks) to a live bridge.
+    """Log estimate + GT trajectory (and landmarks) to Rerun, aligned to GT.
 
-    The estimate is aligned to GT so both sit in the same ``global`` frame in the
-    3D panel: GT in grey, estimate in orange, landmarks as a blue cloud.
+    GT in grey, estimate in orange; landmarks as a blue cloud (ground-flagged
+    points cyan when the flag is given). Requires an active Rerun recording
+    (:func:`nuslam.viz.rerun_logging.init`).
     """
-    est = _positions(estimate.poses_ego2global)
+    from . import rerun_logging as rrlog
+
+    est = _positions(est_poses)
     gt = _positions(gt_poses)[: len(est)]
     aligned, _, T = align_trajectories(est, gt, mode=align)
 
-    bridge.publish_line("/traj/gt", frame, gt, timestamp_us, color=(0.6, 0.6, 0.6, 1.0), entity_id="gt")
-    bridge.publish_line("/traj/est", frame, aligned, timestamp_us, color=(1.0, 0.55, 0.1, 1.0), entity_id="est")
+    rrlog.log_trajectory("traj/gt", gt, color=(150, 150, 150))
+    rrlog.log_trajectory("traj/est", aligned, color=(255, 140, 25))
 
-    if estimate.landmarks is not None and len(estimate.landmarks):
-        lm = np.asarray(estimate.landmarks, dtype=np.float64)
-        lm_h = lm @ T[:3, :3].T + T[:3, 3]  # same alignment as the trajectory
-        if estimate.landmark_is_ground is not None:
-            g = estimate.landmark_is_ground.astype(bool)
+    if landmarks is not None and len(landmarks):
+        lm = np.asarray(landmarks, np.float64)
+        lm_h = lm @ T[:3, :3].T + T[:3, 3]
+        if landmark_is_ground is not None:
+            g = np.asarray(landmark_is_ground, bool)
             if g.any():
-                bridge.publish_pointcloud("/landmarks/ground", frame, lm_h[g], timestamp_us, rgb=(80, 200, 255))
+                rrlog.log_points("landmarks/ground", lm_h[g], colors=(80, 200, 255))
             if (~g).any():
-                bridge.publish_pointcloud("/landmarks/other", frame, lm_h[~g], timestamp_us, rgb=(255, 180, 60))
+                rrlog.log_points("landmarks/other", lm_h[~g], colors=(255, 180, 60))
         else:
-            bridge.publish_pointcloud("/landmarks", frame, lm_h, timestamp_us, rgb=(90, 160, 255))
+            rrlog.log_points("landmarks", lm_h, colors=(90, 160, 255))

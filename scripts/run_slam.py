@@ -6,8 +6,8 @@
 Assembles the scene's SlamInputs (keyframes + cached CoTracker tracks + road
 masks + IMU/wheel/GPS streams), calls the factor graph (``MonocularSLAM.run``),
 and -- when it returns an estimate -- evaluates ATE/RPE against nuScenes GT and
-writes the trajectory figure (``--out``), optionally streaming the reconstruction
-to Foxglove (``--live``).
+writes the trajectory figure (``--out``), optionally logging the reconstruction
+to Rerun (``--live``).
 
 Until the backend is written this reports exactly what reached the seam and
 exits cleanly, so the whole pipeline is verifiable from day one. Run
@@ -36,8 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--align", default="sim3", choices=["none", "se3", "sim3"])
     p.add_argument("--out", type=Path, default=Path("out/trajectory.png"))
-    p.add_argument("--live", action="store_true", help="also stream estimate to Foxglove")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--live", action="store_true", help="also log the estimate to a Rerun viewer")
     return p.parse_args()
 
 
@@ -67,28 +66,21 @@ def main() -> int:
 
     import numpy as np
 
-    from nuslam.viz import plot_trajectory
+    from nuslam.viz import log_estimate, plot_trajectory
     est = result.estimate
     gt = np.stack([kf.ego2global_gt.matrix() for kf in result.inputs.keyframes])
     print(f"\neval: {result.errors}")
 
-    plot_trajectory(est, gt, align=args.align, save_path=args.out,
-                    title=f"{scene}: monocular SLAM vs. GT")
+    plot_trajectory(est.poses_ego2global, gt, landmarks=est.landmarks, align=args.align,
+                    save_path=args.out, title=f"{scene}: monocular SLAM vs. GT")
     print(f"wrote {args.out}")
 
     if args.live:
-        import time
-
-        from nuslam.viz import FoxgloveBridge, publish_estimate
-        with FoxgloveBridge(port=args.port) as bridge:
-            print(f"streaming estimate to ws://localhost:{args.port} — Ctrl-C to stop")
-            try:
-                while True:
-                    publish_estimate(bridge, est, gt, result.inputs.keyframes[-1].timestamp_us,
-                                     align=args.align)
-                    time.sleep(1.0)
-            except KeyboardInterrupt:
-                print("\nstopped")
+        from nuslam.viz import rerun_logging as rrlog
+        rrlog.init(f"nuslam-{scene}", spawn=True)
+        log_estimate(est.poses_ego2global, gt, landmarks=est.landmarks,
+                     landmark_is_ground=est.landmark_is_ground, align=args.align)
+        print("logged estimate to the Rerun viewer")
     return 0
 
 

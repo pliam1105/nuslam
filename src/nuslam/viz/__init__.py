@@ -1,5 +1,5 @@
-"""Visualization: live Foxglove bridge + trajectory/reconstruction figures."""
-from .foxglove_bridge import FoxgloveBridge
-from .trajectory import plot_trajectory, publish_estimate
+"""Visualization: Rerun logging + trajectory/reconstruction figures."""
+from . import rerun_logging
+from .trajectory import log_estimate, plot_trajectory
 
-__all__ = ["FoxgloveBridge", "plot_trajectory", "publish_estimate"]
+__all__ = ["rerun_logging", "plot_trajectory", "log_estimate"]

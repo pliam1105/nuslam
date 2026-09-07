@@ -24,7 +24,7 @@ echo
 echo "verifying key imports"
 .venv/bin/python - <<'PY'
 import importlib
-for m in ["gtsam", "nuscenes", "transformers", "foxglove_websocket", "torch"]:
+for m in ["gtsam", "nuscenes", "transformers", "rerun", "torch"]:
     mod = importlib.import_module(m)
     print(f"  ok  {m:20} {getattr(mod, '__version__', '?')}")
 import torch

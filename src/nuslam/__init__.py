@@ -4,7 +4,7 @@ Package layout:
   nuslam.data      nuScenes monocular keyframe source + CAN proprio streams (plumbing)
   nuslam.frontend  offline CoTracker tracking + CLIPSeg road segmentation (delegated)
   nuslam.backend   the factor graph -- core estimator substance; seam only here
-  nuslam.viz       live Foxglove bridge + trajectory/reconstruction figures (plumbing)
+  nuslam.viz       Rerun logging (images/frusta/points/splats) + trajectory figures (plumbing)
   nuslam.eval      ATE/RPE against nuScenes GT (plumbing)
   nuslam.pipeline  data -> frontend -> [graph] -> eval + viz orchestration
 """

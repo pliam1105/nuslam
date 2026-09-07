@@ -1,16 +1,23 @@
-# nuslam -- monocular metric SLAM on nuScenes (GTSAM backend).
+# nuslam -- monocular metric Gaussian-splat reconstruction on nuScenes.
 #
 # torch / torchvision are expected from the environment (this repo was set up
 # against the system build, torch 2.9.1+cu129). Create the venv with
 # --system-site-packages to reuse it (see scripts/setup_env.sh), then:
 #     .venv/bin/pip install -r requirements.txt
 
-# --- estimator backend ---
-gtsam>=4.2                 # factor graph / ISAM2 (the author writes the factors)
+# --- differentiable rasterizer ---
+# gsplat JIT-compiles CUDA kernels against the torch build (needs a matched 12.x
+# nvcc; the system nvcc is 13.1). scripts/setup_gsplat.sh installs a CUDA 12.9
+# conda toolchain and a .pth hook so the venv builds/loads it. Run that instead of
+# a bare pip install for gsplat.
+gsplat>=1.5
+
+# --- factor-graph backend (staged extension, see CLAUDE.md s8) ---
+gtsam>=4.2                 # GTSAM / ISAM2, for the later factor-graph integration
 
 # --- data ---
 nuscenes-devkit>=1.1.11    # nuScenes tables, calibration, CAN-bus expansion
-numpy<2
+numpy<2                    # nuscenes-devkit + system cv2 are built against numpy 1.x
 pyquaternion
 pillow
 
@@ -22,7 +29,10 @@ einops
 opencv-python-headless     # mask resize (system cv2 also fine)
 
 # --- viz + eval ---
-foxglove-websocket         # live 3D/image streaming to the Foxglove app
+# rerun renders images, camera frusta, point clouds, trajectories and 3D Gaussian
+# splats natively (rr.GaussianSplats3D) -- the viewer for this project. Pulls
+# numpy>=2 by default, so keep the numpy<2 pin above after installing it.
+rerun-sdk>=0.37
 matplotlib
 
 # --- dev ---
