@@ -7,5 +7,29 @@ generated. Only the depth back-projection seam is stubbed so the surrounding viz
 and evaluation plumbing have something to call.
 """
 from .depth_init import unproject_depth_to_world
+from .metric_upgrade import (
+    build_daq_system,
+    decompose_metric_camera,
+    metric_cameras,
+    metric_depth,
+    metric_point_cloud,
+    metric_upgrade,
+    normalized_projective_camera,
+    plane_at_infinity,
+    rectifying_homography,
+    solve_daq,
+)
 
-__all__ = ["unproject_depth_to_world"]
+__all__ = [
+    "unproject_depth_to_world",
+    "normalized_projective_camera",
+    "build_daq_system",
+    "solve_daq",
+    "plane_at_infinity",
+    "rectifying_homography",
+    "metric_upgrade",
+    "metric_cameras",
+    "decompose_metric_camera",
+    "metric_depth",
+    "metric_point_cloud",
+]

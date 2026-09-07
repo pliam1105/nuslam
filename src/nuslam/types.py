@@ -149,8 +149,23 @@ class DepthMap:
     ``is_metric`` is False and the metric scale is exactly what the ground/wheel
     anchor must recover -- so the reconstruction is seeded at the wrong scale on
     purpose. ``conf`` (higher = more reliable) and ``sky`` gate which pixels to
-    trust or exclude when back-projecting. Only DA3's depth is carried here; its
-    predicted poses/gaussians are deliberately not used (DA3 is an initializer).
+    trust or exclude when back-projecting.
+
+    ``extrinsic`` and ``intrinsic`` are populated only by the DA3-Base *full*
+    reconstruction (``DA3ReconEstimator``), not by DA3Mono. They carry DA3's own
+    per-frame pose and estimated calibration:
+
+      * ``extrinsic`` (4, 4): DA3's world->camera pose ``[R_i | t_i]`` (homogeneous),
+        in DA3's own reconstruction frame. (DA3 stores extrinsics world->camera;
+        verify the convention with a reprojection before trusting it.)
+      * ``intrinsic`` (3, 3): DA3's estimated ``K_da3``, rescaled to full image
+        resolution to pair with ``depth`` and ``calib.intrinsic``.
+
+    DA3-Base is intrinsic-agnostic: ``intrinsic`` here is DA3's *own* (typically
+    wrong) estimate, NOT the true calibration. Feeding ``(extrinsic, intrinsic)``
+    plus the true ``calib.intrinsic`` into the metric upgrade
+    (``nuslam.recon.metric_upgrade``) is how the reconstruction is rectified to
+    metric. DA3's predicted gaussians remain unused.
     """
 
     token: str
@@ -158,6 +173,8 @@ class DepthMap:
     is_metric: bool = False
     conf: np.ndarray | None = None  # (H, W) float32 confidence
     sky: np.ndarray | None = None   # (H, W) bool, sky pixels to exclude
+    extrinsic: np.ndarray | None = None  # (4, 4) DA3 world->camera pose (DA3-Base only)
+    intrinsic: np.ndarray | None = None  # (3, 3) DA3 estimated K, full-res (DA3-Base only)
 
 
 # --- Proprioceptive / global streams (nuScenes-CAN + GPS) -----------------

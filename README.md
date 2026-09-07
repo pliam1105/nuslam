@@ -137,7 +137,8 @@ src/nuslam/
   backend/               factor-graph SLAM — staged extension, parked (not the current core)
   recon/                 reconstruction core (init/representation/optimization/loss) -- written by hand
 scripts/                 setup_env, setup_gsplat, download_data, inspect_sample, run_frontend,
-                         run_depth, render_frontend_video, visualize_scene, visualize_depth
+                         run_depth, run_recon (DA3-Base pose+K+depth), run_metric_upgrade,
+                         render_frontend_video, visualize_scene, visualize_depth
 tests/                   unit (transforms/metrics/cache/seeding/refine) + mini-data integration
 ```
 

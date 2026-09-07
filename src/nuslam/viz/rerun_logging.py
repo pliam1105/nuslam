@@ -121,6 +121,28 @@ def _jpeg(rgb: np.ndarray, quality: int = 90) -> bytes:
     return buf.getvalue()
 
 
+def log_estimated_camera(name: str, world_from_cam: np.ndarray, K: np.ndarray,
+                         width: int, height: int, *, channel: str = "cam") -> None:
+    """Log a recovered (estimated) camera: its pose + pinhole, under world/<name>.
+
+    For the DA3 metric-upgrade path: ``world_from_cam`` is the recovered metric
+    camera-to-world pose (4x4) and ``K`` the true intrinsics. Kept on a separate
+    entity path from the GT ego chain (``log_keyframe``) so estimate and ground
+    truth can be shown together. nuScenes camera convention is RDF.
+    """
+    from ..transforms import SE3
+
+    pose = SE3.from_matrix(np.asarray(world_from_cam, float))
+    ent = f"{WORLD}/{name}/{channel}"
+    rr.log(ent, rr.Transform3D(
+        translation=pose.t, quaternion=rr.Quaternion(xyzw=_quat_xyzw(pose.quaternion_wxyz()))))
+    rr.log(f"{ent}/image", rr.Pinhole(
+        image_from_camera=np.asarray(K, float),
+        resolution=[int(width), int(height)],
+        camera_xyz=rr.ViewCoordinates.RDF,
+    ))
+
+
 def log_trajectory(name: str, points_xyz: np.ndarray,
                    color: tuple[int, int, int] = (150, 150, 150), radius: float = 0.1) -> None:
     """Log an (N, 3) polyline (e.g. a trajectory) as a line strip under world/<name>."""

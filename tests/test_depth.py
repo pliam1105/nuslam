@@ -30,6 +30,23 @@ def test_depth_cache_no_conf_sky(tmp_path):
     cache.save_depth(tmp_path, "s", depths)
     back = cache.load_depth(tmp_path, "s")
     assert back["t"].conf is None and back["t"].sky is None
+    assert back["t"].extrinsic is None and back["t"].intrinsic is None
+
+
+def test_depth_cache_recon_pose_intrinsics(tmp_path):
+    # DA3-Base carries a world->camera pose and estimated K alongside depth.
+    rng = np.random.default_rng(3)
+    ext = np.eye(4, dtype=np.float32)
+    ext[:3, :3] = np.linalg.qr(rng.standard_normal((3, 3)))[0]
+    ext[:3, 3] = rng.standard_normal(3)
+    K = np.array([[900, 0, 800], [0, 900, 450], [0, 0, 1]], np.float32)
+    depths = [DepthMap("t0", rng.random((10, 16)).astype(np.float32),
+                       conf=rng.random((10, 16)).astype(np.float32),
+                       extrinsic=ext, intrinsic=K)]
+    cache.save_depth(tmp_path, "recon", depths)
+    back = cache.load_depth(tmp_path, "recon")["t0"]
+    assert np.allclose(back.extrinsic, ext, atol=1e-5)
+    assert np.allclose(back.intrinsic, K, atol=1e-3)
 
 
 def test_missing_depth_cache_returns_none(tmp_path):
@@ -75,10 +92,3 @@ def test_lidar_points_global(dataroot):
     # points sit near the ego's global position (a lidar sweep spans ~100 m)
     ego = kf.ego2global_gt.t
     assert np.linalg.norm(xyz.mean(0) - ego) < 100.0
-
-
-def test_recon_init_is_unimplemented():
-    from nuslam.recon import unproject_depth_to_world
-    import pytest
-    with pytest.raises(NotImplementedError):
-        unproject_depth_to_world(DepthMap("t", np.ones((10, 10), np.float32)), None)

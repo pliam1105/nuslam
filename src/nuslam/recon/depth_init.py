@@ -1,4 +1,4 @@
-"""Depth back-projection -- CORE INITIALIZATION, written by hand.
+"""Depth back-projection -- CORE INITIALIZATION.
 
     ############################################################################
     #  Seeding the reconstruction from monocular depth is core representation/  #
@@ -31,12 +31,16 @@ def unproject_depth_to_world(
     depth_map: DepthMap, keyframe: Keyframe, *, stride: int = 8,
     conf_thresh: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Back-project a depth map to a world-frame RGB point cloud. Written by hand.
-
-    See module banner. Left unimplemented by design.
-    """
-    raise NotImplementedError(
-        "unproject_depth_to_world is core initialization (the monocular-depth "
-        "back-projection). It is derived and written here, not generated. Fill in "
-        "the pixel->3D unprojection + world transform; the viz and init both call it."
-    )
+    """Back-project a depth map to a world-frame RGB point cloud. Written by hand."""
+    img = keyframe.image() # (H,W,3)
+    vv, uu = np.meshgrid(np.arange(img.shape[0]), np.arange(img.shape[1]), indexing='ij')
+    img_coords = np.stack([uu, vv, np.ones_like(uu)], axis=-1) # (H,W,3)
+    depth = depth_map.depth.reshape(img.shape[0], img.shape[1], 1, 1)
+    img_coords = img_coords.reshape(img.shape[0], img.shape[1], 3, 1)
+    pts_camera = (depth * np.linalg.inv(keyframe.calib.intrinsic).reshape(1,1,3,3) @ img_coords).reshape(-1,3,1) # (N,3,1)
+    pts_camera_norm = np.concatenate([pts_camera, np.ones_like(pts_camera)[:,0:1,:]], axis=1) # (N,4,1)
+    pts_world_norm = keyframe.ego2global_gt.matrix().reshape(1,4,4) @ keyframe.calib.sensor2ego.matrix().reshape(1,4,4) @ pts_camera_norm
+    pts_world = pts_world_norm[:,:3,0]/pts_world_norm[:,3:,0] # (N,3)
+    colors_rgb = img.reshape(-1,3)
+    pts_mask = (((depth_map.conf is None) or (depth_map.conf > conf_thresh)) & (~depth_map.sky) & ((uu % stride) == 0) & ((vv % stride) == 0)).reshape(-1)
+    return pts_world[pts_mask], colors_rgb[pts_mask]

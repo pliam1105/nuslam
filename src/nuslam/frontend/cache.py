@@ -110,9 +110,13 @@ def load_masks(cache_root: Path | str, scene_name: str) -> dict[str, GroundMask]
 def save_depth(cache_root: Path | str, scene_name: str, depths: list[DepthMap]) -> Path:
     path = scene_dir(cache_root, scene_name) / "depth.npz"
     # depth as float16 (relative, coarse init -- half precision is ample and halves
-    # the file); conf quantized to uint8; sky packed as bits.
+    # the file); conf quantized to uint8; sky packed as bits. Camera pose/intrinsic
+    # (DA3-Base only) kept at float32 -- tiny (N*4*4 + N*3*3) and precision matters
+    # for the metric upgrade.
     have_conf = bool(depths) and depths[0].conf is not None
     have_sky = bool(depths) and depths[0].sky is not None
+    have_ext = bool(depths) and depths[0].extrinsic is not None
+    have_int = bool(depths) and depths[0].intrinsic is not None
     np.savez_compressed(
         path,
         tokens=np.asarray([d.token for d in depths]),
@@ -122,6 +126,10 @@ def save_depth(cache_root: Path | str, scene_name: str, depths: list[DepthMap]) 
               if have_conf else np.asarray([], dtype=np.uint8)),
         sky=(np.stack([d.sky for d in depths]).astype(bool) if have_sky
              else np.asarray([], dtype=bool)),
+        extrinsic=(np.stack([d.extrinsic for d in depths]).astype(np.float32) if have_ext
+                   else np.asarray([], dtype=np.float32)),
+        intrinsic=(np.stack([d.intrinsic for d in depths]).astype(np.float32) if have_int
+                   else np.asarray([], dtype=np.float32)),
     )
     return path
 
@@ -134,6 +142,8 @@ def load_depth(cache_root: Path | str, scene_name: str) -> dict[str, DepthMap] |
     z = np.load(path, allow_pickle=False)
     tokens = [str(t) for t in z["tokens"]]
     depth, is_metric, conf, sky = z["depth"], z["is_metric"], z["conf"], z["sky"]
+    ext = z["extrinsic"] if "extrinsic" in z.files else np.asarray([])
+    ins = z["intrinsic"] if "intrinsic" in z.files else np.asarray([])
     out: dict[str, DepthMap] = {}
     for i, tok in enumerate(tokens):
         sky_i = sky[i].astype(bool) if sky.size else None
@@ -143,5 +153,7 @@ def load_depth(cache_root: Path | str, scene_name: str) -> dict[str, DepthMap] |
             is_metric=bool(is_metric[i]),
             conf=(None if conf.size == 0 else conf[i].astype(np.float32) / 255.0),
             sky=sky_i,
+            extrinsic=(None if ext.size == 0 else ext[i].astype(np.float32)),
+            intrinsic=(None if ins.size == 0 else ins[i].astype(np.float32)),
         )
     return out

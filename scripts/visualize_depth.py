@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save", type=Path, default=None, help="write a .rrd instead of spawning a viewer")
     p.add_argument("--connect", default=None, help="gRPC url of a running Rerun viewer")
     p.add_argument("--stride", type=int, default=8, help="depth pixel stride (viz density)")
+    p.add_argument("--point-size", type=float, default=0.05,
+                   help="depth point radius; >0 = metres, <0 = screen pixels")
+    p.add_argument("--lidar-size", type=float, default=0.03, help="lidar point radius (metres if >0)")
     p.add_argument("--max-frames", type=int, default=None)
     return p.parse_args()
 
@@ -65,11 +68,11 @@ def main() -> int:
         rrlog.set_time(kf.frame_index, kf.timestamp_us, t0)
         lidar_xyz = lidar_points_global(source, kf)
         if len(lidar_xyz):
-            rrlog.log_points(f"lidar/{i:03d}", lidar_xyz, colors=(190, 190, 190), radii=0.03)
+            rrlog.log_points(f"lidar/{i:03d}", lidar_xyz, colors=(190, 190, 190), radii=args.lidar_size)
         if depth is not None and depth_ok and kf.token in depth:
             try:
                 pts, cols = unproject_depth_to_world(depth[kf.token], kf, stride=args.stride)
-                rrlog.log_points(f"depth/{i:03d}", pts, colors=cols, radii=0.05)
+                rrlog.log_points(f"depth/{i:03d}", pts, colors=cols, radii=args.point_size)
             except NotImplementedError as exc:
                 depth_ok = False
                 if not warned:

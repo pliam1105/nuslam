@@ -6,7 +6,7 @@ imports are lazy at call time so importing this package pulls neither torch nor
 transformers.
 """
 from . import cache, refine, seeding
-from .depth import DepthConfig, DepthEstimator
+from .depth import DA3ReconEstimator, DepthConfig, DepthEstimator, ReconConfig
 from .refine import RefineConfig, refine_tracks_subpixel
 from .segmentation import RoadSegmenter, SegConfig
 from .seeding import SeedConfig
@@ -24,6 +24,8 @@ __all__ = [
     "SegConfig",
     "DepthEstimator",
     "DepthConfig",
+    "DA3ReconEstimator",
+    "ReconConfig",
     "cache",
     "seeding",
     "refine",
