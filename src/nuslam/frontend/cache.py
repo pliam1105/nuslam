@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..types import GroundMask, TrackSet
+from ..types import DepthMap, GroundMask, TrackSet
 
 
 def scene_dir(cache_root: Path | str, scene_name: str) -> Path:
@@ -101,5 +101,47 @@ def load_masks(cache_root: Path | str, scene_name: str) -> dict[str, GroundMask]
             token=tok,
             mask=masks[i],
             prob=(None if probs_u8.size == 0 else probs_u8[i].astype(np.float32) / 255.0),
+        )
+    return out
+
+
+# ---- depth ---------------------------------------------------------------
+
+def save_depth(cache_root: Path | str, scene_name: str, depths: list[DepthMap]) -> Path:
+    path = scene_dir(cache_root, scene_name) / "depth.npz"
+    # depth as float16 (relative, coarse init -- half precision is ample and halves
+    # the file); conf quantized to uint8; sky packed as bits.
+    have_conf = bool(depths) and depths[0].conf is not None
+    have_sky = bool(depths) and depths[0].sky is not None
+    np.savez_compressed(
+        path,
+        tokens=np.asarray([d.token for d in depths]),
+        depth=np.stack([d.depth for d in depths]).astype(np.float16),
+        is_metric=np.asarray([d.is_metric for d in depths], dtype=bool),
+        conf=(np.stack([np.clip(d.conf, 0, 1) * 255 for d in depths]).round().astype(np.uint8)
+              if have_conf else np.asarray([], dtype=np.uint8)),
+        sky=(np.stack([d.sky for d in depths]).astype(bool) if have_sky
+             else np.asarray([], dtype=bool)),
+    )
+    return path
+
+
+def load_depth(cache_root: Path | str, scene_name: str) -> dict[str, DepthMap] | None:
+    """Return a ``token -> DepthMap`` dict, or None if not cached."""
+    path = Path(cache_root) / scene_name / "depth.npz"
+    if not path.is_file():
+        return None
+    z = np.load(path, allow_pickle=False)
+    tokens = [str(t) for t in z["tokens"]]
+    depth, is_metric, conf, sky = z["depth"], z["is_metric"], z["conf"], z["sky"]
+    out: dict[str, DepthMap] = {}
+    for i, tok in enumerate(tokens):
+        sky_i = sky[i].astype(bool) if sky.size else None
+        out[tok] = DepthMap(
+            token=tok,
+            depth=depth[i].astype(np.float32),
+            is_metric=bool(is_metric[i]),
+            conf=(None if conf.size == 0 else conf[i].astype(np.float32) / 255.0),
+            sky=sky_i,
         )
     return out

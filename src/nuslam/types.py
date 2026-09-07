@@ -140,6 +140,26 @@ class GroundMask:
         return self.mask[y, x]
 
 
+@dataclass(frozen=True)
+class DepthMap:
+    """Per-keyframe monocular depth (from Depth Anything 3), for initialization.
+
+    ``depth`` is (H, W) float32 at the keyframe's full image resolution, paired
+    with ``calib.intrinsic``. From DA3Mono it is RELATIVE (scale-ambiguous):
+    ``is_metric`` is False and the metric scale is exactly what the ground/wheel
+    anchor must recover -- so the reconstruction is seeded at the wrong scale on
+    purpose. ``conf`` (higher = more reliable) and ``sky`` gate which pixels to
+    trust or exclude when back-projecting. Only DA3's depth is carried here; its
+    predicted poses/gaussians are deliberately not used (DA3 is an initializer).
+    """
+
+    token: str
+    depth: np.ndarray  # (H, W) float32, relative unless is_metric
+    is_metric: bool = False
+    conf: np.ndarray | None = None  # (H, W) float32 confidence
+    sky: np.ndarray | None = None   # (H, W) bool, sky pixels to exclude
+
+
 # --- Proprioceptive / global streams (nuScenes-CAN + GPS) -----------------
 # These back build ladder rungs 3-5 (IMU, wheel odometry, GPS). They are present
 # only if the nuScenes-CAN expansion is downloaded; the loader returns empty lists

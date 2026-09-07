@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scene", default=None, help="scene name/token (default: first)")
     p.add_argument("--camera", default="CAM_FRONT")
     p.add_argument("--index", type=int, default=0, help="keyframe index within scene")
+    p.add_argument("--lidar", action="store_true", help="also overlay projected lidar (depth-colored)")
     p.add_argument("--out", type=Path, help="write the calibration-overlay PNG here")
     return p.parse_args()
 
@@ -97,11 +98,18 @@ def main() -> int:
                 for a, b in _EDGES:
                     ax.plot([uv[a, 0], uv[b, 0]], [uv[a, 1], uv[b, 1]], color="lime", lw=1.2)
                 drawn += 1
+        title = f"{scene} kf{kf.frame_index} — {drawn} GT boxes projected via our calib"
+        if args.lidar:
+            from nuslam.data import project_lidar_to_camera
+            uv_l, depth_l = project_lidar_to_camera(source, kf)
+            if len(depth_l):
+                ax.scatter(uv_l[:, 0], uv_l[:, 1], c=depth_l, s=2, cmap="turbo", alpha=0.6)
+                title += f" + {len(depth_l)} lidar pts"
         ax.set_xlim(0, kf.calib.width); ax.set_ylim(kf.calib.height, 0)
-        ax.set_title(f"{scene} kf{kf.frame_index} — {drawn} GT boxes projected via our calib", fontsize=10)
+        ax.set_title(title, fontsize=10)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(args.out, dpi=110, bbox_inches="tight")
-        print(f"\nwrote {args.out}  ({drawn} boxes drawn) — verify wireframes sit on objects")
+        print(f"\nwrote {args.out}  ({drawn} boxes drawn) — verify wireframes/points sit on objects")
     return 0
 
 

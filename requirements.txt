@@ -25,7 +25,8 @@ pillow
 # CoTracker is pulled at runtime via torch.hub (facebookresearch/co-tracker);
 # only its light deps are needed here.
 transformers>=4.40         # CLIPSeg prompt-based road segmentation
-einops
+depth-anything-3           # DA3Mono-Large (Apache-2.0) monocular depth for init
+einops>=0.7                # DA3 needs einops.einsum (>=0.6)
 opencv-python-headless     # mask resize (system cv2 also fine)
 
 # --- viz + eval ---

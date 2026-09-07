@@ -44,7 +44,9 @@ read-out of whether it locked (≈ 1.0 = locked).
 | Layer | Module | Status |
 |---|---|---|
 | nuScenes monocular keyframe stream + calibration/GT + windowing | `nuslam.data` | infrastructure (built) |
+| Monocular depth for init (Depth Anything 3) | `nuslam.frontend` | infrastructure (built) |
 | Road/ground segmentation (CLIPSeg) + optional tracking (CoTracker/KLT) | `nuslam.frontend` | infrastructure (built) |
+| Lidar-into-camera projection: calib check + depth-vs-lidar eval | `nuslam.data` / `nuslam.eval` | infrastructure (built) |
 | **Gaussian-splat reconstruction: representation, gsplat calls, training loop, pose refinement, losses, scale** | — | **core substance (written by hand)** |
 | Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure (built) |
 | Scale-vs-GT + ATE/RPE on refined poses | `nuslam.eval` | infrastructure (built) |
@@ -85,7 +87,13 @@ Order matters: clean masks and correct geometry before any modelling.
 # 2. road/ground masks (+ optional tracks), cached and previewed
 .venv/bin/python scripts/run_frontend.py --scene scene-0061 --preview out/frontend_preview
 
-# 3. raw-data view in Rerun (poses, camera frustum, image; --masks overlays ground)
+# 3. DA3 monocular depth for init, cached; preview also scores recovered scale vs lidar
+.venv/bin/python scripts/run_depth.py --scene scene-0061 --preview out/depth_preview
+
+# 4. calibration via lidar: projected lidar (depth-colored) should sit on structure
+.venv/bin/python scripts/inspect_sample.py --scene scene-0061 --index 10 --lidar --out out/calib_lidar.png
+
+# 5. raw-data view in Rerun (poses, camera frustum, image; --masks overlays ground)
 .venv/bin/python scripts/visualize_scene.py --scene scene-0061 --masks
 #    or write a shareable recording:  --save out/scene-0061.rrd  (open: .venv/bin/rerun <file>.rrd)
 ```
@@ -122,13 +130,14 @@ worked.
 src/nuslam/
   transforms.py          SE(3) helpers (numpy)
   types.py               data contract: CameraCalib, Keyframe, TrackSet, GroundMask, streams
-  data/                  nuScenes monocular source + CAN streams
-  frontend/              CLIPSeg road/ground segmentation, tracking (CoTracker + KLT), cache
+  data/                  nuScenes monocular source, CAN streams, lidar->camera projection
+  frontend/              DA3 monocular depth, CLIPSeg segmentation, tracking (CoTracker+KLT), cache
   viz/                   Rerun logging (images/frusta/points/GaussianSplats3D) + figures
-  eval/                  scale-vs-GT (Umeyama Sim(3)) + ATE/RPE
+  eval/                  scale-vs-GT (Umeyama Sim(3)) + ATE/RPE + depth-vs-lidar
   backend/               factor-graph SLAM — staged extension, parked (not the current core)
-scripts/                 setup_env, setup_gsplat, download_data, inspect_sample,
-                         run_frontend, render_frontend_video, visualize_scene
+  recon/                 reconstruction core (init/representation/optimization/loss) -- written by hand
+scripts/                 setup_env, setup_gsplat, download_data, inspect_sample, run_frontend,
+                         run_depth, render_frontend_video, visualize_scene, visualize_depth
 tests/                   unit (transforms/metrics/cache/seeding/refine) + mini-data integration
 ```
 
