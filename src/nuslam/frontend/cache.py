@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..types import DepthMap, GroundMask, TrackSet
+from ..types import DepthMap, GroundMask, MetricUpgrade, TrackSet
 
 
 def scene_dir(cache_root: Path | str, scene_name: str) -> Path:
@@ -157,3 +157,41 @@ def load_depth(cache_root: Path | str, scene_name: str) -> dict[str, DepthMap] |
             intrinsic=(None if ins.size == 0 else ins[i].astype(np.float32)),
         )
     return out
+
+
+# ---- metric upgrade (Stage 1 result) ------------------------------------
+
+def save_metric_upgrade(cache_root: Path | str, scene_name: str, mu: MetricUpgrade) -> Path:
+    """Cache the metric-upgrade result so the scale/Gaussian stages skip the resolve."""
+    path = scene_dir(cache_root, scene_name) / "metric_upgrade.npz"
+    diag_keys = np.asarray(list(mu.diagnostics.keys()))
+    diag_vals = np.asarray([float(v) for v in mu.diagnostics.values()], dtype=np.float64)
+    np.savez_compressed(
+        path,
+        tokens=np.asarray(mu.tokens),
+        H=mu.H.astype(np.float64),
+        omega_star=mu.omega_star.astype(np.float64),
+        plane_at_infinity=mu.plane_at_infinity.astype(np.float64),
+        world_from_cam=mu.world_from_cam.astype(np.float64),
+        metric_cameras=mu.metric_cameras.astype(np.float64),
+        K_recovered=mu.K_recovered.astype(np.float64),
+        K_true=mu.K_true.astype(np.float64),
+        diag_keys=diag_keys,
+        diag_vals=diag_vals,
+    )
+    return path
+
+
+def load_metric_upgrade(cache_root: Path | str, scene_name: str) -> MetricUpgrade | None:
+    """Load the cached metric upgrade, or None if not present."""
+    path = Path(cache_root) / scene_name / "metric_upgrade.npz"
+    if not path.is_file():
+        return None
+    z = np.load(path, allow_pickle=False)
+    diag = {str(k): float(v) for k, v in zip(z["diag_keys"], z["diag_vals"])}
+    return MetricUpgrade(
+        tokens=[str(t) for t in z["tokens"]],
+        H=z["H"], omega_star=z["omega_star"], plane_at_infinity=z["plane_at_infinity"],
+        world_from_cam=z["world_from_cam"], metric_cameras=z["metric_cameras"],
+        K_recovered=z["K_recovered"], K_true=z["K_true"], diagnostics=diag,
+    )

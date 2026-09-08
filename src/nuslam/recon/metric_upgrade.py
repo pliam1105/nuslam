@@ -39,8 +39,8 @@ The geometry to derive and defend (the reason each function exists).
     other cameras' ``K_da3_i`` remain in their ``P~_i``. Equivalently, recover the
     general ``H_w`` from ``Omega*_proj`` directly (then the ``M_0`` block is a
     consistency check, not an input). The reference-M block form is what the
-    ``M``-taking helpers below assume; ``normalized_projective_camera`` is still
-    called per frame with each ``K_da3_i``.
+    ``M``-taking helpers below assume; ``normalized_projective_cameras`` still
+    folds in each per-frame ``K_da3_i``.
   * Eliminate the nuisance scale lambda_i^2 by encoding "proportional to I"
     (off-diagonals zero + diagonals equal) rather than "equals lambda_i^2 I".
     Each such constraint is linear and homogeneous in Omega*_proj, so it stacks
@@ -67,26 +67,37 @@ Caveat to keep in view.
   test, and the focal spread of ``K_da3`` is NOT (drift is expected and harmless).
 """
 from __future__ import annotations
+from re import X
 
 import numpy as np
+import cv2
 
+from .depth_init import backproject_depth_to_world
 
-def normalized_projective_camera(
+def normalized_projective_cameras(
     K_true: np.ndarray, K_da3: np.ndarray, R: np.ndarray, t: np.ndarray
 ) -> np.ndarray:
-    """The DA3 camera in true-normalized coordinates: ``P~ = K_true^{-1} K_da3 [R|t]``.
+    """DA3 cameras in true-normalized coordinates: ``P~_i = K_true^{-1} K_da3_i [R_i|t_i]``.
+
+    Batched over frames. ``K_true`` is shared (static nuScenes calibration);
+    ``K_da3`` is per-frame (DA3 estimates its own, drifting, intrinsics), so each
+    ``P~_i`` folds in its OWN ``K_da3_i`` -- which is what the DAQ needs.
 
     Args:
-        K_true: (3, 3) true intrinsics (nuScenes calibration).
-        K_da3:  (3, 3) DA3-estimated intrinsics for the same frame.
-        R:      (3, 3) DA3 rotation.
-        t:      (3,)   DA3 translation.
+        K_true: (3, 3) true intrinsics (shared across frames).
+        K_da3:  (N, 3, 3) per-frame DA3-estimated intrinsics.
+        R:      (N, 3, 3) per-frame DA3 rotations.
+        t:      (N, 3)    per-frame DA3 translations.
 
     Returns:
-        (3, 4) normalized projective camera ``P~_i = M [R|t]`` with
-        ``M = K_true^{-1} K_da3``.
+        (N, 3, 4) normalized projective cameras ``P~_i = M_i [R_i|t_i]`` with
+        ``M_i = K_true^{-1} K_da3_i``.
     """
-    raise NotImplementedError("core: normalized projective camera assembly (author-written)")
+    return np.linalg.inv(K_true.reshape(1,3,3)) @ K_da3 @ np.concatenate([R, t.reshape(-1,3,1)], axis=2)
+
+def batch_outer(arr_a: np.ndarray, arr_b: np.ndarray):
+    """Given arrays with shapes (N,K), (N,M), with N being a batch dimension, return the outer product of shape (N,K,M)"""
+    return arr_a[:,:,None] @ arr_b[:,None,:]
 
 
 def build_daq_system(cameras: np.ndarray) -> np.ndarray:
@@ -102,7 +113,13 @@ def build_daq_system(cameras: np.ndarray) -> np.ndarray:
     Returns:
         (5 N, 16) matrix ``A`` with ``A vec(Omega*_proj) = 0``.
     """
-    raise NotImplementedError("core: DAQ constraint assembly (author-written)")
+    rows = []
+    rows.append(batch_outer(cameras[:,0], cameras[:,1]).reshape(-1,16))
+    rows.append(batch_outer(cameras[:,0], cameras[:,2]).reshape(-1,16))
+    rows.append(batch_outer(cameras[:,1], cameras[:,2]).reshape(-1,16))
+    rows.append(batch_outer(cameras[:,0], cameras[:,0]).reshape(-1,16)-batch_outer(cameras[:,1], cameras[:,1]).reshape(-1,16))
+    rows.append(batch_outer(cameras[:,0], cameras[:,0]).reshape(-1,16)-batch_outer(cameras[:,2], cameras[:,2]).reshape(-1,16))
+    return np.concatenate(rows, axis=0)
 
 
 def solve_daq(A: np.ndarray) -> np.ndarray:
@@ -117,7 +134,11 @@ def solve_daq(A: np.ndarray) -> np.ndarray:
     Returns:
         (4, 4) symmetric rank-3 ``Omega*_proj`` (up to scale).
     """
-    raise NotImplementedError("core: DAQ solve / rank-3 projection (author-written)")
+    U, S, Vt = np.linalg.svd(A)
+    omega_star = (Vt[-1].reshape(4,4) + Vt[-1].reshape(4,4).T)/2.0 # make symmetric
+    U_o, S_o, Vt_o = np.linalg.svd(omega_star)
+    S_o[-1] = 0 # enforce rank 3
+    return U_o @ np.diag(S_o) @ Vt_o
 
 
 def plane_at_infinity(omega_star: np.ndarray) -> np.ndarray:
@@ -131,8 +152,8 @@ def plane_at_infinity(omega_star: np.ndarray) -> np.ndarray:
     Returns:
         (4,) ``pi_inf = (v_x, v_y, v_z, s)`` (up to scale).
     """
-    raise NotImplementedError("core: plane-at-infinity / null-vector extraction (author-written)")
-
+    U_o, S_o, Vt_o = np.linalg.svd(omega_star)
+    return Vt_o[-1]*np.sign(Vt_o[-1,-1])
 
 def rectifying_homography(pi_inf: np.ndarray, M: np.ndarray) -> np.ndarray:
     """Assemble the rectifying homography ``H = [[M, 0], [v^T, s]]`` (reference gauge).
@@ -150,7 +171,7 @@ def rectifying_homography(pi_inf: np.ndarray, M: np.ndarray) -> np.ndarray:
     Returns:
         (4, 4) rectifying homography ``H``.
     """
-    raise NotImplementedError("core: rectifying-homography assembly (author-written)")
+    return np.concatenate([np.concatenate([M, np.zeros_like(M)[:, 0:1]], axis=1), pi_inf.reshape(1,4)], axis=0)
 
 
 def metric_upgrade(cameras: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -168,7 +189,10 @@ def metric_upgrade(cameras: np.ndarray, M: np.ndarray) -> np.ndarray:
     Returns:
         (4, 4) rectifying homography ``H`` (projective -> metric).
     """
-    raise NotImplementedError("core: metric-upgrade pipeline (author-written)")
+    A = build_daq_system(cameras)
+    omega_star = solve_daq(A)
+    p_inf = plane_at_infinity(omega_star)
+    return rectifying_homography(p_inf, M)
 
 
 # --------------------------------------------------------------------------- #
@@ -190,7 +214,7 @@ def metric_cameras(cameras: np.ndarray, H: np.ndarray) -> np.ndarray:
     Returns:
         (N, 3, 4) metric cameras ``P_metric,i`` (up to per-camera scale).
     """
-    raise NotImplementedError("core: apply rectifier to cameras (author-written)")
+    return cameras @ np.linalg.inv(H).reshape(1,4,4)
 
 
 def decompose_metric_camera(P_metric: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -210,7 +234,11 @@ def decompose_metric_camera(P_metric: np.ndarray) -> tuple[np.ndarray, np.ndarra
     Returns:
         ``(K (3,3), R_star (3,3), t_star (3,))``.
     """
-    raise NotImplementedError("core: metric-camera decomposition (author-written)")
+    K, R_star, C, _, _, _, _ = cv2.decomposeProjectionMatrix(P_metric)
+    K = K / K[2, 2]
+    S = np.diag(np.sign(np.diag(K)))
+    K, R_star = K @ S, S @ R_star
+    return K, R_star, (-R_star @ (C[:3,:]/C[3:,:]))[:,0]
 
 
 def metric_depth(
@@ -244,7 +272,16 @@ def metric_depth(
     Returns:
         (H, W) metric depth, paired with the true intrinsics ``K_true``.
     """
-    raise NotImplementedError("core: depth rectification through H (author-written)")
+    vv, uu = np.meshgrid(range(depth_da3.shape[0]), range(depth_da3.shape[1]), indexing='ij')
+    x = np.stack([uu, vv, np.ones_like(uu)], axis=2)[:,:,:,None] # (H,W,3,1)
+    X_cam_da3 = depth_da3[:,:,None,None] * np.linalg.inv(K_da3).reshape(1,1,3,3) @ x # (H,W,3,1)
+    X_cam_da3_norm = np.concatenate([X_cam_da3, np.ones_like(X_cam_da3)[:,:,0:1,:]], axis=2) # (H,W,4,1)
+    X_world_p_norm = np.linalg.inv(extrinsic_da3).reshape(1,1,4,4) @ X_cam_da3_norm # (H,W,4,1)
+    X_world_m_norm = H.reshape(1,1,4,4) @ X_world_p_norm # (H,W,4,1)
+    X_cam_m_norm = extrinsic_metric.reshape(1,1,4,4) @ X_world_m_norm # (H,W,4,1)
+    X_cam_m = X_cam_m_norm[:,:,:3,0]/X_cam_m_norm[:,:,3:,0] # (H,W,3)
+    d_metric = X_cam_m[:,:,2] # (H,W)
+    return d_metric
 
 
 def metric_point_cloud(
@@ -273,4 +310,6 @@ def metric_point_cloud(
     Returns:
         ``(points_world (N, 3) float, colors_rgb (N, 3) uint8)``.
     """
-    raise NotImplementedError("core: metric back-projection (author-written)")
+    return backproject_depth_to_world(
+        depth_metric, image, K_true, world_from_cam,
+        stride=stride, conf=conf, conf_thresh=conf_thresh, sky=sky)

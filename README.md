@@ -1,55 +1,83 @@
 # nuslam — monocular metric Gaussian-splat reconstruction on nuScenes
 
-Reconstruct a scene from a **single** nuScenes camera with **3D (or 2D) Gaussian
-splatting**, refine the camera poses **through the differentiable rasterizer**,
-and resolve the **monocular scale** metrically with **semantic ground
-constraints** — road/ground-segmented regions anchored to a locally estimated
-ground plane, plus the vehicle's wheel-contact points constrained to that plane.
-The metric anchor acts directly on the reconstruction, so the result is natively
-metric. Batch/windowed optimization (Adam over Gaussians + pose deltas + the
-scale/ground residuals).
+Reconstruct a scene from a **single** nuScenes camera as **3D (or 2D) Gaussians**,
+refine the camera poses **through the differentiable rasterizer**, and resolve the
+**monocular scale** metrically — never by reading it from ground truth.
 
-**The novel core.** Monocular splat-SLAM (MonoGS and similar) inherits scale
-ambiguity; resolving metric scale *inside* a Gaussian-splat reconstruction from
-semantic ground geometry is the contribution. Monocular, metric via semantic
-ground, batch-first.
+A monocular reconstruction model (Depth Anything 3, **DA3-Base**) supplies a full
+joint reconstruction — per-frame depth, pose, and intrinsics — but under a wrong,
+intrinsic-agnostic calibration. A **metric upgrade** recovers the true geometry from
+it: knowing the true intrinsics collapses the projective ambiguity to a
+**metric-up-to-scale** reconstruction via a dual-absolute-quadric (DAQ) solve. The one
+remaining scalar — global metric scale — is then resolved by **semantic ground
+constraints** (road/ground plane + wheel-contact), and independently cross-checked
+against **GPS/IMU**. The anchor acts directly on the reconstruction, so the result is
+natively metric.
 
-> **Scope of this repository.** The Gaussian-splat reconstruction itself — the
-> representation and initialization, the gsplat rasterizer calls, the training
-> loop, the pose refinement, every loss (photometric + metric-anchor) and their
-> weighting, and the scale-resolution geometry — is the core substance and is
-> written by hand; it is **not** generated and is not part of this repository's
-> code. What lives here is the surrounding infrastructure: data, segmentation,
-> visualization, evaluation, and the gsplat build toolchain. The only delegated
-> dependency is gsplat's internal CUDA kernels.
+**The novel core.** Monocular splat-SLAM (MonoGS) inherits scale ambiguity;
+uncalibrated approaches (VGGT-SLAM) inherit the full projective ambiguity. Resolving
+metric scale *inside* a splat reconstruction from semantic geometry — with known
+intrinsics collapsing projective → metric-up-to-scale first — is the contribution.
+The stratification the pipeline walks:
 
-## Two-rung structure
+```
+Projective  --known K-->  Metric-up-to-scale  --scale: ground / GPS-->  Metric
+DAQ Ω*, 15 DoF            Sim(3), 7 DoF                                 SE(3), 6 DoF
+```
 
-The scale idea is de-risked in isolation before the joint optimization:
+The full staged plan is in `Metric_Anchored_GS_SLAM_Engineering_Plan_v3.pdf` (with
+the metric-upgrade derivation in `Metric_Upgrade_Known_Intrinsics_Handbook.pdf`).
 
-1. **Rung 1 — explicit scale variable.** Up-to-scale splat reconstruction + pose
-   refinement + a single scalar metric-scale variable `s`, resolved by the
-   ground/wheel residual. Validates that the semantic constraint recovers metric
-   scale on its own (optimize `s`, compare to nuScenes GT). The safety net.
-2. **Rung 2 — constraints directly on the Gaussians.** No separate scalar; the
-   ground/wheel-contact residuals act on the Gaussians in joint optimization, so
-   the reconstruction is natively metric.
+> **Scope of this repository.** The reconstruction core — the Gaussian representation
+> and initialization, the gsplat rasterizer calls, the training loop, the pose
+> refinement, every loss (photometric + metric-anchor) and their weighting, the
+> DAQ metric-upgrade solve, and the scale-resolution geometry — is the core substance
+> and is **written by hand** (not generated). What lives here as infrastructure: data,
+> segmentation, running the delegated frontend models (depth/tracking), visualization,
+> evaluation, and the gsplat build toolchain. The only delegated dependency is gsplat's
+> internal CUDA kernels.
+>
+> **Ground truth is an oracle, never an input.** nuScenes GT poses and lidar score a
+> finished reconstruction; scale is never fitted from GT (that would be cheating).
 
-The monocular ambiguity is a single scalar (metric scale); the recovered scalar
-from the Sim(3) evaluation alignment (`nuslam.eval`) against GT is the direct
-read-out of whether it locked (≈ 1.0 = locked).
+## Pipeline (staged)
+
+Five stages; each is falsifiable on its own before the next is built. Stages 0–1 are
+built; 2–4 are the work ahead.
+
+0. **Infrastructure** *(built)* — data, frontend (depth/segmentation/tracking), lidar
+   eval, Rerun viz, gsplat toolchain.
+1. **DA3 metric upgrade** *(built + tested)* — DA3-Base reconstruction → normalized
+   projective cameras → DAQ solve for the dual absolute quadric → plane at infinity →
+   rectifying homography → metric cameras, corrected depth, and the **metric-up-to-scale**
+   point cloud. `nuslam.recon.metric_upgrade` (hand-written core).
+2. **Scale resolution** *(next)* — the one global scalar, three ways, **none using GT**:
+   **(A) road/ground + wheel-contact** on the unprojected cloud (the novel core);
+   **(B) GPS(+IMU tilt, +compass heading)** → a reference trajectory that the DA3 poses
+   are Sim(3)-fit to; **(C) joint**. The three should agree; GT scores them afterward.
+3. **Gaussian refinement** *(common tail)* — splatting with pose refinement + ground
+   constraints (photometric + metric-anchor losses, weighting schedule).
+4. **Factor-graph SLAM** *(future)* — render-as-a-factor + IMU/GPS/wheel + loop closure;
+   multi-submap; DA3-SLAM follow-on.
+
+**Route A is de-risked in two rungs:** *Rung 1* adds an explicit scalar `s` and checks it
+recovers the metric value in isolation (the core hypothesis); *Rung 2* drops the scalar and
+lets the ground/wheel residual act directly on the Gaussians, so the reconstruction is
+natively metric.
 
 ## What's built vs. what's core
 
 | Layer | Module | Status |
 |---|---|---|
 | nuScenes monocular keyframe stream + calibration/GT + windowing | `nuslam.data` | infrastructure (built) |
-| Monocular depth for init (Depth Anything 3) | `nuslam.frontend` | infrastructure (built) |
+| Monocular depth + DA3-Base full reconstruction (depth+pose+K) | `nuslam.frontend` | infrastructure (built) |
 | Road/ground segmentation (CLIPSeg) + optional tracking (CoTracker/KLT) | `nuslam.frontend` | infrastructure (built) |
 | Lidar-into-camera projection: calib check + depth-vs-lidar eval | `nuslam.data` / `nuslam.eval` | infrastructure (built) |
-| **Gaussian-splat reconstruction: representation, gsplat calls, training loop, pose refinement, losses, scale** | — | **core substance (written by hand)** |
+| **DA3 metric upgrade: DAQ solve, rectifying homography, metric cameras/depth/cloud** | `nuslam.recon.metric_upgrade` | **core (written by hand) — built + tested** |
+| **Scale resolution (road/ground + wheel-contact; GPS/IMU Sim(3) fit)** | `nuslam.recon` | **core (written by hand) — next** |
+| **Gaussian-splat reconstruction: representation, gsplat calls, training loop, pose refinement, losses** | `nuslam.recon` | **core (written by hand) — next** |
 | Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure (built) |
-| Scale-vs-GT + ATE/RPE on refined poses | `nuslam.eval` | infrastructure (built) |
+| Trajectory eval (Umeyama Sim(3)/SE(3), ATE/RPE) — GT as oracle | `nuslam.eval` | infrastructure (built) |
 | Factor-graph SLAM integration (render-as-a-factor + fusion) | `nuslam.backend` | staged extension (parked) |
 
 ## Setup
@@ -102,16 +130,42 @@ Masks land in `out/frontend_cache/<scene>/masks.npz`. Eyeball the previews —
 garbage masks give a garbage ground plane. The segmentation prompt, threshold,
 and (optional) tracker are configurable; see `scripts/run_frontend.py --help`.
 
-## Evaluation read-out
+## Metric upgrade → metric-up-to-scale reconstruction
 
-`nuslam.eval` scores a reconstruction's refined poses against nuScenes GT:
-ATE/RPE, and the Umeyama Sim(3) alignment whose recovered **scalar scale** is the
-metric-scale diagnostic (≈ 1.0 once resolved; an SE(3) alignment should then fit
-without needing to solve scale). This is the number that says whether Rung 1/2
-worked.
+```bash
+# 1. DA3-Base: cache per-frame depth + pose (frame 0 rebased to identity) + estimated K
+.venv/bin/python scripts/run_recon.py --scene scene-0061
+
+# 2. metric upgrade → metric-up-to-scale reconstruction, visualized with corrected intrinsics
+.venv/bin/python scripts/run_metric_upgrade.py --scene scene-0061 --rerun
+#    …or a shareable recording:  --save out/metric-0061.rrd   (open: .venv/bin/rerun <file>.rrd)
+```
+
+`run_metric_upgrade.py` solves the DAQ, recovers the metric cameras, and logs the
+reconstruction to Rerun (upright/horizontal view; frustum size tracks cloud depth;
+`--point-size` / `--lidar-size` / `--frustum-frac` tune the display). It prints the
+per-camera recovered `K ≈ [c, c, 1]` — the free correctness check on the upgrade — and
+notes that the global scale is **unresolved and never taken from GT**. `--eval-gt` (oracle
+only) Sim(3)-aligns to GT to print ATE and the scale the road/GPS methods should reproduce,
+and overlays lidar as a metric reference.
+
+## Evaluation read-out — ground truth as an oracle
+
+`nuslam.eval` scores a finished reconstruction against nuScenes GT (ATE/RPE, Umeyama
+alignment); **GT is never an input to scale.** The three scale-resolution routes
+(road/ground, GPS/IMU, joint) each produce the global scalar independently — and the
+experiment is that they **agree with each other**, with GT scoring all three afterward.
+The Umeyama Sim(3) scalar is a diagnostic: once scale is resolved legitimately it reads
+≈ 1.0, and an SE(3) alignment (scale fixed) should already fit.
 
 ## Guardrails worth keeping in view
 
+- **GT is an oracle, never an input to scale** — resolve scale from the ground anchor or
+  GPS/IMU; a Sim(3) fit to GT would resolve the scalar by reading the answer.
+- **Metric upgrade:** per-frame `K_da3` drift is expected and harmless (each is known and
+  folded into its own camera); the live feasibility test is the DAQ residual / null-space
+  eigenvalue gap / recovered-`K` anisotropy — **not** the focal spread. Rebase so the first
+  camera is the origin (the block-form rectifier assumes that gauge).
 - Reach **Rung 1** (does the ground/wheel anchor recover scale via explicit `s`?)
   before **Rung 2**, so a failure is the scale idea, not the joint coupling.
 - **RANSAC**, not least-squares, for the ground plane — segmentation bleeds onto
@@ -129,21 +183,25 @@ worked.
 ```
 src/nuslam/
   transforms.py          SE(3) helpers (numpy)
-  types.py               data contract: CameraCalib, Keyframe, TrackSet, GroundMask, streams
+  types.py               data contract: CameraCalib, Keyframe, TrackSet, GroundMask, DepthMap, streams
   data/                  nuScenes monocular source, CAN streams, lidar->camera projection
-  frontend/              DA3 monocular depth, CLIPSeg segmentation, tracking (CoTracker+KLT), cache
+  frontend/              DA3 monocular depth + DA3-Base reconstruction, CLIPSeg, tracking (CoTracker+KLT), cache
   viz/                   Rerun logging (images/frusta/points/GaussianSplats3D) + figures
-  eval/                  scale-vs-GT (Umeyama Sim(3)) + ATE/RPE + depth-vs-lidar
+  eval/                  Umeyama Sim(3)/SE(3) + ATE/RPE + depth-vs-lidar (GT as oracle)
   backend/               factor-graph SLAM — staged extension, parked (not the current core)
-  recon/                 reconstruction core (init/representation/optimization/loss) -- written by hand
+  recon/                 reconstruction core — written by hand
+    depth_init.py          depth back-projection (shared by viz + metric path) — built
+    metric_upgrade.py      DAQ metric upgrade → metric-up-to-scale — built + tested
+    (scale resolution, Gaussian representation/optimization/losses — to come)
 scripts/                 setup_env, setup_gsplat, download_data, inspect_sample, run_frontend,
                          run_depth, run_recon (DA3-Base pose+K+depth), run_metric_upgrade,
                          render_frontend_video, visualize_scene, visualize_depth
-tests/                   unit (transforms/metrics/cache/seeding/refine) + mini-data integration
+tests/                   unit (transforms/metrics/cache/seeding/refine/metric_upgrade) + mini-data
 ```
 
-The Gaussian-splat reconstruction (representation, gsplat calls, optimization,
-losses, scale) is written by hand and is not part of this tree.
+`recon/` is the hand-written core. The metric upgrade is in place; the scale-resolution
+routes and the Gaussian-splat reconstruction (representation, gsplat calls, optimization,
+losses) are written there next.
 
 Run the tests: `.venv/bin/python -m pytest tests/ -q` (data-dependent tests skip
 if the mini split is absent).

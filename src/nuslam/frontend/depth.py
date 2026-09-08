@@ -159,14 +159,21 @@ class DA3ReconEstimator:
                 f"{self.config.model_id} returned no extrinsics/intrinsics; a full-reconstruction "
                 "model (da3-base/-small/-large/-giant) is required, not a mono model.")
 
+        # Rebase all poses so the FIRST camera is the origin ([R_0|t_0] = [I|0]).
+        # Extrinsics are world->camera, so E_i @ inv(E_0) re-expresses every pose in
+        # camera 0's frame (E_0 -> I). The metric upgrade's block-form rectifier
+        # H = [[M_0, 0], [v^T, s]] is only valid in this gauge; DA3's raw output
+        # frame is arbitrary, so canonicalize it once here.
+        E0_inv = np.linalg.inv(self._homogenize(np.asarray(pred.extrinsics[0], np.float32)))
+
         out: list[DepthMap] = []
         for i, kf in enumerate(keyframes):
             h, w = kf.calib.height, kf.calib.width
             depth_proc = np.asarray(pred.depth[i]).squeeze()
-            depth = self._to_full(depth_proc, h, w, nearest=False)
+            depth = DepthEstimator._to_full(depth_proc, h, w, nearest=False)
             conf = None
             if self.config.keep_conf and getattr(pred, "conf", None) is not None:
-                conf = self._to_full(pred.conf[i], h, w, nearest=False).astype(np.float32)
+                conf = DepthEstimator._to_full(pred.conf[i], h, w, nearest=False).astype(np.float32)
             K = self._rescale_K(np.asarray(pred.intrinsics[i], np.float32),
                                  proc_hw=depth_proc.shape[:2], full_hw=(h, w))
             out.append(DepthMap(
@@ -175,7 +182,7 @@ class DA3ReconEstimator:
                 is_metric=bool(getattr(pred, "is_metric", False)),
                 conf=conf,
                 sky=None,  # DA3-Base does not emit a sky mask
-                extrinsic=self._homogenize(np.asarray(pred.extrinsics[i], np.float32)),
+                extrinsic=self._homogenize(np.asarray(pred.extrinsics[i], np.float32)) @ E0_inv,
                 intrinsic=K,
             ))
             log.info("recon %d/%d (depth %.2f..%.2f, f=%.1f)",

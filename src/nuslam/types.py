@@ -177,6 +177,28 @@ class DepthMap:
     intrinsic: np.ndarray | None = None  # (3, 3) DA3 estimated K, full-res (DA3-Base only)
 
 
+@dataclass(frozen=True)
+class MetricUpgrade:
+    """Result of the DA3 metric upgrade (Stage 1), cached for the scale/Gaussian stages.
+
+    Everything needed downstream so the DA3 forward pass and the DAQ solve do not
+    rerun: the rectifier ``H``, the recovered metric cameras/poses (metric up to one
+    global scale), the true intrinsics they pair with, and the solve diagnostics.
+    ``world_from_cam`` is camera->world in the metric frame (camera 0 at the origin);
+    the corrected depth for any frame is recovered from ``H`` + the cached DA3 depth.
+    """
+
+    tokens: list[str]                    # frame order (aligns the N axis)
+    H: np.ndarray                        # (4, 4) rectifier, projective -> metric
+    omega_star: np.ndarray               # (4, 4) dual absolute quadric (projective frame)
+    plane_at_infinity: np.ndarray        # (4,) (v, s)
+    world_from_cam: np.ndarray           # (N, 4, 4) recovered metric camera->world (up to global scale)
+    metric_cameras: np.ndarray           # (N, 3, 4) P_metric = P~ H^{-1}
+    K_recovered: np.ndarray              # (N, 3, 3) decomposed K (should be ~ [c, c, 1])
+    K_true: np.ndarray                   # (3, 3) true intrinsics the metric cameras use
+    diagnostics: dict = field(default_factory=dict)  # DAQ diagnostics scalars
+
+
 # --- Proprioceptive / global streams (nuScenes-CAN + GPS) -----------------
 # These back build ladder rungs 3-5 (IMU, wheel odometry, GPS). They are present
 # only if the nuScenes-CAN expansion is downloaded; the loader returns empty lists

@@ -8,17 +8,26 @@ the normalized projective cameras
 
     P~_i = K_true^{-1} K_da3_i [R_i | t_i],
 
-solves for the rectifier ``H`` (``nuslam.recon.metric_upgrade``), recovers the
-metric cameras, and wires the results downstream:
+solves for the rectifier ``H`` (``nuslam.recon.metric_upgrade``) and recovers a
+reconstruction that is **metric up to a single global scale** -- correct camera
+angles / shape, with one unresolved scalar (the monocular scale, later fixed by
+the ground/wheel anchor). It then:
 
-  * Sim(3) evaluation of the recovered trajectory against nuScenes GT (the scale
-    read-out says whether it is metric);
-  * Rerun logging of the recovered poses (frusta with the true intrinsics), the
-    estimated vs GT trajectories, and the metric depth cloud (``--rerun`` / ``--save``).
+  * visualizes the metric-up-to-scale reconstruction in Rerun -- recovered poses
+    (frusta with the true intrinsics), the trajectory, and the corrected-intrinsics
+    depth cloud (``--rerun`` / ``--save``).
 
-It also reports the per-frame focal spread of ``K_da3`` -- the single-homography
-premise holds only if a single mismatch ``M`` relates DA3 to the truth, so a large
-spread predicts a poor fit.
+The single global scale is NOT resolved here and is NEVER taken from GT (that would
+be cheating). It is resolved downstream, without GT, by either: road/ground +
+wheel-contact on the unprojected point cloud, or a Sim(3) fit of these poses to a
+GPS(+IMU) trajectory. ``--eval-gt`` (oracle only) Sim(3)-aligns to nuScenes GT to
+print ATE and the scale those legitimate methods should reproduce -- GT is a
+scoring oracle, never a scale source.
+
+It also reports the per-frame focal spread of ``K_da3`` (drift is expected and
+harmless -- each ``K_da3_i`` is known and folded into its own ``P~_i``); the live
+test of the single-homography premise is the DAQ residual / recovered-K
+anisotropy, not the focal spread.
 
 The solve itself is core (author-written); until those seams are implemented this
 prints how far it got and what is pending, without failing. Run
@@ -35,18 +44,32 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from nuslam.data import NuScenesMonoSource  # noqa: E402
-from nuslam.eval import evaluate  # noqa: E402
+from nuslam.data import NuScenesMonoSource, lidar_points_global  # noqa: E402
+from nuslam.eval import align_trajectories, evaluate, evaluate_daq  # noqa: E402
 from nuslam.frontend import cache  # noqa: E402
 from nuslam.recon import (  # noqa: E402
+    build_daq_system,
     decompose_metric_camera,
     metric_cameras,
     metric_depth,
     metric_point_cloud,
-    metric_upgrade,
-    normalized_projective_camera,
+    normalized_projective_cameras,
+    plane_at_infinity,
+    rectifying_homography,
+    solve_daq,
 )
+from nuslam.types import MetricUpgrade  # noqa: E402
 from nuslam.viz import rerun_logging as rrlog  # noqa: E402
+
+# The reconstruction lives in camera-0's frame (RDF: x right, y down, z forward),
+# so its "up" is -y and it renders tilted/sideways in a Z-up viewer. R_VIZ rotates
+# that frame to a Z-up, upright, horizontal world for viewing only:
+#   forward (cam +z) -> world +X,  up (cam -y) -> world +Z,  right (cam +x) -> world -Y.
+R_VIZ = np.array([[0.0, 0.0, 1.0],
+                  [-1.0, 0.0, 0.0],
+                  [0.0, -1.0, 0.0]])
+T_VIZ = np.eye(4)
+T_VIZ[:3, :3] = R_VIZ
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +83,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rerun", action="store_true", help="spawn a Rerun viewer with the result")
     p.add_argument("--save", type=Path, default=None, help="write a .rrd instead of spawning")
     p.add_argument("--stride", type=int, default=8, help="depth cloud pixel stride")
+    p.add_argument("--point-size", type=float, default=0.05,
+                   help="metric depth-cloud point radius; >0 = metres, <0 = screen pixels")
+    p.add_argument("--lidar-size", type=float, default=0.03,
+                   help="lidar point radius (--eval-gt overlay); metres if >0")
+    p.add_argument("--frustum-frac", type=float, default=0.2,
+                   help="camera frustum length as a fraction of that frame's median cloud depth")
+    p.add_argument("--eval-gt", action="store_true",
+                   help="ORACLE ONLY: Sim(3)-align to nuScenes GT and print ATE/scale for scoring. "
+                        "GT is never used to resolve scale (that would be cheating); scale is "
+                        "resolved by road/ground or GPS(+IMU) downstream. Off by default.")
     return p.parse_args()
 
 
@@ -114,61 +147,105 @@ def main() -> int:
             print(f"[pending] {name}: {exc}")
             return None, exc
 
-    # Build normalized projective cameras P~_i (author seam).
-    cams, err = stage("normalized_projective_camera", lambda: np.stack([
-        normalized_projective_camera(K_true, dm.intrinsic, dm.extrinsic[:3, :3], dm.extrinsic[:3, 3])
-        for _, dm in frames]))
+    # Build normalized projective cameras P~_i (author seam), batched over frames.
+    K_da3 = np.stack([dm.intrinsic for _, dm in frames])            # (N,3,3) per-frame
+    R = np.stack([dm.extrinsic[:3, :3] for _, dm in frames])        # (N,3,3)
+    t = np.stack([dm.extrinsic[:3, 3] for _, dm in frames])         # (N,3)
+    cams, err = stage("normalized_projective_cameras",
+                      lambda: normalized_projective_cameras(K_true, K_da3, R, t))
     if err:
         return 0
 
-    H, err = stage("metric_upgrade", lambda: metric_upgrade(cams, M))
-    if err:
-        return 0
+    # Solve the DAQ via the sub-functions so A and Omega* are exposed for diagnostics.
+    A = build_daq_system(cams)
+    omega = solve_daq(A)
+    p_inf = plane_at_infinity(omega)
+    H = rectifying_homography(p_inf, M)
     print(f"H =\n{np.array2string(H, precision=4, suppress_small=True)}")
     print(f"plane at infinity (v, s) = {H[3, :]}")
 
-    Pm, err = stage("metric_cameras", lambda: metric_cameras(cams, H))
-    if err:
-        return 0
+    Pm = metric_cameras(cams, H)
 
-    # Recover camera->world poses (and check K ~ proportional to I -- a free test).
-    poses, err = stage("decompose_metric_camera", lambda: [_cam_to_world(P) for P in Pm])
-    if err:
-        return 0
-    world_from_cam = [T for T, _ in poses]
-    for i, (_, K) in enumerate(poses[: min(3, len(poses))]):
-        Kn = K / K[2, 2]
-        aniso = abs(Kn[0, 0] - Kn[1, 1]) / abs(Kn[0, 0])
-        print(f"  cam {i}: recovered K diag={np.diag(Kn)}  aniso={aniso:.3f}  (want ~[c,c,1])")
+    # Recover camera->world poses + K for ALL frames (not just 3).
+    poses = [_cam_to_world(P) for P in Pm]
+    world_from_cam = np.stack([T for T, _ in poses])
+    K_recovered = np.stack([K for _, K in poses])
 
-    # ---- Sim(3) evaluation of the recovered trajectory vs nuScenes GT ----
-    est = np.stack(world_from_cam)                                  # (N,4,4) camera->world (metric frame)
-    gt = np.stack([kf.ego2global_gt.matrix() for kf, _ in frames])  # (N,4,4) ego->global GT
-    err3 = evaluate(est, gt, align="sim3")
-    print(f"\nSim(3) vs GT: {err3}")
-    print(f"  -> recovered scale {err3.scale:.4f} (≈1.0 once metric); a large value = scale not locked")
+    # ---- DAQ solve diagnostics: how well / how consistent the fit was ----
+    diag = evaluate_daq(cams, A, omega, Pm)
+    print(f"\n{diag}")
+    Kn = K_recovered / K_recovered[:, 2:3, 2:3]
+    aniso = np.abs(Kn[:, 0, 0] - Kn[:, 1, 1]) / np.abs(Kn[:, 0, 0])
+    skew = np.abs(Kn[:, 0, 1]) / np.abs(Kn[:, 0, 0])
+    print(f"  recovered-K aniso  mean={aniso.mean():.3f} median={np.median(aniso):.3f} max={aniso.max():.3f}")
+    print(f"  recovered-K skew   mean={skew.mean():.3f} median={np.median(skew):.3f} max={skew.max():.3f}")
 
-    # ---- Rerun: recovered poses + trajectories + metric depth cloud ----
+    # ---- Cache the Stage-1 result (no re-solve, no DA3 rerun for the next stage) ----
+    mu = MetricUpgrade(
+        tokens=[kf.token for kf, _ in frames], H=H, omega_star=omega, plane_at_infinity=p_inf,
+        world_from_cam=world_from_cam, metric_cameras=np.asarray(Pm), K_recovered=K_recovered,
+        K_true=K_true, diagnostics=diag.as_dict(),
+    )
+    cache.save_metric_upgrade(args.cache_root, scene_name, mu)
+    print(f"cached metric upgrade -> {args.cache_root / scene_name / 'metric_upgrade.npz'}")
+
+    # The reconstruction is now metric UP TO ONE GLOBAL SCALE. That scalar is NOT
+    # resolved here and is NEVER taken from GT (that would be cheating). It is
+    # resolved downstream, without GT, by either: (a) road/ground + wheel-contact on
+    # the unprojected point cloud, or (b) a Sim(3) fit of these poses to a GPS(+IMU)
+    # trajectory. See the module docstring.
+    est = np.stack(world_from_cam)  # (N,4,4) camera->world, metric up to a global scale
+    print("\nreconstruction is metric up to ONE global scale (unresolved here; not taken from GT).")
+    print("resolve downstream: road/ground on the unprojected cloud, or Sim(3)-fit these poses to GPS(+IMU).")
+
+    est_aligned, gt, T_sim = None, None, None
+    if args.eval_gt:
+        # ORACLE ONLY -- scoring, not a scale source. Sim(3)-align to GT to read ATE
+        # and the scale the legitimate (road / GPS+IMU) methods should reproduce.
+        gt = np.stack([kf.ego2global_gt.matrix() for kf, _ in frames])
+        err3 = evaluate(est, gt, align="sim3")
+        est_aligned, _, T_sim = align_trajectories(est[:, :3, 3], gt[:, :3, 3], mode="sim3")
+        print(f"\n[oracle · GT · scoring only] Sim(3) fit: {err3}")
+        print(f"  -> scale {err3.scale:.4f} is the value the road/GPS methods should hit; ATE = residual after removing it")
+
+    # ---- Rerun: horizontal, upright metric-up-to-scale reconstruction ----
+    # Everything is rotated by R_VIZ into a Z-up world before logging, so the road
+    # sits horizontal and the scene stands upright in the viewer.
     if args.rerun or args.save is not None:
         rrlog.init(f"nuslam-metric-{scene_name}", spawn=args.rerun, save=args.save)
         t0 = frames[0][0].timestamp_us
-        rrlog.log_trajectory("traj/gt", gt[:, :3, 3], color=(120, 120, 120))
-        rrlog.log_trajectory("traj/est", est[:, :3, 3], color=(80, 200, 120))
+        rrlog.log_trajectory("traj/est", est[:, :3, 3] @ R_VIZ.T, color=(80, 200, 120))
+        if args.eval_gt:  # oracle overlay, in GT's own Z-up frame: GT + Sim(3)-aligned est
+            rrlog.log_trajectory("traj/gt_oracle", gt[:, :3, 3], color=(120, 120, 120))
+            rrlog.log_trajectory("traj/est_gtaligned", est_aligned, color=(200, 160, 60))
         for i, (kf, dm) in enumerate(frames):
             rrlog.set_time(kf.frame_index, kf.timestamp_us, t0)
             T = world_from_cam[i]
-            rrlog.log_estimated_camera(f"est/{i:03d}", T, kf.calib.intrinsic,
-                                       kf.calib.width, kf.calib.height, channel=args.camera)
             dmetric, e = stage("metric_depth", lambda kf=kf, dm=dm, T=T: metric_depth(
                 dm.depth, dm.intrinsic, dm.extrinsic, H, np.linalg.inv(T)))
+            # frustum length ~ a fraction of this frame's cloud depth, so it matches
+            # the points instead of dwarfing them (the cloud scale is arbitrary here).
+            valid = dmetric[np.isfinite(dmetric) & (dmetric > 0)] if e is None else np.array([])
+            plane_dist = float(args.frustum_frac * np.median(valid)) if valid.size else None
+            rrlog.log_estimated_camera(f"est/{i:03d}", T_VIZ @ T, kf.calib.intrinsic,
+                                       kf.calib.width, kf.calib.height, channel=args.camera,
+                                       image_plane_distance=plane_dist)
             if e:
                 continue
             pts, cols = metric_point_cloud(dmetric, kf.image(), kf.calib.intrinsic, T,
                                            stride=args.stride, conf=dm.conf, sky=dm.sky)
-            rrlog.log_points(f"depth/{i:03d}", pts, colors=cols, radii=0.05)
-        print("logged recovered poses + metric cloud to Rerun"
+            rrlog.log_points(f"depth/{i:03d}", pts @ R_VIZ.T, colors=cols, radii=args.point_size)
+            if args.eval_gt:  # aligned cloud + lidar in GT frame -> a metric reference to eyeball
+                rrlog.log_points(f"oracle/depth/{i:03d}", pts @ T_sim[:3, :3].T + T_sim[:3, 3],
+                                 colors=cols, radii=args.point_size)
+                lidar_xyz = lidar_points_global(source, kf)
+                if len(lidar_xyz):
+                    rrlog.log_points(f"oracle/lidar/{i:03d}", lidar_xyz,
+                                     colors=(190, 190, 190), radii=args.lidar_size)
+        print("logged metric-up-to-scale reconstruction (poses + cloud) to Rerun"
+              + ("  [+ GT/lidar oracle overlay]" if args.eval_gt else "")
               + (f" -> {args.save}" if args.save else ""))
-    print("\nmetric upgrade complete.")
+    print("\nmetric upgrade complete (reconstruction is metric up to a global scale).")
     return 0
 
 

@@ -6,7 +6,7 @@ metric anchor), and the scale resolution. It is core substance, built here, not
 generated. Only the depth back-projection seam is stubbed so the surrounding viz
 and evaluation plumbing have something to call.
 """
-from .depth_init import unproject_depth_to_world
+from .depth_init import backproject_depth_to_world, unproject_depth_to_world
 from .metric_upgrade import (
     build_daq_system,
     decompose_metric_camera,
@@ -14,7 +14,7 @@ from .metric_upgrade import (
     metric_depth,
     metric_point_cloud,
     metric_upgrade,
-    normalized_projective_camera,
+    normalized_projective_cameras,
     plane_at_infinity,
     rectifying_homography,
     solve_daq,
@@ -22,7 +22,8 @@ from .metric_upgrade import (
 
 __all__ = [
     "unproject_depth_to_world",
-    "normalized_projective_camera",
+    "backproject_depth_to_world",
+    "normalized_projective_cameras",
     "build_daq_system",
     "solve_daq",
     "plane_at_infinity",
