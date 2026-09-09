@@ -89,6 +89,12 @@ def parse_args() -> argparse.Namespace:
                    help="lidar point radius (--eval-gt overlay); metres if >0")
     p.add_argument("--frustum-frac", type=float, default=0.2,
                    help="camera frustum length as a fraction of that frame's median cloud depth")
+    p.add_argument("--m-weight", type=float, default=1.0,
+                   help="soft-constrain Omega*[:3,:3] to the known reference intrinsics M_0 in "
+                        "the DAQ solve (0 = off; default 1.0). Corrects the forward-motion "
+                        "degeneracy that under-constrains the plane at infinity -- on scene-0061 "
+                        "it drops the conic-block vs M_0 deviation from 0.33 to 0.04 and roughly "
+                        "halves oracle ATE. Pass 0 to reproduce the unconstrained solve.")
     p.add_argument("--eval-gt", action="store_true",
                    help="ORACLE ONLY: Sim(3)-align to nuScenes GT and print ATE/scale for scoring. "
                         "GT is never used to resolve scale (that would be cheating); scale is "
@@ -157,12 +163,30 @@ def main() -> int:
         return 0
 
     # Solve the DAQ via the sub-functions so A and Omega* are exposed for diagnostics.
-    A = build_daq_system(cams)
+    # --m-weight softly pins Omega*[:3,:3] to the known reference intrinsics M_0.
+    try:
+        A = build_daq_system(cams, m_prior=(M if args.m_weight > 0 else None),
+                             m_weight=args.m_weight)
+    except NotImplementedError as exc:
+        print(f"[pending] M-prior rows (daq_m_prior_rows): {exc}")
+        print("          re-run without --m-weight, or implement the seam.")
+        return 0
     omega = solve_daq(A)
     p_inf = plane_at_infinity(omega)
     H = rectifying_homography(p_inf, M)
+    if args.m_weight > 0:
+        print(f"DAQ solved with M_0 soft prior, weight={args.m_weight:g}")
     print(f"H =\n{np.array2string(H, precision=4, suppress_small=True)}")
     print(f"plane at infinity (v, s) = {H[3, :]}")
+
+    # How far the (unconstrained) fit's conic block sits from the known W_0 = M_0^-1 M_0^-T.
+    # A large gap here is exactly what the M prior corrects.
+    W0 = np.linalg.inv(M) @ np.linalg.inv(M).T
+    blk = omega[:3, :3]
+    W0n, blkn = W0 / np.linalg.norm(W0), blk / np.linalg.norm(blk)
+    blkn *= np.sign(np.vdot(W0n, blkn))  # match sign (Omega* is up to sign)
+    print(f"conic-block vs known W_0: relative deviation "
+          f"{np.linalg.norm(blkn - W0n) / np.linalg.norm(W0n):.3f}  (0 = fit agrees with M_0)")
 
     Pm = metric_cameras(cams, H)
 
@@ -181,10 +205,12 @@ def main() -> int:
     print(f"  recovered-K skew   mean={skew.mean():.3f} median={np.median(skew):.3f} max={skew.max():.3f}")
 
     # ---- Cache the Stage-1 result (no re-solve, no DA3 rerun for the next stage) ----
+    diag_out = diag.as_dict()
+    diag_out["m_weight"] = float(args.m_weight)
     mu = MetricUpgrade(
         tokens=[kf.token for kf, _ in frames], H=H, omega_star=omega, plane_at_infinity=p_inf,
         world_from_cam=world_from_cam, metric_cameras=np.asarray(Pm), K_recovered=K_recovered,
-        K_true=K_true, diagnostics=diag.as_dict(),
+        K_true=K_true, diagnostics=diag_out,
     )
     cache.save_metric_upgrade(args.cache_root, scene_name, mu)
     print(f"cached metric upgrade -> {args.cache_root / scene_name / 'metric_upgrade.npz'}")
@@ -214,10 +240,16 @@ def main() -> int:
     if args.rerun or args.save is not None:
         rrlog.init(f"nuslam-metric-{scene_name}", spawn=args.rerun, save=args.save)
         t0 = frames[0][0].timestamp_us
-        rrlog.log_trajectory("traj/est", est[:, :3, 3] @ R_VIZ.T, color=(80, 200, 120))
-        if args.eval_gt:  # oracle overlay, in GT's own Z-up frame: GT + Sim(3)-aligned est
-            rrlog.log_trajectory("traj/gt_oracle", gt[:, :3, 3], color=(120, 120, 120))
-            rrlog.log_trajectory("traj/est_gtaligned", est_aligned, color=(200, 160, 60))
+        # Whole-scene paths -> static, so they show at every time cursor (logged before
+        # the loop's first set_time, they'd otherwise be absent from the frame timeline).
+        rrlog.log_trajectory("traj/est", est[:, :3, 3] @ R_VIZ.T, color=(80, 200, 120), static=True)
+        if args.eval_gt:  # oracle overlay, in GT's own frame: GT + Sim(3)-aligned est
+            # GT-frame scene is metric (tens of m, offset far from origin) -- a 0.1 m
+            # tube is sub-pixel there, so scale the line radius to the trajectory extent.
+            gt_diag = float(np.linalg.norm(gt[:, :3, 3].max(0) - gt[:, :3, 3].min(0)))
+            traj_r = max(0.08, 0.002 * gt_diag)
+            rrlog.log_trajectory("traj/gt_oracle", gt[:, :3, 3], color=(60, 200, 255), radius=traj_r, static=True)
+            rrlog.log_trajectory("traj/est_gtaligned", est_aligned, color=(200, 160, 60), radius=traj_r, static=True)
         for i, (kf, dm) in enumerate(frames):
             rrlog.set_time(kf.frame_index, kf.timestamp_us, t0)
             T = world_from_cam[i]
@@ -230,6 +262,15 @@ def main() -> int:
             rrlog.log_estimated_camera(f"est/{i:03d}", T_VIZ @ T, kf.calib.intrinsic,
                                        kf.calib.width, kf.calib.height, channel=args.camera,
                                        image_plane_distance=plane_dist)
+            if args.eval_gt:  # same camera Sim(3)-aligned into GT's frame -> pyramids on the oracle
+                Rs = T_sim[:3, :3] / err3.scale       # un-fold scale -> orthonormal rotation
+                Ta = np.eye(4)
+                Ta[:3, :3] = Rs @ T[:3, :3]
+                Ta[:3, 3] = T_sim[:3, :3] @ T[:3, 3] + T_sim[:3, 3]
+                rrlog.log_estimated_camera(f"oracle/est/{i:03d}", Ta, kf.calib.intrinsic,
+                                           kf.calib.width, kf.calib.height, channel=args.camera,
+                                           image_plane_distance=(plane_dist * err3.scale if plane_dist else None),
+                                           color=(230, 150, 40))
             if e:
                 continue
             pts, cols = metric_point_cloud(dmetric, kf.image(), kf.calib.intrinsic, T,

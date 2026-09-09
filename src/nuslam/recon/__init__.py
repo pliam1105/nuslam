@@ -9,6 +9,7 @@ and evaluation plumbing have something to call.
 from .depth_init import backproject_depth_to_world, unproject_depth_to_world
 from .metric_upgrade import (
     build_daq_system,
+    daq_m_prior_rows,
     decompose_metric_camera,
     metric_cameras,
     metric_depth,
@@ -25,6 +26,7 @@ __all__ = [
     "backproject_depth_to_world",
     "normalized_projective_cameras",
     "build_daq_system",
+    "daq_m_prior_rows",
     "solve_daq",
     "plane_at_infinity",
     "rectifying_homography",

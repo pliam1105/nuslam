@@ -99,19 +99,66 @@ def batch_outer(arr_a: np.ndarray, arr_b: np.ndarray):
     """Given arrays with shapes (N,K), (N,M), with N being a batch dimension, return the outer product of shape (N,K,M)"""
     return arr_a[:,:,None] @ arr_b[:,None,:]
 
+def idx(i,j):
+    return 4*i+j
 
-def build_daq_system(cameras: np.ndarray) -> np.ndarray:
+
+def daq_m_prior_rows(m_prior: np.ndarray) -> np.ndarray:
+    """SEAM (author-written) -- soft constraint rows pinning ``Omega*[:3,:3]`` to the
+    known reference intrinsics.
+
+    The block form ``H_w = [[M_0, 0], [v^T, s]]`` makes the top-left 3x3 of
+    ``Omega* = H_w^{-1} diag(1,1,1,0) H_w^{-T}`` independent of ``(v, s)``:
+
+        Omega*[:3,:3] (prop.) W_0 = M_0^{-1} M_0^{-T}    (known, since M_0 is known).
+
+    Encode "``Omega*[:3,:3]`` proportional to ``W_0``" as homogeneous rows in
+    ``vec(Omega*)`` (5 independent equations -- 6 unique symmetric entries minus the
+    free overall scale). Each row touches only the 9 top-left ``vec`` indices. Return
+    shape ``(k, 16)`` (``k = 5``). ``build_daq_system`` row-normalizes and weights
+    these against the camera rows.
+
+    Args:
+        m_prior: (3, 3) reference-camera mismatch ``M_0 = K_true^{-1} K_da3_0``.
+
+    Returns:
+        (k, 16) constraint rows (unweighted, unnormalized).
+    """
+    m_prior_inv = np.linalg.inv(m_prior)
+    W_0 = m_prior_inv @ m_prior_inv.T
+    rows = []
+    for i in range(3):
+        for j in range(3):
+            if (i,j)==(0,0):
+                continue
+            row = np.zeros((16,), dtype=np.float32)
+            row[idx(i,j)] = W_0[0,0]
+            row[idx(0,0)] = -W_0[i,j]
+            rows.append(row)
+    return np.stack(rows, axis=0)
+
+
+def build_daq_system(cameras: np.ndarray, *, m_prior: np.ndarray | None = None,
+                     m_weight: float = 0.0) -> np.ndarray:
     """Assemble the DLT matrix ``A`` for ``P~_i Omega*_proj P~_i^T (prop.) I``.
 
     Encode "proportional to I" (three off-diagonals zero + two equal-diagonal
     constraints) as outer-product rows in ``vec(Omega*_proj)``; the nuisance scale
     ``lambda_i^2`` drops out.
 
+    Optionally append a soft prior tying ``Omega*[:3,:3]`` to the known reference
+    intrinsics (``m_prior = M_0``), useful when the camera motion under-constrains
+    the plane at infinity (dominantly-forward driving). The camera rows and the
+    prior rows are row-normalized separately so ``m_weight`` is dimensionless;
+    ``m_weight = 0`` (default) reproduces the plain system exactly.
+
     Args:
-        cameras: (N, 3, 4) normalized projective cameras ``P~_i``.
+        cameras:  (N, 3, 4) normalized projective cameras ``P~_i``.
+        m_prior:  (3, 3) reference mismatch ``M_0`` for the soft prior, or None.
+        m_weight: relative weight of the prior rows (0 disables).
 
     Returns:
-        (5 N, 16) matrix ``A`` with ``A vec(Omega*_proj) = 0``.
+        (5 N [+ k], 16) matrix ``A`` with ``A vec(Omega*_proj) = 0``.
     """
     rows = []
     rows.append(batch_outer(cameras[:,0], cameras[:,1]).reshape(-1,16))
@@ -119,7 +166,14 @@ def build_daq_system(cameras: np.ndarray) -> np.ndarray:
     rows.append(batch_outer(cameras[:,1], cameras[:,2]).reshape(-1,16))
     rows.append(batch_outer(cameras[:,0], cameras[:,0]).reshape(-1,16)-batch_outer(cameras[:,1], cameras[:,1]).reshape(-1,16))
     rows.append(batch_outer(cameras[:,0], cameras[:,0]).reshape(-1,16)-batch_outer(cameras[:,2], cameras[:,2]).reshape(-1,16))
-    return np.concatenate(rows, axis=0)
+    A = np.concatenate(rows, axis=0)
+    if m_prior is not None and m_weight > 0.0:
+        B = daq_m_prior_rows(m_prior)
+        # row-normalize each block so m_weight is scale-free, then stack.
+        A = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+        B = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-12)
+        A = np.concatenate([A, m_weight * B], axis=0)
+    return A
 
 
 def solve_daq(A: np.ndarray) -> np.ndarray:

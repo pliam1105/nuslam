@@ -149,6 +149,15 @@ notes that the global scale is **unresolved and never taken from GT**. `--eval-g
 only) Sim(3)-aligns to GT to print ATE and the scale the road/GPS methods should reproduce,
 and overlays lidar as a metric reference.
 
+**`--m-weight` (M₀ soft prior, default `1.0`).** Dominantly-forward driving under-constrains
+the plane at infinity, so the plain DAQ solve lets `Ω*[:3,:3]` drift from the block it is
+known to equal (`W₀ = M₀⁻¹M₀⁻ᵀ`, since the reference intrinsics `M₀` are known). `--m-weight`
+appends soft rows pinning that block to `W₀`. On scene-0061 the default `w = 1.0` drops the
+conic-block-vs-`W₀` deviation from **0.33 → 0.04**, tightens the null-space gap (`A_gap`
+1.4 → 3.1), pulls recovered-`K` anisotropy in (max 1.11 → 0.53), and roughly halves oracle
+ATE (rmse 4.5 → 2.2 m). Pass `--m-weight 0` for the unconstrained solve. It does **not**
+touch `RPE_t` — that residual lives in DA3's own reconstruction geometry, not the upgrade.
+
 ## Evaluation read-out — ground truth as an oracle
 
 `nuslam.eval` scores a finished reconstruction against nuScenes GT (ATE/RPE, Umeyama
@@ -166,6 +175,10 @@ The Umeyama Sim(3) scalar is a diagnostic: once scale is resolved legitimately i
   folded into its own camera); the live feasibility test is the DAQ residual / null-space
   eigenvalue gap / recovered-`K` anisotropy — **not** the focal spread. Rebase so the first
   camera is the origin (the block-form rectifier assumes that gauge).
+- **Forward-motion degeneracy:** near-straight driving barely constrains the plane at
+  infinity, so gate on it (`A_gap`, conic-block-vs-`W₀` deviation) and lean on the `M₀` soft
+  prior (`--m-weight`, on by default) rather than trusting an unconstrained solve. A turning
+  sub-window constrains it far better — prefer scenes/windows with real rotation.
 - Reach **Rung 1** (does the ground/wheel anchor recover scale via explicit `s`?)
   before **Rung 2**, so a failure is the scale idea, not the joint coupling.
 - **RANSAC**, not least-squares, for the ground plane — segmentation bleeds onto
