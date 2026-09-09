@@ -228,7 +228,13 @@ def main() -> int:
     if args.eval_gt:
         # ORACLE ONLY -- scoring, not a scale source. Sim(3)-align to GT to read ATE
         # and the scale the legitimate (road / GPS+IMU) methods should reproduce.
-        gt = np.stack([kf.ego2global_gt.matrix() for kf, _ in frames])
+        # Compare like with like: the est poses are the CAMERA, so bring GT into the
+        # camera frame via the known sensor->ego extrinsic (the ego origin sits ~1.51 m
+        # below / 1.70 m behind CAM_FRONT). Aligning recon camera centres to GT *ego*
+        # centres would bake that offset into the Sim(3) and push the aligned cloud off
+        # the lidar (which is logged in the true global frame).
+        s2e = frames[0][0].calib.sensor2ego.matrix()  # static per channel: camera->ego
+        gt = np.stack([kf.ego2global_gt.matrix() @ s2e for kf, _ in frames])  # GT camera->global
         err3 = evaluate(est, gt, align="sim3")
         est_aligned, _, T_sim = align_trajectories(est[:, :3, 3], gt[:, :3, 3], mode="sim3")
         print(f"\n[oracle · GT · scoring only] Sim(3) fit: {err3}")
