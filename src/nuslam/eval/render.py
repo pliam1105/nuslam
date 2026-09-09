@@ -1,14 +1,12 @@
 """Score a rendered view against the ground-truth image (photometric quality).
 
-For the staged Gaussian ladder (Stage 3): every rung is measured against the
-Rung-3.1 baseline, and novel-view quality is read on **held-out** keyframes the
-optimization never saw. This module is pure scoring -- it takes a rendered image
-and the GT image and returns PSNR / SSIM / L1; producing the render (the gsplat
-rasterizer call) is estimator substance and lives in the reconstruction code, not
-here.
+Novel-view quality is read on held-out keyframes the optimization never saw. This
+module is pure scoring -- it takes a rendered image and the ground-truth image and
+returns PSNR / SSIM / L1; producing the render (the gsplat rasterizer call) is
+estimator substance and lives in the reconstruction code, not here.
 
-``holdout_indices`` gives the train/test keyframe split so "PSNR on held-out
-views" is well defined and reproducible.
+``holdout_indices`` gives the train/test keyframe split so novel-view scoring is well
+defined and reproducible.
 
 Plumbing: this scores appearance; it makes no modelling decisions.
 """

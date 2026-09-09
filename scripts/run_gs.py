@@ -1,24 +1,27 @@
-"""Stage 3 launchpad -- prepares everything the Gaussian ladder consumes, then hands
-off to the author's 3DGS at a single seam.
+"""Stage 3 driver -- prepares the inputs the Gaussian reconstruction consumes.
 
-This is PLUMBING ONLY. It loads the scene, the cached metric upgrade (poses + true
-intrinsics) and the cached DA3 depth, resolves the global scale from GPS (Route B,
-GT-free) so the seed cloud is in metres, builds a voxel-downsampled metric init
-cloud, splits held-out views, and sets up the Rerun overlays (trajectory + depth
-cloud + camera frustums). Where it says SEAM, the author writes the 3DGS: the
-Gaussian representation, the gsplat rasterizer calls, the training loop, the pose
-retraction, and the losses (photometric + ground/wheel anchor). The eval + per-rung
-metric hooks after the seam are ready for that code to call.
+Plumbing. Loads the scene, the cached metric upgrade (poses + intrinsics) and the
+cached DA3 depth, resolves the global scale from GPS (Route B, GT-free) so the seed
+cloud is in metres, builds a voxel-downsampled metric init cloud, splits held-out
+views, and sets up the Rerun overlays (trajectory + depth cloud + camera frustums).
+The Gaussian reconstruction is called at the marked handoff -- its representation,
+gsplat rasterizer calls, optimization loop, pose retraction, and losses live in
+``nuslam.recon.gaussians``, not here. The visualization and evaluation hooks after the
+handoff are ready for that code to call.
 
     python scripts/run_gs.py --scene scene-0061 --rerun            # prep + overlays
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import torch
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -26,15 +29,48 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from nuslam.data import (  # noqa: E402
     NuScenesMonoSource, gps_positions_at, lidar_points_global, load_proprio_streams,
 )
-from nuslam.eval import evaluate_render, holdout_indices, record_rung  # noqa: E402
-from nuslam.frontend import cache  # noqa: E402
+from nuslam.eval import evaluate_render, holdout_indices, record_metrics  # noqa: E402
+from nuslam.frontend import RoadSegmenter, SegConfig, cache  # noqa: E402
 from nuslam.pointcloud import voxel_downsample  # noqa: E402
-from nuslam.recon import metric_point_cloud, resolve_scale_gps  # noqa: E402
+from nuslam.recon import metric_point_cloud, resolve_scale_gps, train_gaussians  # noqa: E402
 from nuslam.viz import rerun_logging as rrlog  # noqa: E402
 
 # Reconstruction lives in camera-0's frame (RDF); rotate into a Z-up world for viz.
 R_VIZ = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float64)
 T_VIZ = np.eye(4); T_VIZ[:3, :3] = R_VIZ
+
+# Per-parameter Adam learning rates, keyed to the ParameterDict; starting values to tune.
+LR_FOR = {
+    "means": 1.6e-4,
+    "quats": 1.0e-3,
+    "scales": 5.0e-3,
+    "opacities": 5.0e-2,
+    "colors": 2.5e-3,
+}
+
+
+def _sky_keep_mask(means, poses_m, K, frames, sky_masks):
+    """Keep-mask (N,) for Gaussians: drop those that project onto sky in a majority of the
+    views that see them. ``means`` (N,3) is in the metric world frame of ``poses_m``."""
+    means = np.asarray(means, dtype=np.float64)
+    n = len(means)
+    sky_hits = np.zeros(n); seen = np.zeros(n)
+    K = np.asarray(K, dtype=np.float64)
+    for i, (kf, _) in enumerate(frames):
+        sky = sky_masks.get(kf.token)
+        if sky is None:
+            continue
+        h, w = sky.shape
+        vm = np.linalg.inv(poses_m[i])                    # world -> camera
+        Xc = means @ vm[:3, :3].T + vm[:3, 3]             # (N,3)
+        uv = Xc @ K.T                                     # (N,3)
+        u = uv[:, 0] / uv[:, 2]; v = uv[:, 1] / uv[:, 2]
+        inb = (Xc[:, 2] > 1e-3) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        ui = np.clip(u, 0, w - 1).astype(int); vi = np.clip(v, 0, h - 1).astype(int)
+        sky_hits += sky[vi, ui] & inb
+        seen += inb
+    frac = np.divide(sky_hits, np.maximum(seen, 1))
+    return ~((seen > 0) & (frac > 0.5))                   # keep unless seen and majority-sky
 
 
 def parse_args():
@@ -49,8 +85,31 @@ def parse_args():
     p.add_argument("--voxel", type=float, default=0.1, help="init-cloud voxel size (metres)")
     p.add_argument("--holdout-every", type=int, default=8, help="hold out every k-th view for novel-view PSNR")
     p.add_argument("--no-scale", action="store_true", help="skip Route-B metric scaling (leave up-to-scale)")
-    p.add_argument("--rerun", action="store_true")
-    p.add_argument("--save", type=Path, default=None)
+    p.add_argument("--train", action="store_true", help="fit the Gaussians (else only prep + overlays)")
+    p.add_argument("--num-iters", type=int, default=10000, help="optimization iterations")
+    p.add_argument("--structural-lambda", type=float, default=0.2, help="weight of the structural (D-SSIM) term")
+    p.add_argument("--log-every", type=int, default=100, help="log progress/renders every N iters (0 = off)")
+    p.add_argument("--snapshot-every", type=int, default=500, help="save a GS .npz snapshot every N iters")
+    p.add_argument("--from-checkpoint", type=Path, default=None,
+                   help="warm-start the Gaussians from a saved gs_*.npz instead of the point cloud")
+    p.add_argument("--clip-scales", action="store_true",
+                   help="warm start only: clip oversized checkpoint scales to the local kNN spacing")
+    p.add_argument("--run-name", default=None,
+                   help="subdirectory name for this run's logs/checkpoints/renders "
+                        "(default: timestamp). Runs never overwrite each other.")
+    p.add_argument("--mask-sky", action="store_true",
+                   help="segment sky (CLIPSeg 'sky' prompt) and drop sky pixels from the init cloud")
+    p.add_argument("--remove-sky-gaussians", action="store_true",
+                   help="drop Gaussians that project onto sky in most views (needs sky masks; "
+                        "post-processes a warm-started/loaded set)")
+    p.add_argument("--sky-threshold", type=float, default=0.35, help="CLIPSeg sky probability threshold")
+    p.add_argument("--sky-gpu", action="store_true", help="run the sky segmenter on GPU (default CPU)")
+    p.add_argument("--rerun", action="store_true", help="spawn a native Rerun viewer (needs a display)")
+    p.add_argument("--save", type=Path, default=None, help="write a .rrd (opened later, not live)")
+    p.add_argument("--serve", action="store_true",
+                   help="stream to a live Rerun gRPC server; connect a viewer for live updates "
+                        "(headless/remote-friendly). Prints the connect URL.")
+    p.add_argument("--serve-port", type=int, default=None, help="gRPC port for --serve (default 9876)")
     p.add_argument("--point-size", type=float, default=0.03, help="point radius (init cloud + lidar)")
     p.add_argument("--eval-gt", action="store_true",
                    help="ORACLE overlay: also draw GT trajectory + lidar (and the GPS track), "
@@ -71,8 +130,11 @@ def main() -> int:
         print(f"need cached metric upgrade + depth under {args.cache_root}/{scene_name} "
               "-- run run_recon.py then run_metric_upgrade.py --save-cache first")
         return 1
-    frames = [(kf, depth[kf.token]) for kf in keyframes if kf.token in depth]
-    world_from_cam = mu.world_from_cam            # (N,4,4) camera->world, metric up to scale
+    # Align the cached poses to the (possibly --max-frames-limited) keyframe subset by
+    # token, so world_from_cam stays 1:1 with `frames`.
+    pose_idx = {t: i for i, t in enumerate(mu.tokens)}
+    frames = [(kf, depth[kf.token]) for kf in keyframes if kf.token in depth and kf.token in pose_idx]
+    world_from_cam = mu.world_from_cam[[pose_idx[kf.token] for kf, _ in frames]]  # (N,4,4) camera->world
     K_true = mu.K_true
 
     # ---- metric scale from GPS (Route B, GT-free) so the seed cloud is in metres ----
@@ -96,14 +158,27 @@ def main() -> int:
     poses_m = world_from_cam.copy()
     poses_m[:, :3, 3] *= scale                     # metric camera->world
 
+    # ---- sky masks (CLIPSeg 'sky' prompt): drop sky pixels from the cloud / sky Gaussians ----
+    sky_masks = {}
+    if args.mask_sky or args.remove_sky_gaussians:
+        # CLIPSeg on CPU by default: it's small and one-time, and the GPU is usually busy
+        # with a training run; --sky-gpu overrides.
+        seg = RoadSegmenter(SegConfig(prompt="sky", threshold=args.sky_threshold,
+                                      device=(None if args.sky_gpu else "cpu")))
+        for gm in seg.segment_scene([kf for kf, _ in frames]):
+            sky_masks[gm.token] = gm.mask
+        frac = np.mean([m.mean() for m in sky_masks.values()]) if sky_masks else 0.0
+        print(f"sky masks: segmented {len(sky_masks)} keyframes (CLIPSeg 'sky'), ~{frac:.1%} sky")
+
     # ---- init cloud: back-project depth (metres), voxel-downsample PER KEYFRAME, then
     #      concatenate and downsample the merged cloud once more. Thinning each frame
     #      before the merge keeps the concat + final pass cheap. ----
     raw_xyz, raw_rgb, ds_xyz, ds_rgb = [], [], [], []
     voxel_ok = True
     for i, (kf, dm) in enumerate(frames):
+        sky = sky_masks.get(kf.token) if args.mask_sky else dm.sky
         pts, cols = metric_point_cloud(dm.depth, kf.image(), K_true, world_from_cam[i],
-                                       stride=args.stride, conf=dm.conf, sky=dm.sky)
+                                       stride=args.stride, conf=dm.conf, sky=sky)
         pts = pts * scale
         raw_xyz.append(pts); raw_rgb.append(cols)
         if voxel_ok:
@@ -128,8 +203,12 @@ def main() -> int:
     print(f"{len(frames)} frames: {len(train_idx)} train / {len(test_idx)} held-out for novel-view PSNR")
 
     # ---- Rerun overlays: init cloud + trajectory + camera frustums (upright frame) ----
-    if args.rerun or args.save is not None:
-        rrlog.init(f"nuslam-gs-{scene_name}", spawn=args.rerun, save=args.save)
+    if args.rerun or args.save is not None or args.serve:
+        # Distinct app id per mode so the viewer doesn't reuse the training blueprint
+        # (with its empty render/loss panels) for a prep-only point-cloud recording.
+        app_id = f"nuslam-gs-{scene_name}" if args.train else f"nuslam-pointcloud-{scene_name}"
+        rrlog.init(app_id, spawn=args.rerun, save=args.save,
+                   serve=args.serve, serve_port=args.serve_port)
         rrlog.log_points("init/cloud", xyz @ R_VIZ.T, colors=rgb, radii=args.point_size, static=True)
         rrlog.log_trajectory("traj/est", poses_m[:, :3, 3] @ R_VIZ.T, color=(50, 120, 240), static=True)
         for i, (kf, _) in enumerate(frames):
@@ -163,28 +242,135 @@ def main() -> int:
               + " to Rerun" + (f" -> {args.save}" if args.save else ""))
 
     # ===================================================================================
-    # SEAM -- the author writes the 3DGS here (core substance, CLAUDE.md section 3).
+    # Handoff to the Gaussian reconstruction (nuslam.recon.gaussians.train_gaussians).
     #
     # Prepared inputs above, ready to consume:
     #   xyz (M,3) float32, rgb (M,3) uint8  -- metric init cloud (seed Gaussian means/colors)
     #   poses_m (N,4,4)                      -- metric camera->world  (viewmats = inv(poses_m))
-    #   K_true (3,3)                         -- true intrinsics (per-view Ks = tile over N)
-    #   frames[i][0].image()                -- GT image for view i
-    #   train_idx / test_idx                -- optimize on train, score novel-view PSNR on test
+    #   K_true (3,3)                         -- intrinsics (per-view Ks = tile over N)
+    #   frames[i][0].image()                -- image for view i
+    #   train_idx / test_idx                -- optimize on train, score novel views on test
     #
-    # Write: the Gaussian representation + reparametrization, the gsplat rasterization(...)
-    # calls (render_mode="RGB+ED" for the ground anchor), the training loop, the se3 pose
-    # retraction on viewmats, and the losses (photometric + ground/wheel anchor). Then, to
-    # visualize alongside the overlays above and score each rung, call the wired hooks:
-    #
+    # After it returns, visualize alongside the overlays above and score each stage with
+    # the wired hooks:
     #   rrlog.log_gaussians("gs/means", means, scales, quats_wxyz, colors_rgba)  # 3D splats
     #   rrlog.log_image("render/est", rendered);  rrlog.log_image("render/gt", gt)  # 2D compare
     #   e = evaluate_render(rendered, gt);  # PSNR/SSIM/L1 on a held-out view
-    #   record_rung(args.cache_root / scene_name / "rungs.json", "3.1",
-    #               {"psnr": e.psnr, "ssim": e.ssim, ...})  # per-rung metric log
+    #   record_metrics(args.cache_root / scene_name / "metrics.json", "photometric",
+    #                  {"psnr": e.psnr, "ssim": e.ssim, ...})  # per-stage metric log
     # ===================================================================================
-    print("\nStage-3 inputs prepared. Write the 3DGS at the SEAM in this script "
-          "(scripts/run_gs.py) -- the viz + eval + rung-log hooks are ready to call.")
+    if not args.train:
+        print("\nStage-3 inputs prepared. Pass --train to fit the Gaussians "
+              "(nuslam.recon.gaussians consumes the inputs above).")
+        return 0
+
+    images = [kf.image() for kf, _ in frames]
+    to_viz = bool(args.rerun or args.save is not None or args.serve)
+    # Per-run output dir so runs never overwrite each other (concatenate later for final visuals).
+    run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = args.cache_root / scene_name / "runs" / run_name
+    gs_dir = log_dir / "gs_snapshots"; gs_dir.mkdir(parents=True, exist_ok=True)
+    print(f"run outputs -> {log_dir}")
+    C0 = 0.28209479177387814  # SH DC basis; display colour = DC*C0 + 0.5
+
+    def gs_numpy(g):
+        means, scales, quats, opac, sh = g
+        return {
+            "means": means.detach().cpu().numpy(),
+            "scales": scales.detach().cpu().numpy(),
+            "quats": torch.nn.functional.normalize(quats, dim=-1).detach().cpu().numpy(),
+            "opacities": opac.detach().cpu().numpy(),
+            "sh": sh.detach().cpu().numpy(),
+        }
+
+    def gs_rgba(gd):
+        rgb01 = np.clip(gd["sh"][:, 0, :] * C0 + 0.5, 0.0, 1.0)
+        return (np.concatenate([rgb01, gd["opacities"].reshape(-1, 1)], axis=1) * 255).astype(np.uint8)
+
+    def log_gs(name, gd, *, static):
+        rrlog.log_transform(name, R_VIZ, static=static)   # upright, matching init/cloud
+        rrlog.log_gaussians(f"{name}/splats", gd["means"], gd["scales"], gd["quats"],
+                            gs_rgba(gd), static=static)
+
+    # ---- persistent training log (CSV) + GS snapshots + render PNGs + live Rerun ----
+    csv_file = open(log_dir / "train_log.csv", "w", newline="")
+    cw = csv.writer(csv_file); cw.writerow(["step", "loss", "photometric", "dssim", "num_gaussians", "heldout_psnr"])
+    render_dir = log_dir / "renders"; render_dir.mkdir(parents=True, exist_ok=True)
+    ti, hi = int(train_idx[0]), int(test_idx[0])
+    Image.fromarray(frames[hi][0].image()).save(render_dir / "heldout_gt.png")   # gt once
+    Image.fromarray(frames[ti][0].image()).save(render_dir / "train_gt.png")
+
+    def _png(img01):  # (H,W,3) float [0,1] -> uint8
+        return (np.clip(img01, 0, 1) * 255).astype(np.uint8)
+
+    def on_log(step, loss, photo, dssim, gaussians, render):
+        gd = gs_numpy(gaussians)
+        n = len(gd["means"])
+        ho = render(poses_m[hi], K_true)                 # render each view ONCE, reuse
+        tr = render(poses_m[ti], K_true)
+        e = evaluate_render(ho, frames[hi][0].image())   # held-out score
+        print(f"iter {step:6d}  loss {loss:.4f}  photo {photo:.4f}  dssim {dssim:.4f}  "
+              f"N={n}  heldout_psnr={e.psnr:.2f}")
+        cw.writerow([step, loss, photo, dssim, n, e.psnr]); csv_file.flush()
+        if args.snapshot_every and step % args.snapshot_every == 0:        # intermediate GS (disk-heavy)
+            np.savez_compressed(gs_dir / f"gs_{step:06d}.npz", **gd)
+        Image.fromarray(_png(ho)).save(render_dir / f"heldout_est_{step:06d}.png")   # inspectable PNGs
+        Image.fromarray(_png(tr)).save(render_dir / f"train_est_{step:06d}.png")
+        if to_viz:
+            rrlog.set_step(step)
+            rrlog.log_scalar("train/loss", loss); rrlog.log_scalar("train/photometric", photo)
+            rrlog.log_scalar("train/dssim", dssim); rrlog.log_scalar("heldout/psnr", e.psnr)
+            rrlog.log_image("render/heldout_est", ho); rrlog.log_image("render/heldout_gt", frames[hi][0].image())
+            rrlog.log_image("render/train_est", tr); rrlog.log_image("render/train_gt", frames[ti][0].image())
+            log_gs("train/gs", gd, static=False)                          # intermediate GS on the iter timeline
+
+    ckpt = {k: np.load(args.from_checkpoint)[k] for k in np.load(args.from_checkpoint).files} \
+        if args.from_checkpoint else None
+    if ckpt is not None:
+        print(f"warm-starting from checkpoint {args.from_checkpoint} ({len(ckpt['means'])} Gaussians)")
+        if args.remove_sky_gaussians and sky_masks:
+            keep = _sky_keep_mask(ckpt["means"], poses_m, K_true, frames, sky_masks)
+            n0 = len(keep); ckpt = {k: v[keep] for k, v in ckpt.items()}
+            print(f"removed sky Gaussians: {n0} -> {len(ckpt['means'])} kept")
+    # non-sky keep-masks per frame, so the training loss ignores sky (no sky Gaussians grown)
+    train_masks = [~sky_masks[kf.token] for kf, _ in frames] if (args.mask_sky and sky_masks) else None
+    gs_tuple, render = train_gaussians(
+        xyz, rgb, poses_m, K_true, images, train_idx,
+        lr_for=LR_FOR, num_iters=args.num_iters, structural_lambda=args.structural_lambda,
+        log_every=args.log_every, on_log=on_log, init_gaussians=ckpt,
+        clip_scales_to_knn=args.clip_scales, masks=train_masks,
+    )
+    csv_file.close()
+    print(f"\nfit complete ({args.num_iters} iters, structural_lambda={args.structural_lambda})")
+
+    # ---- final GS: persist + score the held-out views + log the run's metrics ----
+    final_gd = gs_numpy(gs_tuple)
+    np.savez_compressed(log_dir / "gs_final.npz", **final_gd)
+    errs = [evaluate_render(render(poses_m[i], K_true), frames[i][0].image()) for i in test_idx]
+    metrics = {
+        "psnr": float(np.mean([e.psnr for e in errs])),
+        "ssim": float(np.mean([e.ssim for e in errs])),
+        "l1": float(np.mean([e.l1 for e in errs])),
+    }
+    mpath = record_metrics(log_dir / "metrics.json", "photometric", metrics)
+    print(f"held-out ({len(test_idx)} views): PSNR={metrics['psnr']:.2f}  SSIM={metrics['ssim']:.4f}  "
+          f"L1={metrics['l1']:.4f}")
+    print(f"logs: {log_dir/'train_log.csv'}  |  GS: {log_dir/'gs_final.npz'} (+ {gs_dir}/)  |  metrics: {mpath}")
+
+    # ---- final Gaussians + a few novel-view renders in Rerun ----
+    if to_viz:
+        log_gs("gs", final_gd, static=True)
+        for i in test_idx[:3]:
+            rrlog.log_image(f"render/est/{i:03d}", render(poses_m[i], K_true))
+            rrlog.log_image(f"render/gt/{i:03d}", frames[i][0].image())
+        print("logged final Gaussians + novel-view renders to Rerun"
+              + (f" -> {args.save}" if args.save else ""))
+
+    if args.serve:  # keep the process (and the live server) alive for review
+        try:
+            input("\n[rerun] serving live -- press Enter to stop the server and exit...")
+        except (EOFError, KeyboardInterrupt):
+            pass
     return 0
 
 

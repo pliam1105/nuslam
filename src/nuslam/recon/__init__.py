@@ -7,6 +7,7 @@ generated. Only the depth back-projection seam is stubbed so the surrounding viz
 and evaluation plumbing have something to call.
 """
 from .depth_init import backproject_depth_to_world, unproject_depth_to_world
+from .gaussians import train_gaussians
 from .scale import ScaleResult, resolve_scale_gps
 from .metric_upgrade import (
     build_daq_system,
@@ -38,4 +39,5 @@ __all__ = [
     "metric_point_cloud",
     "resolve_scale_gps",
     "ScaleResult",
+    "train_gaussians",
 ]

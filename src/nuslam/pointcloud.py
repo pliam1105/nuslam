@@ -2,13 +2,9 @@
 
 Data plumbing shared by the reconstruction seeding and viz. ``voxel_downsample``
 thins a dense back-projected cloud to at most one point per occupied voxel, so the
-Gaussian count (and the GPU) stays bounded before the cloud is seeded or logged.
-It is a generic reduction and makes no decision about *how* Gaussians are seeded
-from the cloud (that is core initialization); it only offers a metric voxel knob.
-
-SEAM: the body is left to wrap Open3D's ``voxel_down_sample`` (numpy -> o3d
-PointCloud -> back to numpy); the signature and contract below are what the callers
-(seeding, viz) expect.
+Gaussian count (and the GPU) stays bounded before the cloud is seeded or logged. It is
+a generic reduction and makes no decision about how Gaussians are seeded from the cloud;
+it only offers a metric voxel knob, wrapping Open3D's ``voxel_down_sample``.
 """
 from __future__ import annotations
 
@@ -45,3 +41,23 @@ def voxel_downsample(
         pcd.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64)/255.0)
     downsampled_pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
     return np.asarray(downsampled_pcd.points) if colors is None else (np.asarray(downsampled_pcd.points), np.asarray((np.asarray(downsampled_pcd.colors)*255.0).round(), dtype=np.uint8))
+
+
+def nn_distances(points: np.ndarray, k: int = 3) -> np.ndarray:
+    """Mean distance from each point to its ``k`` nearest neighbours (scene units).
+
+    Used to size Gaussians to the local point density at initialization: a scale of
+    roughly the neighbour spacing keeps each Gaussian about as big as its neighbourhood
+    (instead of an arbitrary fixed size). Returns an ``(N,)`` float array. Degenerate
+    inputs (fewer than 2 points) return zeros. This computes a geometric quantity; the
+    decision to seed scales from it lives in the reconstruction init.
+    """
+    from scipy.spatial import cKDTree
+
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 2:
+        return np.zeros(n, dtype=np.float64)
+    kk = min(k, n - 1)
+    d, _ = cKDTree(pts).query(pts, k=kk + 1)  # +1 for the point itself (distance 0)
+    return np.atleast_2d(d)[:, 1:].mean(axis=1)

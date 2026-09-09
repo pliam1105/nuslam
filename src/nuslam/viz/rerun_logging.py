@@ -46,22 +46,32 @@ def _ensure_viewer_on_path() -> None:
 
 
 def init(app_id: str = "nuslam", *, spawn: bool = False,
-         save: Path | str | None = None, connect: str | None = None) -> None:
-    """Start a recording. One of: spawn a viewer, save a .rrd, or connect to one.
+         save: Path | str | None = None, connect: str | None = None,
+         serve: bool = False, serve_port: int | None = None) -> str | None:
+    """Start a recording. One of: spawn a viewer, save a .rrd, connect, or serve live.
 
     ``save`` writes a recording file openable later with ``rerun <file>.rrd``;
-    ``spawn`` opens the native viewer; ``connect`` (a gRPC url) attaches to a
-    running viewer. Defaults to an in-memory recording if none is given.
+    ``spawn`` opens the native viewer (needs a display); ``connect`` (a gRPC url)
+    attaches to a running viewer; ``serve`` starts a gRPC server the recording streams
+    to, so any Rerun viewer that connects gets LIVE updates (headless/remote-friendly)
+    -- it returns the server url. Defaults to an in-memory recording if none is given.
     """
     if spawn:
         _ensure_viewer_on_path()
     rr.init(app_id, spawn=spawn)
+    url = None
+    if serve:
+        url = rr.serve_grpc(grpc_port=serve_port)  # stream live; process must stay alive to keep serving
+        print(f"[rerun] live server up. Connect a viewer for live updates:\n"
+              f"          rerun --connect {url}\n"
+              f"        (or in the viewer: menu -> Connect to gRPC -> {url})")
     if save is not None:
         rr.save(str(save))
     elif connect is not None:
         rr.connect_grpc(connect)
     # nuScenes global frame is a local map frame: right-handed, Z up.
     rr.log(WORLD, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    return url
 
 
 def _quat_xyzw(wxyz: np.ndarray) -> list[float]:
@@ -178,6 +188,30 @@ def log_points(name: str, xyz: np.ndarray, *,
     on the timeline value it happened to be logged at."""
     rr.log(f"{WORLD}/{name}", rr.Points3D(np.asarray(xyz, np.float32)[:, :3], colors=colors, radii=radii),
            static=static)
+
+
+def set_step(step: int) -> None:
+    """Advance the 'iter' timeline (for training-loop time series)."""
+    rr.set_time("iter", sequence=int(step))
+
+
+def log_scalar(name: str, value: float, *, step: int | None = None) -> None:
+    """Log a scalar sample to a live time series (e.g. a training loss curve).
+    Pass ``step`` to stamp it on the 'iter' timeline first."""
+    if step is not None:
+        set_step(step)
+    rr.log(name, rr.Scalars(float(value)))
+
+
+def log_transform(name: str, matrix: np.ndarray, *, static: bool = False) -> None:
+    """Log a 3D transform (3x3 rotation or 4x4) at ``world/<name>``; children inherit it.
+
+    Useful to place a whole subtree (e.g. a Gaussian set) in the upright viz frame with
+    one transform instead of rotating every element's pose."""
+    m = np.asarray(matrix, float)
+    R = m[:3, :3]
+    t = m[:3, 3] if m.shape == (4, 4) else np.zeros(3)
+    rr.log(f"{WORLD}/{name}", rr.Transform3D(translation=t, mat3x3=R), static=static)
 
 
 def log_image(name: str, image: np.ndarray, *, static: bool = False) -> None:

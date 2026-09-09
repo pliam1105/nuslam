@@ -1,25 +1,23 @@
-"""Metric scale resolution (Stage 2) -- written by hand (scale-resolution geometry).
+"""Metric scale resolution (Stage 2).
 
 The DA3 metric upgrade (Stage 1, ``metric_upgrade.py``) leaves the reconstruction
-metric UP TO ONE global scale. This module resolves that single scalar, and it does so
-WITHOUT ground truth -- ground truth is only ever an oracle used to *score* the scale
-produced here (see ``nuslam.eval``).
+metric UP TO ONE global scale. This module resolves that single scalar without ground
+truth -- ground truth is only ever an oracle used to *score* the resolved scale (see
+``nuslam.eval``).
 
 Route B (GPS): fit the recovered camera trajectory to the GPS (nuScenes-CAN ``pose``)
 ground track by an iterated Umeyama alignment. The fit accounts for the camera->ground
-lever arm using each frame's OWN recovered orientation (so no compass/heading is
+lever arm using each frame's own recovered orientation (so no compass/heading is
 needed) and pins the vertical to the measured ground plane (z = 0). The Umeyama
-primitive itself, :func:`nuslam.eval.metrics.umeyama`, is shared infrastructure; the
-lever-arm reduction and the fixed-point iteration that resolve the metric scale are the
-core substance built here.
+primitive itself, :func:`nuslam.transforms.umeyama`, is shared infrastructure; the
+lever-arm reduction and the fixed-point iteration resolve the metric scale.
 
 Derivation and the reason a closed form does not exist (the leftover objective in the
-rotation is quadratic, not linear): see the handout ``Umeyama_Alignment_Handout.pdf``,
-sections 6-7.
+rotation is quadratic, not linear): see ``Umeyama_Alignment_Handout.pdf``, sections 6-7.
 
-Other routes are parked here as they are built: Route A (road/ground + wheel-contact on
-the unprojected cloud, the novel core) and Route C (joint). The three resolve the same
-scalar independently and should agree; ground truth scores all three afterward.
+Other routes attach here as they are built: Route A (road/ground + wheel-contact on the
+unprojected cloud) and Route C (joint). The three resolve the same scalar independently
+and should agree; ground truth scores all three afterward.
 """
 from __future__ import annotations
 
@@ -58,10 +56,10 @@ def resolve_scale_gps(
     *,
     iters: int = 3,
 ) -> ScaleResult:
-    """SEAM (author-written) -- Route B: resolve the global metric scale by an iterated
-    lever-arm Umeyama fit of the recovered camera trajectory to the GPS ground track.
+    """Route B: resolve the global metric scale by an iterated lever-arm Umeyama fit of
+    the recovered camera trajectory to the GPS ground track.
 
-    Recipe (handout sections 6-7), over the ``valid`` frames only:
+    Method (handout sections 6-7), over the ``valid`` frames only:
 
       * lever arm ``a = -R_c2e^T t_c2e`` -- the ground/ego point in the camera frame
         (metres), from ``sensor2ego``;
