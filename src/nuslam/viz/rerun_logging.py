@@ -124,7 +124,8 @@ def _jpeg(rgb: np.ndarray, quality: int = 90) -> bytes:
 def log_estimated_camera(name: str, world_from_cam: np.ndarray, K: np.ndarray,
                          width: int, height: int, *, channel: str = "cam",
                          image_plane_distance: float | None = None,
-                         color: tuple[int, int, int] | None = None) -> None:
+                         color: tuple[int, int, int] | None = None,
+                         static: bool = False) -> None:
     """Log a recovered (estimated) camera: its pose + pinhole, under world/<name>.
 
     For the DA3 metric-upgrade path: ``world_from_cam`` is the recovered metric
@@ -141,7 +142,8 @@ def log_estimated_camera(name: str, world_from_cam: np.ndarray, K: np.ndarray,
     pose = SE3.from_matrix(np.asarray(world_from_cam, float))
     ent = f"{WORLD}/{name}/{channel}"
     rr.log(ent, rr.Transform3D(
-        translation=pose.t, quaternion=rr.Quaternion(xyzw=_quat_xyzw(pose.quaternion_wxyz()))))
+        translation=pose.t, quaternion=rr.Quaternion(xyzw=_quat_xyzw(pose.quaternion_wxyz()))),
+        static=static)
     kwargs = {} if image_plane_distance is None else {"image_plane_distance": float(image_plane_distance)}
     if color is not None:
         kwargs["color"] = color
@@ -150,7 +152,7 @@ def log_estimated_camera(name: str, world_from_cam: np.ndarray, K: np.ndarray,
         resolution=[int(width), int(height)],
         camera_xyz=rr.ViewCoordinates.RDF,
         **kwargs,
-    ))
+    ), static=static)
 
 
 def log_trajectory(name: str, points_xyz: np.ndarray,
@@ -167,9 +169,24 @@ def log_trajectory(name: str, points_xyz: np.ndarray,
 
 
 def log_points(name: str, xyz: np.ndarray, *,
-               colors: np.ndarray | tuple | None = None, radii: float | np.ndarray = 0.05) -> None:
-    """Log an (N, 3) point cloud under world/<name>."""
-    rr.log(f"{WORLD}/{name}", rr.Points3D(np.asarray(xyz, np.float32)[:, :3], colors=colors, radii=radii))
+               colors: np.ndarray | tuple | None = None, radii: float | np.ndarray = 0.05,
+               static: bool = False) -> None:
+    """Log an (N, 3) point cloud under world/<name>.
+
+    Pass ``static=True`` for a whole-scene cloud logged outside the per-frame loop
+    (e.g. the Gaussian seed cloud), so it shows at every time cursor instead of only
+    on the timeline value it happened to be logged at."""
+    rr.log(f"{WORLD}/{name}", rr.Points3D(np.asarray(xyz, np.float32)[:, :3], colors=colors, radii=radii),
+           static=static)
+
+
+def log_image(name: str, image: np.ndarray, *, static: bool = False) -> None:
+    """Log a 2D image (a rendered view or its GT keyframe) under ``<name>``.
+
+    Use a 2D entity path (e.g. ``"render/est"``, ``"render/gt"``) so Rerun shows it
+    in an image view beside the 3D scene -- the rendered-vs-GT comparison the ladder
+    is scored on. ``image`` is (H, W, 3) uint8 or float; floats are shown as-is."""
+    rr.log(name, rr.Image(np.asarray(image)), static=static)
 
 
 def log_gaussians(name: str, means: np.ndarray, scales: np.ndarray,

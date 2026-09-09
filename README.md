@@ -25,8 +25,9 @@ Projective  --known K-->  Metric-up-to-scale  --scale: ground / GPS-->  Metric
 DAQ Ω*, 15 DoF            Sim(3), 7 DoF                                 SE(3), 6 DoF
 ```
 
-The full staged plan is in `Metric_Anchored_GS_SLAM_Engineering_Plan_v3.pdf` (with
-the metric-upgrade derivation in `Metric_Upgrade_Known_Intrinsics_Handbook.pdf`).
+The full staged plan is in `Metric_Anchored_GS_SLAM_Engineering_Plan_v4.pdf` (with
+the metric-upgrade derivation in `Metric_Upgrade_Known_Intrinsics_Handbook.pdf` and
+the trajectory-alignment math in `Umeyama_Alignment_Handout.pdf`).
 
 > **Scope of this repository.** The reconstruction core — the Gaussian representation
 > and initialization, the gsplat rasterizer calls, the training loop, the pose
