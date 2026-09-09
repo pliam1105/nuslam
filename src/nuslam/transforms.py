@@ -75,3 +75,35 @@ class SE3:
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         rpy = pyquaternion.Quaternion(matrix=self.R).yaw_pitch_roll
         return f"SE3(t={np.round(self.t, 3).tolist()}, ypr={np.round(rpy, 3).tolist()})"
+
+
+def umeyama(src: np.ndarray, dst: np.ndarray, *, with_scale: bool) -> tuple[float, np.ndarray, np.ndarray]:
+    """Least-squares similarity mapping ``src`` onto ``dst`` (Umeyama 1991).
+
+    ``src``, ``dst`` are (N, 3). Returns ``(scale, R, t)`` minimizing
+    ``sum ||dst_i - (scale * R @ src_i + t)||^2``. With ``with_scale=False`` the scale
+    is fixed to 1 (pure SE(3) / rigid).
+
+    A framework-neutral geometry primitive: the evaluation harness uses it for Sim(3)
+    trajectory alignment, and the metric-scale resolver reuses it as the inner
+    rigid/similarity fit inside its lever-arm iteration. It lives here (not in eval) so
+    the core resolver need not depend on the scoring package.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    n = src.shape[0]
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    sc, dc = src - mu_s, dst - mu_d
+    cov = (dc.T @ sc) / n
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1  # reflection fix
+    R = U @ S @ Vt
+    if with_scale:
+        var_s = (sc**2).sum() / n
+        scale = float((D * np.diag(S)).sum() / var_s) if var_s > 0 else 1.0
+    else:
+        scale = 1.0
+    t = mu_d - scale * R @ mu_s
+    return scale, R, t

@@ -44,7 +44,12 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from nuslam.data import NuScenesMonoSource, lidar_points_global  # noqa: E402
+from nuslam.data import (  # noqa: E402
+    NuScenesMonoSource,
+    gps_positions_at,
+    lidar_points_global,
+    load_proprio_streams,
+)
 from nuslam.eval import align_trajectories, evaluate, evaluate_daq  # noqa: E402
 from nuslam.frontend import cache  # noqa: E402
 from nuslam.recon import (  # noqa: E402
@@ -56,6 +61,7 @@ from nuslam.recon import (  # noqa: E402
     normalized_projective_cameras,
     plane_at_infinity,
     rectifying_homography,
+    resolve_scale_gps,
     solve_daq,
 )
 from nuslam.types import MetricUpgrade  # noqa: E402
@@ -99,6 +105,10 @@ def parse_args() -> argparse.Namespace:
                    help="ORACLE ONLY: Sim(3)-align to nuScenes GT and print ATE/scale for scoring. "
                         "GT is never used to resolve scale (that would be cheating); scale is "
                         "resolved by road/ground or GPS(+IMU) downstream. Off by default.")
+    p.add_argument("--route-b", action="store_true",
+                   help="Resolve the global metric scale from GPS (nuScenes-CAN 'pose') via the "
+                        "lever-arm Umeyama fit (nuslam.recon.resolve_scale_gps). GT-free; needs the "
+                        "CAN expansion. With --eval-gt, prints Route-B vs oracle scale side by side.")
     return p.parse_args()
 
 
@@ -240,6 +250,28 @@ def main() -> int:
         print(f"\n[oracle · GT · scoring only] Sim(3) fit: {err3}")
         print(f"  -> scale {err3.scale:.4f} is the value the road/GPS methods should hit; ATE = residual after removing it")
 
+    # ---- Route B: resolve the global scale from GPS (GT-free) ----
+    res, gps_ref_xy, gps_valid = None, None, None
+    if args.route_b:
+        streams = load_proprio_streams(args.dataroot, scene_name, version=args.version)
+        if not streams.gps:
+            print("\n[route B] no GPS stream (nuScenes-CAN expansion missing) -- skipping.")
+        else:
+            gps_ref_xy, gps_valid = gps_positions_at(streams, [kf.timestamp_us for kf, _ in frames])
+            s2e_b = frames[0][0].calib.sensor2ego.matrix()
+            try:
+                res = resolve_scale_gps(est, gps_ref_xy, s2e_b, gps_valid)
+                print(f"\n[route B · GPS · no GT] scale = {res.scale:.4f}  "
+                      f"(horizontal residual {res.residual:.3f} m, {res.num_iters} iters, "
+                      f"{int(gps_valid.sum())}/{len(gps_valid)} frames)")
+                if args.eval_gt:
+                    rel = abs(res.scale - err3.scale) / err3.scale
+                    print(f"  vs oracle scale {err3.scale:.4f}: relative difference {rel:.1%}  "
+                          f"(agreement validates the GPS route without touching GT)")
+            except NotImplementedError as exc:
+                print(f"\n[route B] pending: {exc}")
+                print("          implement resolve_scale_gps (nuslam.recon.scale) -- see the Umeyama handout.")
+
     # ---- Rerun: horizontal, upright metric-up-to-scale reconstruction ----
     # Everything is rotated by R_VIZ into a Z-up world before logging, so the road
     # sits horizontal and the scene stands upright in the viewer.
@@ -249,13 +281,30 @@ def main() -> int:
         # Whole-scene paths -> static, so they show at every time cursor (logged before
         # the loop's first set_time, they'd otherwise be absent from the frame timeline).
         rrlog.log_trajectory("traj/est", est[:, :3, 3] @ R_VIZ.T, color=(80, 200, 120), static=True)
-        if args.eval_gt:  # oracle overlay, in GT's own frame: GT + Sim(3)-aligned est
-            # GT-frame scene is metric (tens of m, offset far from origin) -- a 0.1 m
-            # tube is sub-pixel there, so scale the line radius to the trajectory extent.
-            gt_diag = float(np.linalg.norm(gt[:, :3, 3].max(0) - gt[:, :3, 3].min(0)))
-            traj_r = max(0.08, 0.002 * gt_diag)
-            rrlog.log_trajectory("traj/gt_oracle", gt[:, :3, 3], color=(60, 200, 255), radius=traj_r, static=True)
-            rrlog.log_trajectory("traj/est_gtaligned", est_aligned, color=(200, 160, 60), radius=traj_r, static=True)
+        # Map-frame overlay: place the reconstruction by the GPS Sim(3) (Route B) when it
+        # ran, else by the GT Sim(3). Whichever is used, GT (cyan) and the GPS reference
+        # track (green) are drawn alongside for comparison. This frame is already Z-up
+        # (GT/GPS map frame), so no R_VIZ here.
+        T_ref = res.T if res is not None else (T_sim if args.eval_gt else None)
+        ref_scale = res.scale if res is not None else (err3.scale if args.eval_gt else None)
+        map_origin = np.zeros(3)
+        if T_ref is not None:
+            est_ref = est[:, :3, 3] @ T_ref[:3, :3].T + T_ref[:3, 3]   # est cameras in the map
+            # The map frame sits ~1 km from its origin; recenter the whole overlay on the
+            # camera centroid so the view lands on the cameras, not empty space far away.
+            # A pure display shift (subtracted from every map-frame entity) -- geometry unchanged.
+            map_origin = est_ref.mean(0)
+            est_ref = est_ref - map_origin
+            # metric map frame is tens of m -- scale the line radius to the track extent
+            # so a 0.1 m tube is not sub-pixel.
+            diag = float(np.linalg.norm(est_ref.max(0) - est_ref.min(0)))
+            traj_r = max(0.08, 0.002 * diag)
+            rrlog.log_trajectory("traj/est_aligned", est_ref, color=(200, 160, 60), radius=traj_r, static=True)
+            if args.eval_gt:  # GT camera track, for comparison
+                rrlog.log_trajectory("traj/gt", gt[:, :3, 3] - map_origin, color=(60, 200, 255), radius=traj_r, static=True)
+            if res is not None:  # the GPS reference track the fit was aligned to, on z=0
+                gps3 = np.column_stack([gps_ref_xy[gps_valid], np.zeros(int(gps_valid.sum()))])
+                rrlog.log_trajectory("traj/gps", gps3 - map_origin, color=(80, 220, 120), radius=traj_r, static=True)
         for i, (kf, dm) in enumerate(frames):
             rrlog.set_time(kf.frame_index, kf.timestamp_us, t0)
             T = world_from_cam[i]
@@ -268,29 +317,30 @@ def main() -> int:
             rrlog.log_estimated_camera(f"est/{i:03d}", T_VIZ @ T, kf.calib.intrinsic,
                                        kf.calib.width, kf.calib.height, channel=args.camera,
                                        image_plane_distance=plane_dist)
-            if args.eval_gt:  # same camera Sim(3)-aligned into GT's frame -> pyramids on the oracle
-                Rs = T_sim[:3, :3] / err3.scale       # un-fold scale -> orthonormal rotation
+            if T_ref is not None:  # same camera aligned into the map frame -> pyramids on the overlay
+                Rs = T_ref[:3, :3] / ref_scale       # un-fold scale -> orthonormal rotation
                 Ta = np.eye(4)
                 Ta[:3, :3] = Rs @ T[:3, :3]
-                Ta[:3, 3] = T_sim[:3, :3] @ T[:3, 3] + T_sim[:3, 3]
-                rrlog.log_estimated_camera(f"oracle/est/{i:03d}", Ta, kf.calib.intrinsic,
+                Ta[:3, 3] = T_ref[:3, :3] @ T[:3, 3] + T_ref[:3, 3] - map_origin
+                rrlog.log_estimated_camera(f"aligned/est/{i:03d}", Ta, kf.calib.intrinsic,
                                            kf.calib.width, kf.calib.height, channel=args.camera,
-                                           image_plane_distance=(plane_dist * err3.scale if plane_dist else None),
+                                           image_plane_distance=(plane_dist * ref_scale if plane_dist else None),
                                            color=(230, 150, 40))
             if e:
                 continue
             pts, cols = metric_point_cloud(dmetric, kf.image(), kf.calib.intrinsic, T,
                                            stride=args.stride, conf=dm.conf, sky=dm.sky)
             rrlog.log_points(f"depth/{i:03d}", pts @ R_VIZ.T, colors=cols, radii=args.point_size)
-            if args.eval_gt:  # aligned cloud + lidar in GT frame -> a metric reference to eyeball
-                rrlog.log_points(f"oracle/depth/{i:03d}", pts @ T_sim[:3, :3].T + T_sim[:3, 3],
+            if T_ref is not None:  # aligned cloud + lidar in the map frame -> metric reference to eyeball
+                rrlog.log_points(f"aligned/depth/{i:03d}", pts @ T_ref[:3, :3].T + T_ref[:3, 3] - map_origin,
                                  colors=cols, radii=args.point_size)
                 lidar_xyz = lidar_points_global(source, kf)
                 if len(lidar_xyz):
-                    rrlog.log_points(f"oracle/lidar/{i:03d}", lidar_xyz,
+                    rrlog.log_points(f"aligned/lidar/{i:03d}", lidar_xyz - map_origin,
                                      colors=(190, 190, 190), radii=args.lidar_size)
+        _ref_name = "GPS(route B)" if res is not None else ("GT" if args.eval_gt else None)
         print("logged metric-up-to-scale reconstruction (poses + cloud) to Rerun"
-              + ("  [+ GT/lidar oracle overlay]" if args.eval_gt else "")
+              + (f"  [+ {_ref_name}-aligned overlay + lidar]" if _ref_name else "")
               + (f" -> {args.save}" if args.save else ""))
     print("\nmetric upgrade complete (reconstruction is metric up to a global scale).")
     return 0

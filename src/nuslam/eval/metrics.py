@@ -20,32 +20,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
-def umeyama(src: np.ndarray, dst: np.ndarray, *, with_scale: bool) -> tuple[float, np.ndarray, np.ndarray]:
-    """Least-squares similarity mapping ``src`` onto ``dst`` (Umeyama 1991).
-
-    ``src``, ``dst`` are (N, 3). Returns ``(scale, R, t)`` minimizing
-    ``sum ||dst_i - (scale * R @ src_i + t)||^2``. With ``with_scale=False`` the
-    scale is fixed to 1 (pure SE(3) / rigid).
-    """
-    src = np.asarray(src, dtype=np.float64)
-    dst = np.asarray(dst, dtype=np.float64)
-    n = src.shape[0]
-    mu_s, mu_d = src.mean(0), dst.mean(0)
-    sc, dc = src - mu_s, dst - mu_d
-    cov = (dc.T @ sc) / n
-    U, D, Vt = np.linalg.svd(cov)
-    S = np.eye(3)
-    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
-        S[2, 2] = -1  # reflection fix
-    R = U @ S @ Vt
-    if with_scale:
-        var_s = (sc**2).sum() / n
-        scale = float((D * np.diag(S)).sum() / var_s) if var_s > 0 else 1.0
-    else:
-        scale = 1.0
-    t = mu_d - scale * R @ mu_s
-    return scale, R, t
+# The Umeyama primitive lives in transforms.py (framework-neutral geometry) so the
+# metric-scale resolver can reuse it without the core depending on this scoring
+# package; re-exported here to keep ``nuslam.eval.umeyama`` stable.
+from ..transforms import umeyama
 
 
 def align_trajectories(
