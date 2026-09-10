@@ -71,12 +71,34 @@ natively metric.
 The static reconstruction runs (metric scale via GPS, sky masked out of the loss). Two known
 limitations to address next, in order:
 
-1. **Mask out moving vehicles.** The photometric loss assumes a static scene; moving cars
+1. **Handle moving vehicles.** The photometric loss assumes a static scene; moving cars
    violate it and get reconstructed as smeared floaters/ghosts (and inflate the Gaussian
    count). Segment vehicles with **CLIPSeg** (a "vehicle/car" prompt, same mechanism already
-   used for sky) and drop those pixels from the loss. This only removes *dynamic* objects
-   from supervision — parked cars that are consistent across views can stay. (Longer term, the
-   alternative is modelling motion explicitly with **4DGS** rather than masking.)
+   used for sky). The minimum is to **drop those pixels from the static-scene loss** (only
+   *dynamic* vehicles need removing — parked cars consistent across views can stay).
+
+   **Planned approach — reconstruct vehicles as their own Gaussians (compositional, not just
+   masked):**
+   - Take the per-frame CLIPSeg vehicle masks and run the masked regions through **DA3** to
+     get per-object poses and an initialization point cloud for each vehicle.
+   - **Resolve each object cloud's projective + scale ambiguity by reusing the same
+     metric-upgrade machinery** as the full scene (DAQ solve → rectifying homography → metric
+     cameras/cloud), then **pin the remaining scale scalar by matching the object depth against
+     the global-scene point cloud's depth at the masked pixels** — the object and the scene are
+     seen from the *same camera*, so the global reconstruction supplies a metric depth target
+     over exactly those pixels. (Optimizing an `SL(4)` projective transform directly against that
+     target, as in **VGGT-SLAM 1.0**'s submap alignment, is the alternative, but the plan is to
+     reuse the existing metric-upgrade code rather than add a separate projective solve.)
+   - **Optimize a separate 3DGS per vehicle instance** on its masked crops.
+   - **Compose** each object's Gaussians back into the world by transforming with the global
+     poses, concatenating the per-instance splats onto the static-scene splats.
+   - **Instance association across frames** by **Euclidean-distance tracking** of the object
+     centroids (nearest-centroid data association frame-to-frame) to know which mask is which
+     vehicle over time.
+
+   This keeps dynamic objects *in* the reconstruction (rather than only removing them) as
+   posed rigid sub-models — a compositional-scene-graph alternative to modelling motion with a
+   single monolithic **4DGS**.
 2. **Refine camera poses.** Poses are currently **frozen** at the DA3/metric-upgrade estimate,
    which sits **~2 m from GT on average** (measured: mean 2.09 m, max 5.76 m offset over
    scene-0061) — a ceiling on how sharp any render can get, since the training views are
