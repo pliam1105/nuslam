@@ -42,7 +42,7 @@ intrinsic mismatch `Mᵢ = K_true⁻¹K_da3ᵢ` (the mismatches need not be equa
 per frame, and each is folded into its own camera) makes every normalized camera a calibrated one
 times that one homography, so its dual image of the absolute conic is `I`:
 
-$$\tilde P_i = M_i\,[R_i\mid t_i] = [R_i^{*}\mid t_i^{*}]\,H,\qquad \Omega^{*}=H^{-1}\begin{bmatrix}I_3&0\\\\0&0\end{bmatrix}H^{-\top}$$
+$$\tilde P_i = M_i\,[R_i\mid t_i] = [R_i^{*}\mid t_i^{*}]\,H,\qquad \Omega^{*}=H^{-1}\begin{bmatrix}I_3&0\\0&0\end{bmatrix}H^{-\top}$$
 
 The dual absolute quadric `Ω*` then satisfies, per camera and up to an unknown per-frame scale `λᵢ²`:
 
@@ -158,7 +158,7 @@ scene is dynamic or under-constrained.
 The reconstruction rendered along the estimated (DA3/metric-upgrade) camera trajectory:
 
 <p align="center">
-  <video src="https://github.com/pliam1105/nuslam/raw/main/docs/run4_flythrough.mp4" controls muted loop width="90%"></video>
+  <video src="docs/run4_flythrough.mp4" controls muted loop width="90%"></video>
 </p>
 <p align="center"><sub>Regenerate with <code>scripts/render_gs_video.py --scene scene-0061 --run run4 --mode flythrough</code>.</sub></p>
 
