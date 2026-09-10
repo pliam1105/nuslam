@@ -35,60 +35,64 @@ initialization cloud.
 
 ### Metric upgrade (DAQ)
 
-DA3-Base returns per frame a pose `[Rᵢ|tᵢ]` and its own intrinsics `K_da3ᵢ`; interpreting those
-cameras with the true `K_true` gives a reconstruction that is only projective, related to the
-metric scene by a single 4×4 world homography `H`. Normalizing each camera by its known per-frame
-intrinsic mismatch `Mᵢ = K_true⁻¹K_da3ᵢ` (the mismatches need not be equal — DA3's focal drifts
-per frame, and each is folded into its own camera) makes every normalized camera a calibrated one
-times that one homography, so its dual image of the absolute conic is `I`:
+DA3-Base returns per frame a pose $[R_i \mid t_i]$ and its own intrinsics $K_{\mathrm{da3},i}$;
+interpreting those cameras with the true $K_{\mathrm{true}}$ gives a reconstruction that is only
+projective, related to the metric scene by a single $4\times4$ world homography $H$. Normalizing
+each camera by its known per-frame intrinsic mismatch $M_i = K_{\mathrm{true}}^{-1}K_{\mathrm{da3},i}$
+(the mismatches need not be equal — DA3's focal drifts per frame, and each is folded into its own
+camera) makes every normalized camera a calibrated one times that one homography, so its dual image
+of the absolute conic is $I$:
 
-$$\tilde P_i = M_i\,[R_i\mid t_i] = [R_i^{*}\mid t_i^{*}]\,H,\qquad \Omega^{*}=H^{-1}\begin{bmatrix}I_3&0\\0&0\end{bmatrix}H^{-\top}$$
+$$\tilde P_i = M_i\,[R_i \mid t_i] = [R_i^{\ast}\mid t_i^{\ast}]\,H,\qquad \Omega^{\ast}=H^{-1}\,\mathrm{diag}(1,1,1,0)\,H^{-\top}$$
 
-The dual absolute quadric `Ω*` then satisfies, per camera and up to an unknown per-frame scale `λᵢ²`:
+The dual absolute quadric $\Omega^{\ast}$ then satisfies, per camera and up to an unknown per-frame
+scale $\lambda_i^{2}$:
 
-$$\tilde P_i\,\Omega^{*}\,\tilde P_i^{\top}=\lambda_i^{2}\,I_3$$
+$$\tilde P_i\,\Omega^{\ast}\,\tilde P_i^{\top}=\lambda_i^{2}\,I_3$$
 
-Encoding "proportional to `I`" (off-diagonals zero, diagonals equal) eliminates `λᵢ²` and leaves
-linear homogeneous constraints on the ten entries of the symmetric `Ω*`; stacked, they form a DLT
-solved by the smallest right singular vector, projected to rank-3 PSD. The plane at infinity is
-the null vector `Ω*π∞ = 0`; fixing camera 0 as canonical, the rectifying homography is
-`H = [[M₀, 0], [vᵀ, s]]` with `π∞ = (v, s)` and `M₀ = K_true⁻¹K_da3₀` the first camera's mismatch.
-It upgrades the reconstruction by `X_metric = H·X_proj`. `nuslam.recon.metric_upgrade`.
+Encoding "proportional to $I$" (off-diagonals zero, diagonals equal) eliminates $\lambda_i^{2}$ and
+leaves linear homogeneous constraints on the ten entries of the symmetric $\Omega^{\ast}$; stacked,
+they form a DLT solved by the smallest right singular vector, projected to rank-3 PSD. The plane at
+infinity is the null vector, $\Omega^{\ast}\pi_\infty = 0$; fixing camera 0 as canonical, the
+rectifying homography $H$ takes the block form with top-left $M_0$ and bottom row $(v^{\top}\; s)$,
+where $\pi_\infty = (v, s)$ and $M_0 = K_{\mathrm{true}}^{-1}K_{\mathrm{da3},0}$ is the first
+camera's mismatch. It upgrades the reconstruction by $X_{\mathrm{metric}} = H\,X_{\mathrm{proj}}$.
+`nuslam.recon.metric_upgrade`.
 
 Dominantly-forward driving under-constrains the plane at infinity, so the plain solve lets the
-conic block `Ω*[:3,:3]` drift from the value it must equal, `W₀ = M₀⁻¹M₀⁻ᵀ` (known, since `M₀`
-is). A soft prior (`--m-weight`) pins that block to `W₀`; the free correctness check is that each
-recovered `K ≈ [c, c, 1]`.
+conic block $\Omega^{\ast}_{3\times3}$ drift from the value it must equal,
+$W_0 = M_0^{-1}M_0^{-\top}$ (known, since $M_0$ is). A soft prior (`--m-weight`) pins that block to
+$W_0$; the free correctness check is that each recovered $K \approx \mathrm{diag}(c,c,1)$.
 
 ### Scale resolution
 
-The one remaining scalar is currently resolved from GPS. GPS (nuScenes-CAN) measures the ego
-ground point, offset from the recovered camera centre `Cᵢ` by the camera→ground lever arm
-`a = −R_c2eᵀ t_c2e` (the ego origin in the camera frame, metric, from `sensor2ego`). Rotating it
-into the world frame by each camera's own recovered orientation, `bᵢ = R^w_i a`, and pinning the
-target to the measured ground plane, `yᵢ = (gps_xᵢ, gps_yᵢ, 0)`, the metric scale is the Sim(3)
-fit minimizing
+The one remaining scalar is currently resolved from GPS. GPS (nuScenes-CAN) measures the ego ground
+point, offset from the recovered camera centre $C_i$ by the camera-to-ground lever arm
+$a = -R_{c2e}^{\top} t_{c2e}$ (the ego origin in the camera frame, metric, from the `sensor2ego`
+extrinsic). Rotating it into the world frame by each camera's own recovered orientation,
+$b_i = R^{w}_i\,a$, and pinning the target to the measured ground plane,
+$y_i = (\mathrm{gps}_{x,i},\ \mathrm{gps}_{y,i},\ 0)$, the metric scale is the Sim(3) fit minimizing
 
 $$E(s,R,t)=\frac1n\sum_i\big\lVert y_i-sRC_i-Rb_i-t\big\rVert^{2}$$
 
-Eliminating `t` (centroids) and `s` in closed form leaves an objective in `R` that is quadratic —
-the `(tr RA)² / P` scale–lever-arm coupling — not the linear trace the Procrustes SVD closes, so
-no finite closed form exists. It is solved as a fixed point: initialize `R = I`, form modified
-targets `yᵢ − R bᵢ`, run a plain closed-form Umeyama Sim(3) fit of `{Cᵢ}` onto them, and repeat
-(two–three iterations suffice). The `z = 0` pin supplies the vertical a 2-D GPS track lacks; the
-camera height enters only through the measured `a`, never assumed. The semantic ground/wheel-contact
-anchor — the intended scale source, acting directly on the Gaussians — is the core next step (see
-Roadmap). The same Umeyama fit against GT scores a finished reconstruction (ATE/RPE); once scale is
-resolved legitimately its `s` reads ≈ 1.
+Eliminating $t$ (centroids) and $s$ in closed form leaves an objective in $R$ that is quadratic —
+the $(\mathrm{tr}\,RA)^{2}/P$ scale–lever-arm coupling — not the linear trace the Procrustes SVD
+closes, so no finite closed form exists. It is solved as a fixed point: initialize $R = I$, form
+modified targets $y_i - R\,b_i$, run a plain closed-form Umeyama Sim(3) fit of $\{C_i\}$ onto them,
+and repeat (two–three iterations suffice). The $z = 0$ pin supplies the vertical a 2-D GPS track
+lacks; the camera height enters only through the measured $a$, never assumed. The semantic
+ground/wheel-contact anchor — the intended scale source, acting directly on the Gaussians — is the
+core next step (see Roadmap). The same Umeyama fit against GT scores a finished reconstruction
+(ATE/RPE); once scale is resolved legitimately its $s$ reads $\approx 1$.
 
 ### Gaussian-splat reconstruction
 
 The metric cloud seeds a 3D Gaussian-splat reconstruction, optimized with gsplat's rasterizer and
 MCMC densification. The representation is reparametrized so every raw parameter is unconstrained
-and every step stays a valid Gaussian (scale via `exp`, opacity via `sigmoid`, quaternions
+and every step stays a valid Gaussian (scale via $\exp$, opacity via $\sigma$, quaternions
 normalized). Sky is segmented with CLIPSeg and masked out of both the loss and the initialization,
 so no Gaussians are grown to reconstruct sky. The photometric loss is L1 + D-SSIM over non-sky
-pixels; with per-pixel keep-mask `m`, render `Î` and target `I`:
+pixels; with per-pixel keep-mask $m$, render $\hat I$ and target $I$:
 
 $$\mathcal{L}=(1-\lambda)\,\frac{\sum_i m_i\,\lVert \hat I_i - I_i\rVert_1}{\sum_i m_i}+\lambda\,\big(1-\mathrm{SSIM}(m\hat I,\,mI)\big),\qquad \lambda=0.5$$
 
@@ -125,21 +129,21 @@ iteration.
 
 ### Metric upgrade
 
-The `M₀` soft prior is the difference between a drifting and a well-conditioned DAQ solve on
+The $M_0$ soft prior is the difference between a drifting and a well-conditioned DAQ solve on
 near-straight driving:
 
 | Metric | `--m-weight 0` | `--m-weight 1` (default) |
 |---|---|---|
-| Conic-block-vs-`W₀` deviation | 0.33 | **0.04** |
-| Null-space eigenvalue gap `A_gap` | 1.4 | **3.1** |
-| Recovered-`K` anisotropy (max) | 1.11 | **0.53** |
+| Conic-block-vs-$W_0$ deviation | 0.33 | **0.04** |
+| Null-space eigenvalue gap $A_{\mathrm{gap}}$ | 1.4 | **3.1** |
+| Recovered-$K$ anisotropy (max) | 1.11 | **0.53** |
 | Oracle ATE rmse (m) | 4.5 | **2.2** |
 
-The prior does not touch `RPE_t` — that residual lives in DA3's own reconstruction geometry, not
-the upgrade. The GPS scale fit resolves the global scale at 20.57 (recon units → metres) on this
-scene, with no use of GT.
+The prior does not touch $\mathrm{RPE}_t$ — that residual lives in DA3's own reconstruction
+geometry, not the upgrade. The GPS scale fit resolves the global scale at 20.57 (recon units →
+metres) on this scene, with no use of GT.
 
-<p align="center"><img src="docs/alignment.png" width="50%" alt="Top-down metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks"></p>
+<p align="center"><img src="docs/alignment.png" width="75%" alt="Top-down metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks"></p>
 <p align="center"><sub>Metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks by the Sim(3) GPS fit.</sub></p>
 
 ### Gaussian-splat reconstruction
@@ -158,7 +162,7 @@ scene is dynamic or under-constrained.
 The reconstruction rendered along the estimated (DA3/metric-upgrade) camera trajectory:
 
 <p align="center">
-  <video src="docs/run4_flythrough.mp4" controls muted loop width="90%"></video>
+  <video src="https://github.com/pliam1105/nuslam/raw/main/docs/run4_flythrough.mp4" controls muted loop width="90%"></video>
 </p>
 <p align="center"><sub>Regenerate with <code>scripts/render_gs_video.py --scene scene-0061 --run run4 --mode flythrough</code>.</sub></p>
 
