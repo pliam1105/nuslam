@@ -66,6 +66,25 @@ recovers the metric value in isolation (the core hypothesis); *Rung 2* drops the
 lets the ground/wheel residual act directly on the Gaussians, so the reconstruction is
 natively metric.
 
+### Immediate next steps (within stage 3)
+
+The static reconstruction runs (metric scale via GPS, sky masked out of the loss). Two known
+limitations to address next, in order:
+
+1. **Mask out moving vehicles.** The photometric loss assumes a static scene; moving cars
+   violate it and get reconstructed as smeared floaters/ghosts (and inflate the Gaussian
+   count). Segment vehicles with **CLIPSeg** (a "vehicle/car" prompt, same mechanism already
+   used for sky) and drop those pixels from the loss. This only removes *dynamic* objects
+   from supervision — parked cars that are consistent across views can stay. (Longer term, the
+   alternative is modelling motion explicitly with **4DGS** rather than masking.)
+2. **Refine camera poses.** Poses are currently **frozen** at the DA3/metric-upgrade estimate,
+   which sits **~2 m from GT on average** (measured: mean 2.09 m, max 5.76 m offset over
+   scene-0061) — a ceiling on how sharp any render can get, since the training views are
+   placed wrong. Let the poses be optimized jointly through the rasterizer via an **SE(3)
+   tangent-space delta** (`exp(ξ^)` retraction on `viewmats`), which needs the manifold-
+   optimization tooling (Lie-algebra parametrization + retraction) put in place first. This is
+   the pose-through-rasterizer gradient path noted in §3c of `CLAUDE.md`.
+
 ## What's built vs. what's core
 
 | Layer | Module | Status |
