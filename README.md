@@ -1,237 +1,255 @@
-# nuslam — monocular metric Gaussian-splat reconstruction on nuScenes
+# Monocular Metric 3D Gaussian-Splat Reconstruction on nuScenes
 
-Reconstruct a scene from a **single** nuScenes camera as **3D (or 2D) Gaussians**,
-refine the camera poses **through the differentiable rasterizer**, and resolve the
-**monocular scale** metrically — never by reading it from ground truth.
+Reconstruct a scene from a single nuScenes camera as 3D Gaussians, refine the camera poses
+through the differentiable rasterizer, and resolve the monocular scale metrically — never by
+reading it from ground truth. Built and evaluated on nuScenes-mini as a proof-of-concept, with
+the pipeline structured to scale up to full nuScenes.
 
-A monocular reconstruction model (Depth Anything 3, **DA3-Base**) supplies a full
-joint reconstruction — per-frame depth, pose, and intrinsics — but under a wrong,
-intrinsic-agnostic calibration. A **metric upgrade** recovers the true geometry from
-it: knowing the true intrinsics collapses the projective ambiguity to a
-**metric-up-to-scale** reconstruction via a dual-absolute-quadric (DAQ) solve. The one
-remaining scalar — global metric scale — is then resolved by **semantic ground
-constraints** (road/ground plane + wheel-contact), and independently cross-checked
-against **GPS/IMU**. The anchor acts directly on the reconstruction, so the result is
-natively metric.
+## Motivation
 
-**The novel core.** Monocular splat-SLAM (MonoGS) inherits scale ambiguity;
-uncalibrated approaches (VGGT-SLAM) inherit the full projective ambiguity. Resolving
-metric scale *inside* a splat reconstruction from semantic geometry — with known
-intrinsics collapsing projective → metric-up-to-scale first — is the contribution.
-The stratification the pipeline walks:
+A monocular reconstruction is ambiguous: from images alone the geometry is fixed only up to a
+projective transform, and a calibrated one only up to a global scale. Existing monocular
+splat-SLAM (MonoGS) inherits that scale ambiguity; uncalibrated feed-forward approaches
+(VGGT-SLAM) inherit the full projective ambiguity. The problem of interest is recovering metric
+geometry — real metres — without ever reading scale from ground truth, as a real vehicle must
+from cameras plus cheap proprioception.
 
-```
-Projective  --known K-->  Metric-up-to-scale  --scale: ground / GPS-->  Metric
-DAQ Ω*, 15 DoF            Sim(3), 7 DoF                                 SE(3), 6 DoF
-```
+The approach collapses one ambiguity at a time with an independent piece of knowledge: known
+intrinsics collapse the projective reconstruction to metric-up-to-scale via a dual-absolute-quadric
+(DAQ) solve, and the remaining global scale is resolved from a GPS/IMU reference trajectory (with
+a semantic ground/wheel anchor as the eventual, GT-free scale source). Resolving metric scale
+inside a Gaussian-splat reconstruction, projective collapsed to metric-up-to-scale first, is the
+contribution. Ground truth (nuScenes poses, lidar) is used only as an oracle to score a finished
+reconstruction; scale is never fitted from it.
 
-The full staged plan is in `Metric_Anchored_GS_SLAM_Engineering_Plan_v4.pdf` (with
-the metric-upgrade derivation in `Metric_Upgrade_Known_Intrinsics_Handbook.pdf` and
-the trajectory-alignment math in `Umeyama_Alignment_Handout.pdf`).
+## Method
 
-> **Scope of this repository.** The reconstruction core — the Gaussian representation
-> and initialization, the gsplat rasterizer calls, the training loop, the pose
-> refinement, every loss (photometric + metric-anchor) and their weighting, the
-> DAQ metric-upgrade solve, and the scale-resolution geometry — is the core substance
-> and is **written by hand** (not generated). What lives here as infrastructure: data,
-> segmentation, running the delegated frontend models (depth/tracking), visualization,
-> evaluation, and the gsplat build toolchain. The only delegated dependency is gsplat's
-> internal CUDA kernels.
->
-> **Ground truth is an oracle, never an input.** nuScenes GT poses and lidar score a
-> finished reconstruction; scale is never fitted from GT (that would be cheating).
+A sequence of stages, each falsifiable on its own before the next is built.
 
-## Pipeline (staged)
+### DA3-Base reconstruction
 
-Five stages; each is falsifiable on its own before the next is built. Stages 0–1 are
-built; 2–4 are the work ahead.
+Depth Anything 3 (DA3-Base) supplies a full joint monocular reconstruction — per-frame depth,
+pose, and intrinsics — but under a wrong, intrinsic-agnostic calibration (a projective
+reconstruction). This is the delegated frontend; its per-frame depth also seeds the Gaussian
+initialization cloud.
 
-0. **Infrastructure** *(built)* — data, frontend (depth/segmentation/tracking), lidar
-   eval, Rerun viz, gsplat toolchain.
-1. **DA3 metric upgrade** *(built + tested)* — DA3-Base reconstruction → normalized
-   projective cameras → DAQ solve for the dual absolute quadric → plane at infinity →
-   rectifying homography → metric cameras, corrected depth, and the **metric-up-to-scale**
-   point cloud. `nuslam.recon.metric_upgrade` (hand-written core).
-2. **Scale resolution** *(next)* — the one global scalar, three ways, **none using GT**:
-   **(A) road/ground + wheel-contact** on the unprojected cloud (the novel core);
-   **(B) GPS(+IMU tilt, +compass heading)** → a reference trajectory that the DA3 poses
-   are Sim(3)-fit to; **(C) joint**. The three should agree; GT scores them afterward.
-3. **Gaussian refinement** *(common tail)* — splatting with pose refinement + ground
-   constraints (photometric + metric-anchor losses, weighting schedule).
-4. **Factor-graph SLAM** *(future)* — render-as-a-factor + IMU/GPS/wheel + loop closure;
-   multi-submap; DA3-SLAM follow-on.
+### Metric upgrade (DAQ)
 
-**Route A is de-risked in two rungs:** *Rung 1* adds an explicit scalar `s` and checks it
-recovers the metric value in isolation (the core hypothesis); *Rung 2* drops the scalar and
-lets the ground/wheel residual act directly on the Gaussians, so the reconstruction is
-natively metric.
+DA3-Base returns per frame a pose `[Rᵢ|tᵢ]` and its own intrinsics `K_da3ᵢ`; interpreting those
+cameras with the true `K_true` gives a reconstruction that is only projective, related to the
+metric scene by a single 4×4 world homography `H`. Normalizing each camera by its known per-frame
+intrinsic mismatch `Mᵢ = K_true⁻¹K_da3ᵢ` (the mismatches need not be equal — DA3's focal drifts
+per frame, and each is folded into its own camera) makes every normalized camera a calibrated one
+times that one homography, so its dual image of the absolute conic is `I`:
 
-### Immediate next steps (within stage 3)
+$$\tilde P_i = M_i\,[R_i\mid t_i] = [R_i^{*}\mid t_i^{*}]\,H,\qquad \Omega^{*}=H^{-1}\begin{bmatrix}I_3&0\\\\0&0\end{bmatrix}H^{-\top}$$
 
-The static reconstruction runs (metric scale via GPS, sky masked out of the loss). Two known
-limitations to address next, in order:
+The dual absolute quadric `Ω*` then satisfies, per camera and up to an unknown per-frame scale `λᵢ²`:
 
-1. **Handle moving vehicles.** The photometric loss assumes a static scene; moving cars
-   violate it and get reconstructed as smeared floaters/ghosts (and inflate the Gaussian
-   count). Segment vehicles with **CLIPSeg** (a "vehicle/car" prompt, same mechanism already
-   used for sky). The minimum is to **drop those pixels from the static-scene loss** (only
-   *dynamic* vehicles need removing — parked cars consistent across views can stay).
+$$\tilde P_i\,\Omega^{*}\,\tilde P_i^{\top}=\lambda_i^{2}\,I_3$$
 
-   **Planned approach — reconstruct vehicles as their own Gaussians (compositional, not just
-   masked):**
-   - Take the per-frame CLIPSeg vehicle masks and run the masked regions through **DA3** to
-     get per-object poses and an initialization point cloud for each vehicle.
-   - **Resolve each object cloud's projective + scale ambiguity by reusing the same
-     metric-upgrade machinery** as the full scene (DAQ solve → rectifying homography → metric
-     cameras/cloud), then **pin the remaining scale scalar by matching the object depth against
-     the global-scene point cloud's depth at the masked pixels** — the object and the scene are
-     seen from the *same camera*, so the global reconstruction supplies a metric depth target
-     over exactly those pixels. (Optimizing an `SL(4)` projective transform directly against that
-     target, as in **VGGT-SLAM 1.0**'s submap alignment, is the alternative, but the plan is to
-     reuse the existing metric-upgrade code rather than add a separate projective solve.)
-   - **Optimize a separate 3DGS per vehicle instance** on its masked crops.
-   - **Compose** each object's Gaussians back into the world by transforming with the global
-     poses, concatenating the per-instance splats onto the static-scene splats.
-   - **Instance association across frames** by **Euclidean-distance tracking** of the object
-     centroids (nearest-centroid data association frame-to-frame) to know which mask is which
-     vehicle over time.
+Encoding "proportional to `I`" (off-diagonals zero, diagonals equal) eliminates `λᵢ²` and leaves
+linear homogeneous constraints on the ten entries of the symmetric `Ω*`; stacked, they form a DLT
+solved by the smallest right singular vector, projected to rank-3 PSD. The plane at infinity is
+the null vector `Ω*π∞ = 0`; fixing camera 0 as canonical, the rectifying homography is
+`H = [[M₀, 0], [vᵀ, s]]` with `π∞ = (v, s)` and `M₀ = K_true⁻¹K_da3₀` the first camera's mismatch.
+It upgrades the reconstruction by `X_metric = H·X_proj`. `nuslam.recon.metric_upgrade`.
 
-   This keeps dynamic objects *in* the reconstruction (rather than only removing them) as
-   posed rigid sub-models — a compositional-scene-graph alternative to modelling motion with a
-   single monolithic **4DGS**.
-2. **Refine camera poses.** Poses are currently **frozen** at the DA3/metric-upgrade estimate,
-   which sits **~2 m from GT on average** (measured: mean 2.09 m, max 5.76 m offset over
-   scene-0061) — a ceiling on how sharp any render can get, since the training views are
-   placed wrong. Let the poses be optimized jointly through the rasterizer via an **SE(3)
-   tangent-space delta** (`exp(ξ^)` retraction on `viewmats`), which needs the manifold-
-   optimization tooling (Lie-algebra parametrization + retraction) put in place first. This is
-   the pose-through-rasterizer gradient path noted in §3c of `CLAUDE.md`.
+Dominantly-forward driving under-constrains the plane at infinity, so the plain solve lets the
+conic block `Ω*[:3,:3]` drift from the value it must equal, `W₀ = M₀⁻¹M₀⁻ᵀ` (known, since `M₀`
+is). A soft prior (`--m-weight`) pins that block to `W₀`; the free correctness check is that each
+recovered `K ≈ [c, c, 1]`.
 
-## What's built vs. what's core
+### Scale resolution
 
-| Layer | Module | Status |
+The one remaining scalar is currently resolved from GPS. GPS (nuScenes-CAN) measures the ego
+ground point, offset from the recovered camera centre `Cᵢ` by the camera→ground lever arm
+`a = −R_c2eᵀ t_c2e` (the ego origin in the camera frame, metric, from `sensor2ego`). Rotating it
+into the world frame by each camera's own recovered orientation, `bᵢ = R^w_i a`, and pinning the
+target to the measured ground plane, `yᵢ = (gps_xᵢ, gps_yᵢ, 0)`, the metric scale is the Sim(3)
+fit minimizing
+
+$$E(s,R,t)=\frac1n\sum_i\big\lVert y_i-sRC_i-Rb_i-t\big\rVert^{2}$$
+
+Eliminating `t` (centroids) and `s` in closed form leaves an objective in `R` that is quadratic —
+the `(tr RA)² / P` scale–lever-arm coupling — not the linear trace the Procrustes SVD closes, so
+no finite closed form exists. It is solved as a fixed point: initialize `R = I`, form modified
+targets `yᵢ − R bᵢ`, run a plain closed-form Umeyama Sim(3) fit of `{Cᵢ}` onto them, and repeat
+(two–three iterations suffice). The `z = 0` pin supplies the vertical a 2-D GPS track lacks; the
+camera height enters only through the measured `a`, never assumed. The semantic ground/wheel-contact
+anchor — the intended scale source, acting directly on the Gaussians — is the core next step (see
+Roadmap). The same Umeyama fit against GT scores a finished reconstruction (ATE/RPE); once scale is
+resolved legitimately its `s` reads ≈ 1.
+
+### Gaussian-splat reconstruction
+
+The metric cloud seeds a 3D Gaussian-splat reconstruction, optimized with gsplat's rasterizer and
+MCMC densification. The representation is reparametrized so every raw parameter is unconstrained
+and every step stays a valid Gaussian (scale via `exp`, opacity via `sigmoid`, quaternions
+normalized). Sky is segmented with CLIPSeg and masked out of both the loss and the initialization,
+so no Gaussians are grown to reconstruct sky. The photometric loss is L1 + D-SSIM over non-sky
+pixels; with per-pixel keep-mask `m`, render `Î` and target `I`:
+
+$$\mathcal{L}=(1-\lambda)\,\frac{\sum_i m_i\,\lVert \hat I_i - I_i\rVert_1}{\sum_i m_i}+\lambda\,\big(1-\mathrm{SSIM}(m\hat I,\,mI)\big),\qquad \lambda=0.5$$
+
+The photometric term is scale-free. The metric-anchor loss (ground-plane + wheel-contact residual)
+is the term that breaks the scale gauge and makes the reconstruction natively metric; with joint
+pose refinement through the rasterizer it is the current work (see Roadmap).
+
+## Architecture
+
+| Component | Module / symbol | Status |
 |---|---|---|
-| nuScenes monocular keyframe stream + calibration/GT + windowing | `nuslam.data` | infrastructure (built) |
-| Monocular depth + DA3-Base full reconstruction (depth+pose+K) | `nuslam.frontend` | infrastructure (built) |
-| Road/ground segmentation (CLIPSeg) + optional tracking (CoTracker/KLT) | `nuslam.frontend` | infrastructure (built) |
-| Lidar-into-camera projection: calib check + depth-vs-lidar eval | `nuslam.data` / `nuslam.eval` | infrastructure (built) |
-| **DA3 metric upgrade: DAQ solve, rectifying homography, metric cameras/depth/cloud** | `nuslam.recon.metric_upgrade` | **core (written by hand) — built + tested** |
-| **Scale resolution (road/ground + wheel-contact; GPS/IMU Sim(3) fit)** | `nuslam.recon` | **core (written by hand) — next** |
-| **Gaussian-splat reconstruction: representation, gsplat calls, training loop, pose refinement, losses** | `nuslam.recon` | **core (written by hand) — next** |
-| Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure (built) |
-| Trajectory eval (Umeyama Sim(3)/SE(3), ATE/RPE) — GT as oracle | `nuslam.eval` | infrastructure (built) |
-| Factor-graph SLAM integration (render-as-a-factor + fusion) | `nuslam.backend` | staged extension (parked) |
+| nuScenes monocular keyframe stream + calibration/GT + windowing | `nuslam.data` | infrastructure |
+| Monocular depth + DA3-Base reconstruction (depth+pose+K) | `nuslam.frontend` | infrastructure |
+| Road/ground + sky segmentation (CLIPSeg), tracking (CoTracker/KLT) | `nuslam.frontend` | infrastructure |
+| Lidar-into-camera projection: calib check + depth-vs-lidar eval | `nuslam.data` / `nuslam.eval` | infrastructure |
+| DA3 metric upgrade: DAQ solve, rectifying homography, metric cameras/depth/cloud | `nuslam.recon.metric_upgrade` | core — built + tested |
+| GPS/IMU Sim(3) scale fit | `nuslam.recon` | core — built |
+| Ground/wheel-contact scale anchor; Gaussian pose refinement; metric-anchor loss | `nuslam.recon` | core — in progress |
+| 3DGS representation, gsplat calls, training loop, photometric loss, sky masking | `nuslam.recon.gaussians` | core — built |
+| Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure |
+| Trajectory eval (Umeyama Sim(3)/SE(3), ATE/RPE) — GT as oracle | `nuslam.eval` | infrastructure |
+| Factor-graph SLAM integration (render-as-a-factor + fusion) | `nuslam.backend` | parked |
 
-## Setup
+The reconstruction core — the Gaussian representation and initialization, the gsplat rasterizer
+calls, the training loop, the pose refinement, the losses, the DAQ metric-upgrade solve, and the
+scale-resolution geometry — is written by hand. The only delegated dependency is gsplat's internal
+CUDA kernels; the surrounding data, segmentation, frontend models, visualization, and evaluation
+are infrastructure.
+
+## Results
+
+Run on nuScenes-mini `scene-0061` (39 keyframes, CAM_FRONT), for pipeline validation and fast
+iteration.
+
+### Metric upgrade
+
+The `M₀` soft prior is the difference between a drifting and a well-conditioned DAQ solve on
+near-straight driving:
+
+| Metric | `--m-weight 0` | `--m-weight 1` (default) |
+|---|---|---|
+| Conic-block-vs-`W₀` deviation | 0.33 | **0.04** |
+| Null-space eigenvalue gap `A_gap` | 1.4 | **3.1** |
+| Recovered-`K` anisotropy (max) | 1.11 | **0.53** |
+| Oracle ATE rmse (m) | 4.5 | **2.2** |
+
+The prior does not touch `RPE_t` — that residual lives in DA3's own reconstruction geometry, not
+the upgrade. The GPS scale fit resolves the global scale at 20.57 (recon units → metres) on this
+scene, with no use of GT.
+
+<p align="center"><img src="docs/alignment.png" width="50%" alt="Top-down metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks"></p>
+<p align="center"><sub>Metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks by the Sim(3) GPS fit.</sub></p>
+
+### Gaussian-splat reconstruction
+
+The static reconstruction runs metrically with sky masked out. Held-out novel-view PSNR peaks
+early (~14.8 dB near iteration 500) and then declines to ~14 dB as the Gaussian count grows to the
+5M cap — added Gaussians overfit the training views rather than improving novel views.
+
+<p align="center"><img src="docs/training_curves.png" width="90%" alt="Training loss; held-out PSNR declining while Gaussian count rises to the 5M cap"></p>
+
+Train views reconstruct roughly; held-out views are noticeably ghosted, with floaters where the
+scene is dynamic or under-constrained.
+
+<p align="center"><img src="docs/render_compare.png" width="85%" alt="GT vs render for a train and a held-out view; train roughly reconstructed, held-out ghosted"></p>
+
+The reconstruction rendered along the estimated (DA3/metric-upgrade) camera trajectory:
+
+<p align="center">
+  <video src="https://github.com/pliam1105/nuslam/raw/main/docs/run4_flythrough.mp4" controls muted loop width="90%"></video>
+</p>
+<p align="center"><sub>Regenerate with <code>scripts/render_gs_video.py --scene scene-0061 --run run4 --mode flythrough</code>.</sub></p>
+
+The ceiling is not Gaussian count or iterations (both were saturated) but pose error: the frozen
+DA3/metric-upgrade trajectory sits a mean of 2.09 m (max 5.76 m) from GT after the Sim(3)
+alignment, so the training views themselves are placed wrong.
+
+<p align="center"><img src="docs/trajectory.png" width="95%" alt="Top-down camera trajectory, DA3 estimate vs nuScenes GT, ~2 m mean offset concentrated at the turn"></p>
+
+This motivates the two next steps (dynamic-object handling and pose refinement through the
+rasterizer) over adding more Gaussians.
+
+### Qualitative outputs
+
+Produced by the viz scripts (into the gitignored `out/`):
+
+- `scripts/render_gs_video.py --mode panel` — a grid of train + held-out views, GT over the
+  render, evolving across the run's snapshots.
+- `scripts/render_gs_video.py --mode flythrough --trajectory both` — the final snapshot rendered
+  along the estimated and the actual GT camera trajectory (GT poses mapped into the recon frame
+  via the Sim(3)); the ~2 m offset is what makes the GT flythrough mis-register.
+- `scripts/replay_gs_rrd.py` — the Gaussian evolution + curves + GT/render images as a Rerun
+  `.rrd`, scrubbable on the `iter` timeline.
+
+## Roadmap
+
+- Dynamic objects — segment vehicles with CLIPSeg and either drop them from the static-scene loss
+  or reconstruct them as posed per-instance Gaussians composed back onto the scene.
+- Pose refinement — unfreeze the camera poses and optimize them through the rasterizer via an
+  SE(3) tangent-space delta, to close the ~2 m gap that caps render quality.
+- Ground/wheel scale anchor — the semantic metric anchor acting directly on the Gaussians,
+  de-risked first with an explicit scalar, then folded into the joint optimization.
+- Factor-graph SLAM — lift the batch optimization into a GTSAM/iSAM2 graph with the render as a
+  factor, plus IMU/GPS/wheel fusion and loop closure.
+
+## How to run
+
+Setup:
 
 ```bash
 ./scripts/setup_env.sh      # venv (reuses system torch 2.9.1+cu129) + pip deps
-./scripts/setup_gsplat.sh   # matched CUDA 12.9 toolchain + gsplat, kernels built
+./scripts/setup_gsplat.sh   # matched CUDA 12.9 toolchain + gsplat kernels built
 ```
 
-`setup_gsplat.sh` exists because gsplat JIT-compiles its CUDA kernels against the
-torch build, which needs a **12.x** nvcc while the system nvcc is **13.1**. It
-installs a CUDA 12.9 conda toolchain (`cuda129`) and a `.pth` hook so every
-`.venv/bin/python` builds/loads gsplat transparently. Verify:
+`setup_gsplat.sh` exists because gsplat JIT-compiles its CUDA kernels against the torch build,
+which needs a 12.x nvcc while the system nvcc is 13.1; it installs a CUDA 12.9 conda toolchain and
+a `.pth` hook so every `.venv/bin/python` builds/loads gsplat transparently. Verify:
 
 ```bash
 .venv/bin/python -c "import gsplat; from gsplat.cuda._backend import _C; print('gsplat', gsplat.__version__, _C is not None)"
 ```
 
-Data — nuScenes **v1.0-mini**. Symlink an existing copy, or fetch (~4.2 GB, no
-login):
+Data — nuScenes v1.0-mini (~4.2 GB, no login). Symlink an existing copy or fetch:
 
 ```bash
-ln -s /path/to/nuscenes data/nuscenes      # or:
-./scripts/download_data.sh data/nuscenes
+ln -s /path/to/nuscenes data/nuscenes      # or: ./scripts/download_data.sh data/nuscenes
 ```
 
-## Verify the infrastructure first
-
-Order matters: clean masks and correct geometry before any modelling.
+Verify the infrastructure before trusting anything downstream — clean masks and correct geometry
+first:
 
 ```bash
-# 1. calibration: GT 3D boxes projected into CAM_FRONT via the extracted calib
-.venv/bin/python scripts/inspect_sample.py --scene scene-0061 --index 10 --out out/calib_check.png
-
-# 2. road/ground masks (+ optional tracks), cached and previewed
-.venv/bin/python scripts/run_frontend.py --scene scene-0061 --preview out/frontend_preview
-
-# 3. DA3 monocular depth for init, cached; preview also scores recovered scale vs lidar
-.venv/bin/python scripts/run_depth.py --scene scene-0061 --preview out/depth_preview
-
-# 4. calibration via lidar: projected lidar (depth-colored) should sit on structure
 .venv/bin/python scripts/inspect_sample.py --scene scene-0061 --index 10 --lidar --out out/calib_lidar.png
-
-# 5. raw-data view in Rerun (poses, camera frustum, image; --masks overlays ground)
-.venv/bin/python scripts/visualize_scene.py --scene scene-0061 --masks
-#    or write a shareable recording:  --save out/scene-0061.rrd  (open: .venv/bin/rerun <file>.rrd)
+.venv/bin/python scripts/run_frontend.py --scene scene-0061 --preview out/frontend_preview
+.venv/bin/python scripts/run_depth.py --scene scene-0061 --preview out/depth_preview
 ```
 
-Masks land in `out/frontend_cache/<scene>/masks.npz`. Eyeball the previews —
-garbage masks give a garbage ground plane. The segmentation prompt, threshold,
-and (optional) tracker are configurable; see `scripts/run_frontend.py --help`.
-
-## Metric upgrade → metric-up-to-scale reconstruction
+Metric upgrade → metric-up-to-scale reconstruction:
 
 ```bash
-# 1. DA3-Base: cache per-frame depth + pose (frame 0 rebased to identity) + estimated K
-.venv/bin/python scripts/run_recon.py --scene scene-0061
-
-# 2. metric upgrade → metric-up-to-scale reconstruction, visualized with corrected intrinsics
-.venv/bin/python scripts/run_metric_upgrade.py --scene scene-0061 --rerun
-#    …or a shareable recording:  --save out/metric-0061.rrd   (open: .venv/bin/rerun <file>.rrd)
+.venv/bin/python scripts/run_recon.py --scene scene-0061            # DA3-Base depth+pose+K, cached
+.venv/bin/python scripts/run_metric_upgrade.py --scene scene-0061 --rerun   # DAQ solve, metric cameras
+# --eval-gt (oracle) Sim(3)-aligns to GT to print ATE and the scale the GPS fit should reproduce
 ```
 
-`run_metric_upgrade.py` solves the DAQ, recovers the metric cameras, and logs the
-reconstruction to Rerun (upright/horizontal view; frustum size tracks cloud depth;
-`--point-size` / `--lidar-size` / `--frustum-frac` tune the display). It prints the
-per-camera recovered `K ≈ [c, c, 1]` — the free correctness check on the upgrade — and
-notes that the global scale is **unresolved and never taken from GT**. `--eval-gt` (oracle
-only) Sim(3)-aligns to GT to print ATE and the scale the road/GPS methods should reproduce,
-and overlays lidar as a metric reference.
+Gaussian-splat reconstruction (sky masked; snapshots + curves + renders written under the run dir):
 
-**`--m-weight` (M₀ soft prior, default `1.0`).** Dominantly-forward driving under-constrains
-the plane at infinity, so the plain DAQ solve lets `Ω*[:3,:3]` drift from the block it is
-known to equal (`W₀ = M₀⁻¹M₀⁻ᵀ`, since the reference intrinsics `M₀` are known). `--m-weight`
-appends soft rows pinning that block to `W₀`. On scene-0061 the default `w = 1.0` drops the
-conic-block-vs-`W₀` deviation from **0.33 → 0.04**, tightens the null-space gap (`A_gap`
-1.4 → 3.1), pulls recovered-`K` anisotropy in (max 1.11 → 0.53), and roughly halves oracle
-ATE (rmse 4.5 → 2.2 m). Pass `--m-weight 0` for the unconstrained solve. It does **not**
-touch `RPE_t` — that residual lives in DA3's own reconstruction geometry, not the upgrade.
+```bash
+PYTHONPATH=src .venv/bin/python scripts/run_gs.py --scene scene-0061 --train \
+    --mask-sky --voxel 0.3 --run-name run4
+```
 
-## Evaluation read-out — ground truth as an oracle
+Result figures and videos:
 
-`nuslam.eval` scores a finished reconstruction against nuScenes GT (ATE/RPE, Umeyama
-alignment); **GT is never an input to scale.** The three scale-resolution routes
-(road/ground, GPS/IMU, joint) each produce the global scalar independently — and the
-experiment is that they **agree with each other**, with GT scoring all three afterward.
-The Umeyama Sim(3) scalar is a diagnostic: once scale is resolved legitimately it reads
-≈ 1.0, and an SE(3) alignment (scale fixed) should already fit.
+```bash
+python scripts/make_readme_figures.py --scene scene-0061 --run run4     # docs/ montage, curves, trajectory
+python scripts/render_gs_video.py --scene scene-0061 --run run4 --mode both --trajectory both
+python scripts/replay_gs_rrd.py --scene scene-0061 --run run4           # out/run4.rrd  (open: rerun out/run4.rrd)
+```
 
-## Guardrails worth keeping in view
-
-- **GT is an oracle, never an input to scale** — resolve scale from the ground anchor or
-  GPS/IMU; a Sim(3) fit to GT would resolve the scalar by reading the answer.
-- **Metric upgrade:** per-frame `K_da3` drift is expected and harmless (each is known and
-  folded into its own camera); the live feasibility test is the DAQ residual / null-space
-  eigenvalue gap / recovered-`K` anisotropy — **not** the focal spread. Rebase so the first
-  camera is the origin (the block-form rectifier assumes that gauge).
-- **Forward-motion degeneracy:** near-straight driving barely constrains the plane at
-  infinity, so gate on it (`A_gap`, conic-block-vs-`W₀` deviation) and lean on the `M₀` soft
-  prior (`--m-weight`, on by default) rather than trusting an unconstrained solve. A turning
-  sub-window constrains it far better — prefer scenes/windows with real rotation.
-- Reach **Rung 1** (does the ground/wheel anchor recover scale via explicit `s`?)
-  before **Rung 2**, so a failure is the scale idea, not the joint coupling.
-- **RANSAC**, not least-squares, for the ground plane — segmentation bleeds onto
-  curbs/low objects; gate the wheel-contact anchor on inlier support.
-- Watch the **photometric-vs-metric weighting** — start the anchor loose so the
-  render converges, then increase; the anchor overpowering the render (or vice
-  versa) is the main failure mode.
-- **2DGS** gives cleaner depth + a surface normal, directly useful for a ground
-  plane — worth considering over 3DGS as the base.
-- nuScenes is Boston/Singapore; the local-plane assumption holds where the road
-  is locally near-planar — check the slope profile.
+Tests: `.venv/bin/python -m pytest tests/ -q` (data-dependent tests skip if the mini split is absent).
 
 ## Layout
 
@@ -240,23 +258,15 @@ src/nuslam/
   transforms.py          SE(3) helpers (numpy)
   types.py               data contract: CameraCalib, Keyframe, TrackSet, GroundMask, DepthMap, streams
   data/                  nuScenes monocular source, CAN streams, lidar->camera projection
-  frontend/              DA3 monocular depth + DA3-Base reconstruction, CLIPSeg, tracking (CoTracker+KLT), cache
+  frontend/              DA3 depth + DA3-Base reconstruction, CLIPSeg, tracking (CoTracker+KLT), cache
   viz/                   Rerun logging (images/frusta/points/GaussianSplats3D) + figures
   eval/                  Umeyama Sim(3)/SE(3) + ATE/RPE + depth-vs-lidar (GT as oracle)
-  backend/               factor-graph SLAM — staged extension, parked (not the current core)
+  backend/               factor-graph SLAM — parked
   recon/                 reconstruction core — written by hand
-    depth_init.py          depth back-projection (shared by viz + metric path) — built
-    metric_upgrade.py      DAQ metric upgrade → metric-up-to-scale — built + tested
-    (scale resolution, Gaussian representation/optimization/losses — to come)
-scripts/                 setup_env, setup_gsplat, download_data, inspect_sample, run_frontend,
-                         run_depth, run_recon (DA3-Base pose+K+depth), run_metric_upgrade,
-                         render_frontend_video, visualize_scene, visualize_depth
+    metric_upgrade.py      DAQ metric upgrade -> metric-up-to-scale — built + tested
+    gaussians.py           3DGS representation, gsplat calls, training loop, photometric loss — built
+    (ground/wheel scale anchor, pose refinement, metric-anchor loss — in progress)
+scripts/                 setup, data, inspect_sample, run_frontend, run_depth, run_recon,
+                         run_metric_upgrade, run_gs, render_gs_video, replay_gs_rrd, make_readme_figures
 tests/                   unit (transforms/metrics/cache/seeding/refine/metric_upgrade) + mini-data
 ```
-
-`recon/` is the hand-written core. The metric upgrade is in place; the scale-resolution
-routes and the Gaussian-splat reconstruction (representation, gsplat calls, optimization,
-losses) are written there next.
-
-Run the tests: `.venv/bin/python -m pytest tests/ -q` (data-dependent tests skip
-if the mini split is absent).

@@ -226,3 +226,6 @@ out/
 *.npz
 # CoTracker weights if redirected here
 torch_hub/
+
+# working plan / roadmap (kept out of the shipped README)
+PLAN.md
