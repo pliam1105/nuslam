@@ -161,9 +161,8 @@ scene is dynamic or under-constrained.
 
 The reconstruction rendered along the estimated (DA3/metric-upgrade) camera trajectory:
 
-<p align="center">
-  <video src="https://github.com/pliam1105/nuslam/raw/main/docs/run4_flythrough.mp4" controls muted loop width="90%"></video>
-</p>
+https://github.com/user-attachments/assets/24267471-20ec-42ac-b5f3-408f441124a0
+
 <p align="center"><sub>Regenerate with <code>scripts/render_gs_video.py --scene scene-0061 --run run4 --mode flythrough</code>.</sub></p>
 
 The ceiling is not Gaussian count or iterations (both were saturated) but pose error: the frozen
