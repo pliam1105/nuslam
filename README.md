@@ -1,4 +1,4 @@
-# Monocular Metric 3D Gaussian-Splat Reconstruction on nuScenes
+# nuSLAM
 
 Reconstruct a scene from a single nuScenes camera as 3D Gaussians, refine the camera poses
 through the differentiable rasterizer, and resolve the monocular scale metrically — never by
