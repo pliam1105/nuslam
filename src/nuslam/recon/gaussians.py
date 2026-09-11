@@ -58,6 +58,15 @@ def train_gaussians(
                                          # SE(3) only for input/output. Off by default: poses stay
                                          # frozen at the recovered solution. Parametrization is core
                                          # geometry -- seam below.
+    opacity_reg: float = 0.0,            # MCMC opacity-sparsity weight lambda_o (L1 on sigmoid(opacities)).
+    scale_reg: float = 0.0,              # MCMC covariance weight lambda_Sigma (L1 on exp(scales)).
+                                         # Loss terms are author-added at the "total loss" seam; ~0.01 typical.
+    depths=None,                         # optional per-view (H,W) metric depth (DA3, same units as means)
+                                         # to supervise the rendered expected depth. Aligned with images.
+    depth_lambda: float = 0.0,           # weight of the expected-depth loss (author-added at the seam).
+    sky_masks=None,                      # optional per-view (H,W) bool sky masks: supervise those pixels
+                                         # toward black (sky has nothing behind it -> the black background).
+    sky_lambda: float = 0.0,             # weight of the sky->black loss (author-added at the seam).
 ):
     """Fit the Gaussians to the images and return the optimized set.
 
@@ -100,6 +109,10 @@ def train_gaussians(
     gt_img = torch.tensor(images)[train_idx].to("cuda").permute(0,3,1,2).to(torch.float32)/255.0 # (N,3,H,W)
     keep_img = None if masks is None else \
         torch.tensor(np.stack(masks))[train_idx].to("cuda").float()[:, None]  # (N,1,H,W), 1=non-sky
+    gt_depth = None if depths is None else \
+        torch.tensor(np.stack(depths))[train_idx].to("cuda").to(torch.float32)[:, None]  # (N,1,H,W) metric
+    sky_img = None if sky_masks is None else \
+        torch.tensor(np.stack(sky_masks))[train_idx].to("cuda").float()[:, None]  # (N,1,H,W), 1=sky
 
     params = torch.nn.ParameterDict({
         "means": means,
@@ -176,7 +189,32 @@ def train_gaussians(
         dssim = 1 - (((2*m_x*m_y+C1)*(2*s_xy+C2))/((m_x**2+m_y**2+C1)*(s_x+s_y+C2))).mean()
 
         # total loss
-        loss = (1-structural_lambda)*photometric_loss + structural_lambda*dssim
+        # SEAM (author, §3d): add the MCMC regularizers here using the supplied weights, e.g.
+        #   loss += opacity_reg * torch.sigmoid(params["opacities"]).mean()   # opacity L1 (sparsity)
+        #   loss += scale_reg   * torch.exp(params["scales"]).mean()          # covariance L1 (sqrt-eig = scales)
+        # opacity_reg / scale_reg default 0.0 (no-op) until wired.
+        loss = (1-structural_lambda)*photometric_loss + structural_lambda*dssim + opacity_reg*torch.sigmoid(params["opacities"]).mean() + scale_reg*torch.exp(params["scales"]).mean()
+        # depth-supervision seam (author, §3d): supervise the rendered expected depth toward the DA3
+        # metric depth where valid + non-masked. render_depths is (b,H,W,1), gt_depth[step_batch] is
+        # (b,1,H,W). e.g. masked L1 (also gate out zero/invalid DA3 depth as needed):
+        #   rd = render_depths.permute(0, 3, 1, 2)
+        #   w  = mk if mk is not None else torch.ones_like(rd)
+        #   loss += depth_lambda * ((rd - gt_depth[step_batch]).abs() * w).sum() / (w.sum() + 1e-8)
+        if depth_lambda > 0 and gt_depth is not None:
+            rd = render_depths.permute(0, 3, 1, 2)
+            w  = mk if mk is not None else torch.ones_like(rd)
+            w = w * (gt_depth[step_batch] > 0)
+            loss += depth_lambda * ((rd - gt_depth[step_batch]).abs() * w).sum() / (w.sum() + 1e-8)
+
+        # sky->black seam (author, §3d): push the render toward black on sky pixels (sky has nothing
+        # behind it, so black = the background). sky_img[step_batch] is (b,1,H,W), render_colors (b,3,H,W).
+        # e.g. L1 to black over sky pixels:
+        #   sb = sky_img[step_batch]
+        #   loss += sky_lambda * (render_colors.abs() * sb).sum() / (sb.sum() * 3 + 1e-8)
+
+        if sky_lambda > 0 and sky_img is not None:
+            sb = sky_img[step_batch]
+            loss += sky_lambda * (render_colors.abs() * sb).sum() / (sb.sum() * 3 + 1e-8)
 
         loss.backward() # backprop
 

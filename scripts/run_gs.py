@@ -32,7 +32,7 @@ from nuslam.data import (  # noqa: E402
 from nuslam.eval import evaluate_render, holdout_indices, record_metrics  # noqa: E402
 from nuslam.frontend import RoadSegmenter, Sam3Segmenter, SegConfig, cache  # noqa: E402
 from nuslam.pointcloud import voxel_downsample  # noqa: E402
-from nuslam.recon import metric_point_cloud, resolve_scale_gps, train_gaussians  # noqa: E402
+from nuslam.recon import metric_depth, metric_point_cloud, resolve_scale_gps, train_gaussians  # noqa: E402
 from nuslam.viz import rerun_logging as rrlog  # noqa: E402
 
 # Reconstruction lives in camera-0's frame (RDF); rotate into a Z-up world for viz.
@@ -88,6 +88,9 @@ def parse_args():
     p.add_argument("--stride", type=int, default=4, help="depth back-projection pixel stride")
     p.add_argument("--voxel", type=float, default=0.1, help="init-cloud voxel size (metres)")
     p.add_argument("--holdout-every", type=int, default=8, help="hold out every k-th view for novel-view PSNR")
+    p.add_argument("--holdout-offset", type=int, default=0,
+                   help="phase of the held-out split: hold out frames where (i-offset) %% every == 0 "
+                        "(e.g. --holdout-every 2 --holdout-offset 1 trains 0,2,4 and holds out 1,3)")
     p.add_argument("--no-scale", action="store_true", help="skip Route-B metric scaling (leave up-to-scale)")
     p.add_argument("--train", action="store_true", help="fit the Gaussians (else only prep + overlays)")
     p.add_argument("--num-iters", type=int, default=10000, help="optimization iterations")
@@ -101,6 +104,24 @@ def parse_args():
     p.add_argument("--optimize-poses", action="store_true",
                    help="refine camera poses jointly through the rasterizer (raw per-view quaternion "
                         "+ translation); off by default, poses frozen at the recovered solution")
+    p.add_argument("--gt-poses", action="store_true",
+                   help="ORACLE: use nuScenes GT camera poses (mapped into the metric-recon frame via "
+                        "the Route-B Sim(3)) as the training cameras, to isolate DA3 pose error. Never "
+                        "used for scale; diagnostic only")
+    p.add_argument("--colmap-poses", action="store_true",
+                   help="use cached COLMAP camera poses (aligned to the nuScenes global frame by the same "
+                        "Route-B Umeyama, built by scratchpad/cache_colmap_poses.py -> "
+                        "<cache>/<scene>/colmap_poses_global.npz) as the training cameras, subset by token. "
+                        "Like --gt-poses but SfM poses instead of the GT oracle; the DA3 metric depth still "
+                        "seeds the dense init cloud. Not used for scale")
+    p.add_argument("--opacity-reg", type=float, default=0.0,
+                   help="MCMC opacity-sparsity weight (L1 on opacities); 0=off, ~0.01 typical")
+    p.add_argument("--scale-reg", type=float, default=0.0,
+                   help="MCMC covariance weight (L1 on scales); 0=off, ~0.01 typical")
+    p.add_argument("--depth-lambda", type=float, default=0.0,
+                   help="weight of the expected-depth loss vs the DA3 metric depth; 0=off")
+    p.add_argument("--sky-lambda", type=float, default=0.0,
+                   help="weight of the sky->black loss (needs --mask-sky); 0=off")
     p.add_argument("--run-name", default=None,
                    help="subdirectory name for this run's logs/checkpoints/renders "
                         "(default: timestamp). Runs never overwrite each other.")
@@ -180,6 +201,42 @@ def main() -> int:
     poses_m = world_from_cam.copy()
     poses_m[:, :3, 3] *= scale                     # metric camera->world
 
+    gt_poses = None
+    if args.gt_poses:
+        # ORACLE: use nuScenes GT camera poses DIRECTLY -- they are already metric and live in the
+        # map/GT frame, so there is NOTHING to align: no res, no Sim(3) on the poses. res.scale is
+        # used only to put the homography-rectified depth into metres (below). The init cloud is
+        # rebuilt from these GT poses so cloud and cameras share the GT frame. GT never sets scale.
+        s2e_m = frames[0][0].calib.sensor2ego.matrix()
+        gt_poses = np.stack([kf.ego2global_gt.matrix() @ s2e_m for kf, _ in frames])  # (N,4,4) metres
+        poses_m = gt_poses
+        print(f"[gt-poses] ORACLE: raw GT camera poses in the GT metric frame ({len(gt_poses)} frames)")
+
+    colmap_poses = None
+    if args.colmap_poses:
+        # Cached COLMAP poses, already in the nuScenes global metric frame (aligned by the same
+        # Route-B Umeyama over the full trajectory). Subset to `frames` by token so they stay 1:1,
+        # exactly like the GT branch -- the seed cloud is rebuilt from them below.
+        cp_path = args.cache_root / scene_name / "colmap_poses_global.npz"
+        if not cp_path.exists():
+            print(f"[colmap-poses] {cp_path} not found -- run scratchpad/cache_colmap_poses.py first")
+            return 1
+        d = np.load(cp_path, allow_pickle=True)
+        cmap = {str(t): P for t, P in zip(d["tokens"], d["poses"])}
+        missing = [kf.token for kf, _ in frames if kf.token not in cmap]
+        if missing:
+            print(f"[colmap-poses] {len(missing)}/{len(frames)} frames missing from {cp_path} "
+                  "(unregistered by COLMAP?) -- cannot use as training cameras")
+            return 1
+        colmap_poses = np.stack([cmap[kf.token] for kf, _ in frames])
+        poses_m = colmap_poses
+        print(f"[colmap-poses] COLMAP poses in the global metric frame ({len(colmap_poses)} frames, "
+              f"scale={float(d['scale']):.4f}, GPS residual={float(d['residual']):.3f} m)")
+
+    # GT / COLMAP both supply metric poses already in the global frame; the seed cloud is then
+    # back-projected from THESE poses (metric DA3 depth * scale) instead of the DA3 metric-upgrade poses.
+    override_poses = gt_poses if gt_poses is not None else colmap_poses
+
     # ---- sky / vehicle masks: drop those pixels from the cloud + training loss. SAM3 (default)
     #      gives sharper instance masks than CLIPSeg; a single SAM3 model is reused across prompts
     #      and released before training. --segmenter clipseg falls back to the CLIPSeg backend. ----
@@ -244,12 +301,21 @@ def main() -> int:
     # ---- init cloud: back-project depth (metres), voxel-downsample PER KEYFRAME, then
     #      concatenate and downsample the merged cloud once more. Thinning each frame
     #      before the merge keeps the concat + final pass cheap. ----
+    # rectify each DA3 depth to metric via the DAQ homography H (H acts in the world frame, so per
+    # pixel: unproject with the DA3 pose -> apply H -> reproject with the metric pose to read z).
+    # Up-to-scale here; * scale -> metres. This is the depth the cloud AND the depth loss use.
+    metric_depths = [metric_depth(dm.depth, dm.intrinsic, dm.extrinsic, mu.H, np.linalg.inv(world_from_cam[i]))
+                     for i, (kf, dm) in enumerate(frames)]
     raw_xyz, raw_rgb, ds_xyz, ds_rgb = [], [], [], []
     voxel_ok = True
     for i, (kf, dm) in enumerate(frames):
-        pts, cols = metric_point_cloud(dm.depth, kf.image(), K_true, world_from_cam[i],
-                                       stride=args.stride, conf=dm.conf, sky=drop_mask(kf, dm))
-        pts = pts * scale
+        if override_poses is not None:   # GT/COLMAP run: metric depth (metres) back-projected from those poses
+            pts, cols = metric_point_cloud(metric_depths[i] * scale, kf.image(), K_true, override_poses[i],
+                                           stride=args.stride, conf=dm.conf, sky=drop_mask(kf, dm))
+        else:                      # standard: up-to-scale depth from the metric-upgrade poses, then * scale
+            pts, cols = metric_point_cloud(metric_depths[i], kf.image(), K_true, world_from_cam[i],
+                                           stride=args.stride, conf=dm.conf, sky=drop_mask(kf, dm))
+            pts = pts * scale
         raw_xyz.append(pts); raw_rgb.append(cols)
         if voxel_ok:
             try:
@@ -269,7 +335,7 @@ def main() -> int:
               f"(implement nuslam.pointcloud.voxel_downsample to thin)")
 
     # ---- held-out split for novel-view PSNR ----
-    train_idx, test_idx = holdout_indices(len(frames), every=args.holdout_every)
+    train_idx, test_idx = holdout_indices(len(frames), every=args.holdout_every, offset=args.holdout_offset)
     print(f"{len(frames)} frames: {len(train_idx)} train / {len(test_idx)} held-out for novel-view PSNR")
 
     # ---- Rerun overlays: init cloud + trajectory + camera frustums (upright frame) ----
@@ -289,9 +355,12 @@ def main() -> int:
         # These live in the nuScenes map frame; map them into this reconstruction frame
         # with the Route-B Sim(3) inverse: map M -> recon P = (M - t) Rs, then R_VIZ.
         if res is not None:
-            Rs = res.T[:3, :3] / res.scale        # orthonormal (scale un-folded)
-            t_map = res.T[:3, 3]
-            to_view = lambda M: ((np.asarray(M, float) - t_map) @ Rs) @ R_VIZ.T
+            if override_poses is not None:        # poses_m already in the nuScenes global frame: no remap
+                to_view = lambda M: np.asarray(M, float) @ R_VIZ.T
+            else:                                 # DA3 recon frame: bring the map reference in via Sim(3) inv
+                Rs = res.T[:3, :3] / res.scale    # orthonormal (scale un-folded)
+                t_map = res.T[:3, 3]
+                to_view = lambda M: ((np.asarray(M, float) - t_map) @ Rs) @ R_VIZ.T
             if gps_xy is not None and gps_valid.any():  # GPS reference track (the fit target)
                 gps3 = np.column_stack([gps_xy[gps_valid], np.zeros(int(gps_valid.sum()))])
                 rrlog.log_trajectory("ref/gps", to_view(gps3), color=(230, 150, 40), radius=0.3, static=True)
@@ -408,11 +477,28 @@ def main() -> int:
     # those pixels and no Gaussians are grown to reconstruct them
     masking = bool((args.mask_sky and sky_masks) or (args.mask_vehicles and vehicle_masks))
     train_masks = [~drop_mask(kf, dm, da3_sky=False) for kf, dm in frames] if masking else None
+    # per-view DA3 metric depth (recon depth * scale, same units as the Gaussians) for the
+    # expected-depth loss; only built when the depth loss is on
+    depth_maps = [metric_depths[i] * scale for i in range(len(frames))] if args.depth_lambda > 0 else None
+    # per-frame sky masks (separate from the union keep-mask) for the sky->black supervision
+    sky_only_masks = ([sky_masks[kf.token] for kf, _ in frames]
+                      if (args.sky_lambda > 0 and args.mask_sky and sky_masks) else None)
+    # scale the means LR by the scene extent (3DGS spatial_lr_scale = camera-bounding radius): the
+    # 1.6e-4 base is meant to be multiplied by this, else in a metric scene of tens of metres the
+    # means barely move. Also scales the MCMC position-noise (which uses lr_for["means"]).
+    cam_c = poses_m[:, :3, 3]
+    spatial_lr_scale = float(np.linalg.norm(cam_c - cam_c.mean(0), axis=1).max() * 1.1)
+    lr_for = {**LR_FOR, "means": LR_FOR["means"] * spatial_lr_scale}
+    print(f"spatial_lr_scale = {spatial_lr_scale:.1f} m -> means LR {lr_for['means']:.2e} "
+          f"(base {LR_FOR['means']:.1e})")
     gs_tuple, render = train_gaussians(
         xyz, rgb, poses_m, K_true, images, train_idx,
-        lr_for=LR_FOR, num_iters=args.num_iters, structural_lambda=args.structural_lambda,
+        lr_for=lr_for, num_iters=args.num_iters, structural_lambda=args.structural_lambda,
         log_every=args.log_every, on_log=on_log, init_gaussians=ckpt,
         clip_scales_to_knn=args.clip_scales, masks=train_masks, optimize_poses=args.optimize_poses,
+        opacity_reg=args.opacity_reg, scale_reg=args.scale_reg,
+        depths=depth_maps, depth_lambda=args.depth_lambda,
+        sky_masks=sky_only_masks, sky_lambda=args.sky_lambda,
     )
     csv_file.close()
     print(f"\nfit complete ({args.num_iters} iters, structural_lambda={args.structural_lambda})")
