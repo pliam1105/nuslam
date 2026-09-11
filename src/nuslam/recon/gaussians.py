@@ -52,6 +52,12 @@ def train_gaussians(
     masks=None,                          # optional per-view (H,W) bool keep-masks (True=use pixel);
                                          # sky pixels set False so the loss ignores them and no sky
                                          # Gaussians are grown to reconstruct sky.
+    optimize_poses: bool = False,        # refine the camera poses jointly through the rasterizer,
+                                         # optimizing a raw quaternion + translation per view (quats
+                                         # normalized at use, like the Gaussian quats; no Lie retraction).
+                                         # SE(3) only for input/output. Off by default: poses stay
+                                         # frozen at the recovered solution. Parametrization is core
+                                         # geometry -- seam below.
 ):
     """Fit the Gaussians to the images and return the optimized set.
 
@@ -105,6 +111,22 @@ def train_gaussians(
     })
 
     optimizers = {k: torch.optim.Adam([p], lr=lr_for[k]) for k, p in params.items()}
+
+    if optimize_poses:
+        # SEAM (core geometry, to implement): free the camera poses through the rasterizer.
+        # Parametrize each view's pose as a raw quaternion q_i + translation t_i (normalize q_i at
+        # use, as with the Gaussian quats -- no Lie-algebra delta / exp retraction), initialized from
+        # the input SE(3) `viewmats`. Build the viewmats from (q_i, t_i) each step for the
+        # rasterization call; gradient path (q, t) -> viewmats -> rasterization.
+        #   Keep q_i, t_i in a SEPARATE torch.optim.Adam (lr from lr_for["pose_quats"/"pose_trans"]),
+        #   NOT in `params`/`optimizers` above: MCMCStrategy densification (step_post_backward)
+        #   indexes every param in that dict by Gaussian id and would resize/corrupt per-view poses.
+        #   Step this optimizer manually in the loop (zero_grad before, step after backward).
+        # Read the refined poses back out as SE(3) via the return. Left unimplemented by design.
+        raise NotImplementedError(
+            "optimize_poses: pose refinement through the rasterizer is not implemented yet "
+            "(raw per-view quaternion + translation in a separate optimizer, viewmats rebuilt each step)."
+        )
 
     # auto-densification strategy
     strategy = gsplat.MCMCStrategy(cap_max=5_000_000)

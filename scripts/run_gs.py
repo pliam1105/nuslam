@@ -30,7 +30,7 @@ from nuslam.data import (  # noqa: E402
     NuScenesMonoSource, gps_positions_at, lidar_points_global, load_proprio_streams,
 )
 from nuslam.eval import evaluate_render, holdout_indices, record_metrics  # noqa: E402
-from nuslam.frontend import RoadSegmenter, SegConfig, cache  # noqa: E402
+from nuslam.frontend import RoadSegmenter, Sam3Segmenter, SegConfig, cache  # noqa: E402
 from nuslam.pointcloud import voxel_downsample  # noqa: E402
 from nuslam.recon import metric_point_cloud, resolve_scale_gps, train_gaussians  # noqa: E402
 from nuslam.viz import rerun_logging as rrlog  # noqa: E402
@@ -46,6 +46,10 @@ LR_FOR = {
     "scales": 5.0e-3,
     "opacities": 5.0e-2,
     "colors": 2.5e-3,
+    # camera-pose refinement (--optimize-poses). Read by a SEPARATE pose optimizer, not the
+    # MCMC-managed params dict (densification indexes every param by Gaussian id). Tune.
+    "pose_quats": 1.0e-3,
+    "pose_trans": 1.0e-3,
 }
 
 
@@ -94,6 +98,9 @@ def parse_args():
                    help="warm-start the Gaussians from a saved gs_*.npz instead of the point cloud")
     p.add_argument("--clip-scales", action="store_true",
                    help="warm start only: clip oversized checkpoint scales to the local kNN spacing")
+    p.add_argument("--optimize-poses", action="store_true",
+                   help="refine camera poses jointly through the rasterizer (raw per-view quaternion "
+                        "+ translation); off by default, poses frozen at the recovered solution")
     p.add_argument("--run-name", default=None,
                    help="subdirectory name for this run's logs/checkpoints/renders "
                         "(default: timestamp). Runs never overwrite each other.")
@@ -102,8 +109,20 @@ def parse_args():
     p.add_argument("--remove-sky-gaussians", action="store_true",
                    help="drop Gaussians that project onto sky in most views (needs sky masks; "
                         "post-processes a warm-started/loaded set)")
-    p.add_argument("--sky-threshold", type=float, default=0.35, help="CLIPSeg sky probability threshold")
-    p.add_argument("--sky-gpu", action="store_true", help="run the sky segmenter on GPU (default CPU)")
+    p.add_argument("--segmenter", choices=["sam3", "clipseg"], default="sam3",
+                   help="masking backend for --mask-sky/--mask-vehicles: sam3 (facebook/sam3, sharp "
+                        "instance masks, ~3.5 GB, GPU) or clipseg (CIDAS/clipseg, small, softer)")
+    p.add_argument("--seg-cpu", action="store_true", help="run the SAM3 segmenter on CPU (slow; default GPU)")
+    p.add_argument("--sky-threshold", type=float, default=0.35,
+                   help="sky mask threshold (CLIPSeg sigmoid prob, or SAM3 detection score)")
+    p.add_argument("--sky-gpu", action="store_true", help="run the CLIPSeg segmenter on GPU (default CPU)")
+    p.add_argument("--mask-vehicles", action="store_true",
+                   help="segment vehicles (via --segmenter) and drop them from BOTH the init cloud and "
+                        "the training loss. Appearance-based, so ALL vehicles are removed (parked "
+                        "included) -- motion-aware removal needs the per-instance tracking step")
+    p.add_argument("--vehicle-prompt", default="vehicle", help="CLIPSeg prompt for the vehicle class")
+    p.add_argument("--vehicle-threshold", type=float, default=0.5,
+                   help="vehicle mask threshold (CLIPSeg sigmoid prob, or SAM3 detection score)")
     p.add_argument("--rerun", action="store_true", help="spawn a native Rerun viewer (needs a display)")
     p.add_argument("--save", type=Path, default=None, help="write a .rrd (opened later, not live)")
     p.add_argument("--serve", action="store_true",
@@ -158,17 +177,55 @@ def main() -> int:
     poses_m = world_from_cam.copy()
     poses_m[:, :3, 3] *= scale                     # metric camera->world
 
-    # ---- sky masks (CLIPSeg 'sky' prompt): drop sky pixels from the cloud / sky Gaussians ----
+    # ---- sky / vehicle masks: drop those pixels from the cloud + training loss. SAM3 (default)
+    #      gives sharper instance masks than CLIPSeg; a single SAM3 model is reused across prompts
+    #      and released before training. --segmenter clipseg falls back to the CLIPSeg backend. ----
+    _seg_cache = {}
+
+    def _segment(prompt, threshold):
+        kfs = [kf for kf, _ in frames]
+        if args.segmenter == "sam3":
+            seg = _seg_cache.get("sam3")
+            if seg is None:
+                seg = _seg_cache["sam3"] = Sam3Segmenter(
+                    SegConfig(prompt=prompt, threshold=threshold,
+                              device=("cpu" if args.seg_cpu else None)))  # GPU by default (pre-training)
+            seg.config.prompt, seg.config.threshold = prompt, threshold
+        else:
+            seg = RoadSegmenter(SegConfig(prompt=prompt, threshold=threshold,
+                                          device=(None if args.sky_gpu else "cpu")))
+        return {gm.token: gm.mask for gm in seg.segment_scene(kfs)}
+
     sky_masks = {}
     if args.mask_sky or args.remove_sky_gaussians:
-        # CLIPSeg on CPU by default: it's small and one-time, and the GPU is usually busy
-        # with a training run; --sky-gpu overrides.
-        seg = RoadSegmenter(SegConfig(prompt="sky", threshold=args.sky_threshold,
-                                      device=(None if args.sky_gpu else "cpu")))
-        for gm in seg.segment_scene([kf for kf, _ in frames]):
-            sky_masks[gm.token] = gm.mask
+        sky_masks = _segment("sky", args.sky_threshold)
         frac = np.mean([m.mean() for m in sky_masks.values()]) if sky_masks else 0.0
-        print(f"sky masks: segmented {len(sky_masks)} keyframes (CLIPSeg 'sky'), ~{frac:.1%} sky")
+        print(f"sky masks: segmented {len(sky_masks)} keyframes ({args.segmenter} 'sky'), ~{frac:.1%} sky")
+
+    vehicle_masks = {}
+    if args.mask_vehicles:
+        vehicle_masks = _segment(args.vehicle_prompt, args.vehicle_threshold)
+        frac = np.mean([m.mean() for m in vehicle_masks.values()]) if vehicle_masks else 0.0
+        print(f"vehicle masks: segmented {len(vehicle_masks)} keyframes "
+              f"({args.segmenter} '{args.vehicle_prompt}'), ~{frac:.1%} vehicle")
+
+    if _seg_cache.get("sam3") is not None:
+        _seg_cache["sam3"].release()   # free the ~3.5 GB SAM3 off the GPU before training
+
+    def drop_mask(kf, dm, *, da3_sky=True):
+        """Pixels to exclude: union of the enabled sky and vehicle masks for this frame. The init
+        cloud passes ``da3_sky=True`` so it also drops DA3's own sky estimate when ``--mask-sky``
+        is off (preserving prior behaviour); the loss passes ``da3_sky=False`` so it masks only the
+        explicitly-requested CLIPSeg classes. Returns an (H, W) bool mask, or None if nothing is
+        masked for this frame."""
+        if args.mask_sky:
+            m = sky_masks.get(kf.token)
+        else:
+            m = dm.sky if da3_sky else None
+        if args.mask_vehicles and vehicle_masks.get(kf.token) is not None:
+            v = vehicle_masks[kf.token]
+            m = v if m is None else (m | v)
+        return m
 
     # ---- init cloud: back-project depth (metres), voxel-downsample PER KEYFRAME, then
     #      concatenate and downsample the merged cloud once more. Thinning each frame
@@ -176,9 +233,8 @@ def main() -> int:
     raw_xyz, raw_rgb, ds_xyz, ds_rgb = [], [], [], []
     voxel_ok = True
     for i, (kf, dm) in enumerate(frames):
-        sky = sky_masks.get(kf.token) if args.mask_sky else dm.sky
         pts, cols = metric_point_cloud(dm.depth, kf.image(), K_true, world_from_cam[i],
-                                       stride=args.stride, conf=dm.conf, sky=sky)
+                                       stride=args.stride, conf=dm.conf, sky=drop_mask(kf, dm))
         pts = pts * scale
         raw_xyz.append(pts); raw_rgb.append(cols)
         if voxel_ok:
@@ -322,7 +378,9 @@ def main() -> int:
             rrlog.log_scalar("train/dssim", dssim); rrlog.log_scalar("heldout/psnr", e.psnr)
             rrlog.log_image("render/heldout_est", ho); rrlog.log_image("render/heldout_gt", frames[hi][0].image())
             rrlog.log_image("render/train_est", tr); rrlog.log_image("render/train_gt", frames[ti][0].image())
-            log_gs("train/gs", gd, static=False)                          # intermediate GS on the iter timeline
+            log_gs("train/gs", gd, static=True)   # overwrite-in-place: live view updates but memory stays
+                                                  # bounded (a full GS set per log step would balloon a long
+                                                  # --serve run); the evolution is kept in the .npz snapshots
 
     ckpt = {k: np.load(args.from_checkpoint)[k] for k in np.load(args.from_checkpoint).files} \
         if args.from_checkpoint else None
@@ -332,13 +390,15 @@ def main() -> int:
             keep = _sky_keep_mask(ckpt["means"], poses_m, K_true, frames, sky_masks)
             n0 = len(keep); ckpt = {k: v[keep] for k, v in ckpt.items()}
             print(f"removed sky Gaussians: {n0} -> {len(ckpt['means'])} kept")
-    # non-sky keep-masks per frame, so the training loss ignores sky (no sky Gaussians grown)
-    train_masks = [~sky_masks[kf.token] for kf, _ in frames] if (args.mask_sky and sky_masks) else None
+    # per-frame keep-masks (complement of the sky/vehicle drop mask), so the training loss ignores
+    # those pixels and no Gaussians are grown to reconstruct them
+    masking = bool((args.mask_sky and sky_masks) or (args.mask_vehicles and vehicle_masks))
+    train_masks = [~drop_mask(kf, dm, da3_sky=False) for kf, dm in frames] if masking else None
     gs_tuple, render = train_gaussians(
         xyz, rgb, poses_m, K_true, images, train_idx,
         lr_for=LR_FOR, num_iters=args.num_iters, structural_lambda=args.structural_lambda,
         log_every=args.log_every, on_log=on_log, init_gaussians=ckpt,
-        clip_scales_to_knn=args.clip_scales, masks=train_masks,
+        clip_scales_to_knn=args.clip_scales, masks=train_masks, optimize_poses=args.optimize_poses,
     )
     csv_file.close()
     print(f"\nfit complete ({args.num_iters} iters, structural_lambda={args.structural_lambda})")

@@ -8,7 +8,7 @@ transformers.
 from . import cache, refine, seeding
 from .depth import DA3ReconEstimator, DepthConfig, DepthEstimator, ReconConfig
 from .refine import RefineConfig, refine_tracks_subpixel
-from .segmentation import RoadSegmenter, SegConfig
+from .segmentation import RoadSegmenter, Sam3Segmenter, SegConfig
 from .seeding import SeedConfig
 from .tracking import CoTrackerFrontend, KLTFrontend, TrackConfig, make_tracker
 
@@ -21,6 +21,7 @@ __all__ = [
     "RefineConfig",
     "refine_tracks_subpixel",
     "RoadSegmenter",
+    "Sam3Segmenter",
     "SegConfig",
     "DepthEstimator",
     "DepthConfig",
