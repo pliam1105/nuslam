@@ -11,6 +11,7 @@ Layout::
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -103,6 +104,38 @@ def load_masks(cache_root: Path | str, scene_name: str) -> dict[str, GroundMask]
             prob=(None if probs_u8.size == 0 else probs_u8[i].astype(np.float32) / 255.0),
         )
     return out
+
+
+# ---- tagged segmentation masks (sky / vehicle / ... per backend+prompt+threshold) --------
+
+def _seg_name(tag: str) -> str:
+    slug = re.sub(r"[^a-z0-9.]+", "-", str(tag).lower()).strip("-")
+    return f"seg_{slug}.npz"
+
+
+def save_seg_masks(cache_root: Path | str, scene_name: str, tag: str,
+                   masks: list[GroundMask]) -> Path:
+    """Cache binary segmentation masks under ``tag`` (e.g. 'sam3-vehicle-0.5'), so re-running with
+    the same segmenter/prompt/threshold reuses them instead of re-estimating. Binary only (the run
+    consumes binary keep/drop masks); the tag namespaces prompts and settings so they never collide."""
+    path = scene_dir(cache_root, scene_name) / _seg_name(tag)
+    np.savez_compressed(
+        path,
+        tokens=np.asarray([m.token for m in masks]),
+        masks=np.stack([m.mask for m in masks]).astype(bool) if masks else np.asarray([], dtype=bool),
+    )
+    return path
+
+
+def load_seg_masks(cache_root: Path | str, scene_name: str, tag: str) -> dict[str, np.ndarray] | None:
+    """Return a ``token -> bool mask`` dict for ``tag``, or None if not cached."""
+    path = Path(cache_root) / scene_name / _seg_name(tag)
+    if not path.is_file():
+        return None
+    z = np.load(path, allow_pickle=False)
+    tokens = [str(t) for t in z["tokens"]]
+    masks = z["masks"]
+    return {tok: masks[i] for i, tok in enumerate(tokens)}
 
 
 # ---- depth ---------------------------------------------------------------

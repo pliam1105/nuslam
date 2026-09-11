@@ -113,6 +113,9 @@ def parse_args():
                    help="masking backend for --mask-sky/--mask-vehicles: sam3 (facebook/sam3, sharp "
                         "instance masks, ~3.5 GB, GPU) or clipseg (CIDAS/clipseg, small, softer)")
     p.add_argument("--seg-cpu", action="store_true", help="run the SAM3 segmenter on CPU (slow; default GPU)")
+    p.add_argument("--no-seg-cache", action="store_true",
+                   help="re-estimate sky/vehicle masks instead of loading the on-disk cache "
+                        "(cache is keyed by segmenter+prompt+threshold under the scene cache dir)")
     p.add_argument("--sky-threshold", type=float, default=0.35,
                    help="sky mask threshold (CLIPSeg sigmoid prob, or SAM3 detection score)")
     p.add_argument("--sky-gpu", action="store_true", help="run the CLIPSeg segmenter on GPU (default CPU)")
@@ -183,6 +186,14 @@ def main() -> int:
     _seg_cache = {}
 
     def _segment(prompt, threshold):
+        # on-disk cache keyed by backend+prompt+threshold, so masks are estimated once per config
+        # (like depth / metric upgrade) and reused across runs. --no-seg-cache forces re-estimation.
+        tag = f"{args.segmenter}-{prompt}-{threshold}"
+        if not args.no_seg_cache:
+            cached = cache.load_seg_masks(args.cache_root, scene_name, tag)
+            if cached is not None:
+                print(f"[seg cache] '{prompt}' ({args.segmenter}, thr {threshold}): loaded {len(cached)} masks")
+                return cached
         kfs = [kf for kf, _ in frames]
         if args.segmenter == "sam3":
             seg = _seg_cache.get("sam3")
@@ -194,7 +205,10 @@ def main() -> int:
         else:
             seg = RoadSegmenter(SegConfig(prompt=prompt, threshold=threshold,
                                           device=(None if args.sky_gpu else "cpu")))
-        return {gm.token: gm.mask for gm in seg.segment_scene(kfs)}
+        gms = seg.segment_scene(kfs)
+        if not args.no_seg_cache:
+            cache.save_seg_masks(args.cache_root, scene_name, tag, gms)
+        return {gm.token: gm.mask for gm in gms}
 
     sky_masks = {}
     if args.mask_sky or args.remove_sky_gaussians:
