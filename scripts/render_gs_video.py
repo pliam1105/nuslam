@@ -184,7 +184,7 @@ def video_panel(args, geom, snaps, out):
     print(f"wrote {out}")
 
 
-def video_flythrough(args, geom, snaps):
+def video_flythrough(args, geom, snaps, render_snap):
     frames_meta, poses_m, K_true, images, train_idx, test_idx, gt_poses = geom
     jobs = []
     if args.trajectory in ("est", "both"):
@@ -194,7 +194,7 @@ def video_flythrough(args, geom, snaps):
             sys.exit("--trajectory gt/both needs the Route-B Sim(3) (GPS scale); none available (--no-scale or no GPS)")
         jobs.append((gt_poses, "GT trajectory", f"out/{args.run}_flythrough_gt.mp4"))
 
-    render, (gs, torch) = render_from_snapshot(snaps[-1], poses_m, K_true, images, train_idx)  # once, reused
+    render, (gs, torch) = render_from_snapshot(render_snap, poses_m, K_true, images, train_idx)  # once, reused
     for traj, tag, out in jobs:
         path = interp_poses(traj, args.interp)
         with imageio.get_writer(out, fps=args.fps, macro_block_size=None) as w:
@@ -242,10 +242,14 @@ def main():
         sys.exit(f"no snapshots under {run_dir}")
     geom = load_geometry(args)
 
+    # flythrough renders the FINAL Gaussians; snapshots stop one interval short of num_iters
+    # (on_log doesn't fire on the last step), so prefer gs_final.npz when the run saved it.
+    final_snap = run_dir / "gs_final.npz"
+    render_snap = str(final_snap) if final_snap.exists() else snaps[-1]
     if args.mode in ("panel", "both"):
         video_panel(args, geom, snaps, f"out/{args.run}_panel.mp4")
     if args.mode in ("flythrough", "both"):
-        video_flythrough(args, geom, snaps)
+        video_flythrough(args, geom, snaps, render_snap)
 
 
 if __name__ == "__main__":

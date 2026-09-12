@@ -108,6 +108,16 @@ def main():
     keep = snaps[::args.every]
     if snaps[-1] not in keep:
         keep.append(snaps[-1])
+    # snapshots stop at the last snapshot_every multiple BEFORE num_iters (on_log doesn't fire on
+    # the final step); the true final Gaussians are in gs_final.npz. Append it as the last frame,
+    # stepped one snapshot-interval past the last snapshot so it lands at the end of the timeline.
+    final = run_dir / "gs_final.npz"
+    final_step = None
+    if final.exists():
+        last = int(Path(snaps[-1]).stem.split("_")[-1])
+        span = (last - int(Path(snaps[-2]).stem.split("_")[-1])) if len(snaps) > 1 else 100
+        final_step = last + max(span, 1)
+        keep.append(str(final))
 
     out = args.out or f"out/{stem}.rrd"
     rng = np.random.default_rng(0)
@@ -117,7 +127,7 @@ def main():
         load_renders(run_dir, stem, args.render_every, args.render_width)
 
     for f in keep:
-        step = int(Path(f).stem.split("_")[-1])
+        step = final_step if f == str(final) else int(Path(f).stem.split("_")[-1])
         d = np.load(f)
         means, scales, quats, opac, sh = d["means"], d["scales"], d["quats"], d["opacities"], d["sh"]
         ctr = np.median(means, axis=0)
