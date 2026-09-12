@@ -33,6 +33,11 @@ pose, and intrinsics — but under a wrong, intrinsic-agnostic calibration (a pr
 reconstruction). This is the delegated frontend; its per-frame depth also seeds the Gaussian
 initialization cloud.
 
+DA3 assumes a static scene and takes no mask input, so moving vehicles corrupt its pose solve —
+on this scene the recovered trajectory drifts a mean of 2.09 m from GT (see Results). Its dense
+metric depth is still the best init available, so the pipeline keeps DA3 for depth and takes the
+camera poses from a masked structure-from-motion solve instead (below).
+
 ### Metric upgrade (DAQ)
 
 DA3-Base returns per frame a pose $[R_i \mid t_i]$ and its own intrinsics $K_{\mathrm{da3},i}$;
@@ -85,20 +90,50 @@ ground/wheel-contact anchor — the intended scale source, acting directly on th
 core next step (see Roadmap). The same Umeyama fit against GT scores a finished reconstruction
 (ATE/RPE); once scale is resolved legitimately its $s$ reads $\approx 1$.
 
+### Camera poses (COLMAP)
+
+Because DA3's poses are corrupted by dynamic objects, the training cameras come from a
+structure-from-motion solve (COLMAP, `pycolmap`) run over the same keyframes with the sky and
+vehicle pixels masked out of feature extraction, so no correspondences are drawn from moving
+objects. Forward driving is near-degenerate for SfM (low parallax, a thin motion baseline), so the
+solve is conditioned with the known `PINHOLE` intrinsics held fixed and a low minimum
+triangulation angle, which registers all 39 frames. The sparse SfM points are discarded; only the
+per-frame poses are kept. Those poses are up-to-scale in COLMAP's own frame, so they are brought
+into metres by the *same* iterated lever-arm Umeyama fit used for DA3 — one Sim(3) over the whole
+trajectory — and cached per keyframe. The dense Gaussian init cloud is still back-projected from
+DA3's homography-rectified metric depth, now from the COLMAP poses. `scripts/cache_colmap_poses.py`,
+`run_gs.py --colmap-poses`.
+
 ### Gaussian-splat reconstruction
 
-The metric cloud seeds a 3D Gaussian-splat reconstruction, optimized with gsplat's rasterizer and
-MCMC densification. The representation is reparametrized so every raw parameter is unconstrained
-and every step stays a valid Gaussian (scale via $\exp$, opacity via $\sigma$, quaternions
-normalized). Sky is segmented with CLIPSeg and masked out of both the loss and the initialization,
-so no Gaussians are grown to reconstruct sky. The photometric loss is L1 + D-SSIM over non-sky
-pixels; with per-pixel keep-mask $m$, render $\hat I$ and target $I$:
+The metric cloud seeds a 3D Gaussian-splat reconstruction, optimized with gsplat's rasterizer
+(render mode `RGB+ED`, so each pass also returns the expected depth) and MCMC densification to a
+5M-Gaussian cap. The representation is reparametrized so every raw parameter is unconstrained and
+every step stays a valid Gaussian (scale via $\exp$, opacity via $\sigma$, quaternions normalized).
+Sky and vehicles are segmented with SAM3 (`facebook/sam3`, text-prompted instance masks; CLIPSeg is
+a fallback) and masked out of both the loss and the initialization, so no Gaussians are grown to
+reconstruct sky or moving objects; the masks are cached per prompt like depth and poses. The
+photometric loss is L1 + D-SSIM over the kept pixels; with per-pixel keep-mask $m$, render
+$\hat I$ and target $I$:
 
-$$\mathcal{L}=(1-\lambda)\,\frac{\sum_i m_i\,\lVert \hat I_i - I_i\rVert_1}{\sum_i m_i}+\lambda\,\big(1-\mathrm{SSIM}(m\hat I,\,mI)\big),\qquad \lambda=0.5$$
+$$\mathcal{L}_{\mathrm{photo}}=(1-\lambda)\,\frac{\sum_i m_i\,\lVert \hat I_i - I_i\rVert_1}{\sum_i m_i}+\lambda\,\big(1-\mathrm{SSIM}(m\hat I,\,mI)\big),\qquad \lambda=0.5$$
 
-The photometric term is scale-free. The metric-anchor loss (ground-plane + wheel-contact residual)
-is the term that breaks the scale gauge and makes the reconstruction natively metric; with joint
-pose refinement through the rasterizer it is the current work (see Roadmap).
+Three optional supervision/regularization terms are added on top. A depth term ties the rendered
+expected depth $\hat D$ to DA3's homography-rectified metric depth $D$ (in metres, same units as
+the Gaussians) over kept pixels with valid depth. A sky term pushes the render to black where the
+sky mask $s$ fires, so the masked region is not left to floaters. And the two MCMC regularizers act
+on the *activated* parameters — an opacity-sparsity L1 on $\sigma(o)$ and a covariance L1 on the
+scales $\exp(\ell)$ (the square-roots of the eigenvalues of $\Sigma$) — each a mean, to match the
+mean-reduced photometric loss:
+
+$$\mathcal{L}=\mathcal{L}_{\mathrm{photo}}+\lambda_{d}\,\frac{\sum m\,\lvert \hat D-D\rvert}{\sum m}+\lambda_{s}\,\frac{\sum s\,\lvert\hat I\rvert}{3\sum s}+\lambda_{o}\,\overline{\sigma(o)}+\lambda_{c}\,\overline{\exp(\ell)}$$
+
+The means learning rate follows the 3DGS `spatial_lr_scale` convention — the base rate times the
+camera-bounding radius ($\times 1.1$) — so in a metric scene tens of metres across the means
+actually move rather than freezing. The photometric term is scale-free; the metric-anchor loss
+(ground-plane + wheel-contact residual) is the term that will break the scale gauge and make the
+reconstruction natively metric, with joint pose refinement through the rasterizer, the current work
+(see Roadmap).
 
 ## Architecture
 
@@ -106,12 +141,13 @@ pose refinement through the rasterizer it is the current work (see Roadmap).
 |---|---|---|
 | nuScenes monocular keyframe stream + calibration/GT + windowing | `nuslam.data` | infrastructure |
 | Monocular depth + DA3-Base reconstruction (depth+pose+K) | `nuslam.frontend` | infrastructure |
-| Road/ground + sky segmentation (CLIPSeg), tracking (CoTracker/KLT) | `nuslam.frontend` | infrastructure |
+| Sky/vehicle segmentation (SAM3, CLIPSeg fallback), tracking (CoTracker/KLT) | `nuslam.frontend` | infrastructure |
 | Lidar-into-camera projection: calib check + depth-vs-lidar eval | `nuslam.data` / `nuslam.eval` | infrastructure |
 | DA3 metric upgrade: DAQ solve, rectifying homography, metric cameras/depth/cloud | `nuslam.recon.metric_upgrade` | core — built + tested |
 | GPS/IMU Sim(3) scale fit | `nuslam.recon` | core — built |
+| COLMAP (masked SfM) camera poses, Umeyama-aligned to metres | `pycolmap` + `nuslam.recon` | infrastructure |
 | Ground/wheel-contact scale anchor; Gaussian pose refinement; metric-anchor loss | `nuslam.recon` | core — in progress |
-| 3DGS representation, gsplat calls, training loop, photometric loss, sky masking | `nuslam.recon.gaussians` | core — built |
+| 3DGS representation, gsplat calls, training loop, photometric + depth + sky losses, MCMC regularizers, sky/vehicle masking | `nuslam.recon.gaussians` | core — built |
 | Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure |
 | Trajectory eval (Umeyama Sim(3)/SE(3), ATE/RPE) — GT as oracle | `nuslam.eval` | infrastructure |
 | Factor-graph SLAM integration (render-as-a-factor + fusion) | `nuslam.backend` | parked |
@@ -146,54 +182,130 @@ metres) on this scene, with no use of GT.
 <p align="center"><img src="docs/alignment.png" width="75%" alt="Top-down metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks"></p>
 <p align="center"><sub>Metric-upgraded DA3 point cloud and camera frusta along the recovered trajectory, aligned to the GPS and GT reference tracks by the Sim(3) GPS fit.</sub></p>
 
+### Camera poses
+
+DA3's poses were the reconstruction ceiling. After the Sim(3) GPS alignment its trajectory sits a
+mean of 2.09 m from GT (2.28 m RMS GPS residual), the error concentrated on the frames where
+vehicles move through the scene — DA3 assumes a static world and cannot tell a moving car from
+fixed structure. Re-solving the poses with masked COLMAP SfM and the *same* GPS Umeyama collapses
+that to a 0.16 m GPS residual and a 0.11 m median (0.19 m mean) offset from GT over the 91 m
+trajectory — matching a GT-pose oracle without ever touching GT.
+
+| Pose source | GPS-align residual | vs GT (mean / median) |
+|---|---|---|
+| DA3 metric-upgrade | 2.28 m | 2.09 m / — |
+| COLMAP (masked SfM) | **0.16 m** | **0.19 m / 0.11 m** |
+
+<p align="center"><img src="docs/pose_alignment.png" width="55%" alt="Top-down camera trajectory: COLMAP and GT and GPS overlap; DA3 zigzags off by ~2 m"></p>
+<p align="center"><sub>Top-down camera trajectory in the nuScenes global frame: COLMAP (green) sits on GT (red) and the GPS track (blue); DA3 (orange) zigzags off wherever the scene is dynamic.</sub></p>
+
+The same contrast in 3D over the dense cloud — COLMAP poses lie clean along the trajectory (top),
+DA3 poses jitter off the GT track (bottom):
+
+<p align="center">
+  <img src="docs/colmap_poses_overview.png" width="49%" alt="COLMAP frusta and trajectory (green) on GT (red) and GPS (blue) along the dense cloud">
+  <img src="docs/colmap_poses_street.png" width="49%" alt="COLMAP trajectory down the street, close view">
+</p>
+<p align="center">
+  <img src="docs/da3_poses_topdown.png" width="49%" alt="DA3 trajectory (green) zigzagging off the GT arc (red)">
+  <img src="docs/da3_poses_street.png" width="49%" alt="DA3 trajectory jittering down the street">
+</p>
+<p align="center"><sub>COLMAP poses (top) versus DA3 poses (bottom), both against the GT (red) and GPS (blue) references — the DA3 track visibly wanders where COLMAP holds the line.</sub></p>
+
 ### Gaussian-splat reconstruction
 
-The static reconstruction runs metrically with sky masked out. Held-out novel-view PSNR peaks
-early (~14.8 dB near iteration 500) and then declines to ~14 dB as the Gaussian count grows to the
-5M cap — added Gaussians overfit the training views rather than improving novel views.
+With COLMAP poses the reconstruction reaches the pose oracle it was capped below. On a five-frame
+window (train 3 / hold out 2) COLMAP matches the GT-pose oracle, and dropping the DA3 depth
+supervision *helps* — the DA3 depth carries the noisier five-frame scale, and once the geometry is
+good it fights the render. Extended to all 39 keyframes (train 34 / hold out 5), with depth back on,
+the full run is the strongest on every structural metric, over genuinely novel viewpoints spread
+across the whole trajectory:
 
-<p align="center"><img src="docs/training_curves.png" width="90%" alt="Training loss; held-out PSNR declining while Gaussian count rises to the 5M cap"></p>
+| Run | Poses | Depth sup. | Frames | PSNR | SSIM | L1 |
+|---|---|---|---|---|---|---|
+| 5-frame, GT (oracle) | GT | yes | 5 | 10.25 | 0.469 | 0.186 |
+| 5-frame, COLMAP | COLMAP | yes | 5 | 10.27 | 0.474 | 0.187 |
+| 5-frame, COLMAP | COLMAP | no | 5 | 10.57 | 0.492 | 0.177 |
+| Full, COLMAP | COLMAP | yes | 39 | **10.62** | **0.592** | **0.158** |
 
-Train views reconstruct roughly; held-out views are noticeably ghosted, with floaters where the
-scene is dynamic or under-constrained.
+PSNR is depressed and roughly flat across these runs because the sky→black term renders the masked
+sky dark against bright-sky GT over the whole frame; SSIM and L1 are the cleaner cross-run signal,
+and both are clearly best on the full COLMAP run.
 
-<p align="center"><img src="docs/render_compare.png" width="85%" alt="GT vs render for a train and a held-out view; train roughly reconstructed, held-out ghosted"></p>
+Five-frame renders, depth supervision (left) versus none (right):
 
-The reconstruction rendered along the estimated (DA3/metric-upgrade) camera trajectory:
+<p align="center">
+  <img src="docs/colmap_5frame_depth.png" width="49%" alt="5-frame COLMAP with depth supervision, rendered view">
+  <img src="docs/colmap_5frame_nodepth.png" width="49%" alt="5-frame COLMAP without depth supervision, rendered view">
+</p>
 
-https://github.com/user-attachments/assets/24267471-20ec-42ac-b5f3-408f441124a0
+Full 39-frame reconstruction, rendered along the trajectory:
 
-<p align="center"><sub>Regenerate with <code>scripts/render_gs_video.py --scene scene-0061 --run run4 --mode flythrough</code>.</sub></p>
+<p align="center">
+  <img src="docs/full_colmap_1.png" width="49%" alt="Full COLMAP reconstruction, rendered view 1">
+  <img src="docs/full_colmap_2.png" width="49%" alt="Full COLMAP reconstruction, rendered view 2">
+</p>
+<p align="center">
+  <img src="docs/full_colmap_3.png" width="49%" alt="Full COLMAP reconstruction, rendered view 3">
+  <img src="docs/full_colmap_4.png" width="49%" alt="Full COLMAP reconstruction, rendered view 4">
+</p>
 
-The ceiling is not Gaussian count or iterations (both were saturated) but pose error: the frozen
-DA3/metric-upgrade trajectory sits a mean of 2.09 m (max 5.76 m) from GT after the Sim(3)
-alignment, so the training views themselves are placed wrong.
+<p align="center"><img src="docs/training_curves.png" width="90%" alt="Full-run training loss, held-out PSNR, and Gaussian count rising to the 5M cap"></p>
 
-<p align="center"><img src="docs/trajectory.png" width="95%" alt="Top-down camera trajectory, DA3 estimate vs nuScenes GT, ~2 m mean offset concentrated at the turn"></p>
+The remaining limit is density, not poses. A 39-frame drive spans ~90 m, and the 5M-Gaussian cap
+spreads thin over that extent — worse, most of the budget scatters far outside the scene (at the
+final iteration only ~0.46M of the 5M sit within 200 m of the centre). The reconstruction looks
+sparse and spiky where coverage is thin:
 
-This motivates the two next steps (dynamic-object handling and pose refinement through the
-rasterizer) over adding more Gaussians.
+<p align="center"><img src="docs/full_extent_sparsity.png" width="80%" alt="Full-scene Gaussians spread thin and spiky over the large scene extent"></p>
+
+The next step is to bound the reconstruction — mask out far-away points at both initialization and
+during optimization — so the Gaussian budget is spent on the scene rather than on distant floaters.
+
+Flythroughs — the final Gaussians rendered along the camera trajectory. The source `.mp4`s live in
+`docs/`; upload each via the GitHub GUI and paste its attachment link under the matching heading.
+
+Five-frame COLMAP, with depth supervision (`docs/run5-5frame-colmap_flythrough.mp4`):
+
+<!-- upload docs/run5-5frame-colmap_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+
+Five-frame COLMAP, no depth supervision (`docs/run5-5frame-colmap-nodepth_flythrough.mp4`):
+
+<!-- upload docs/run5-5frame-colmap-nodepth_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+
+Full 39-frame COLMAP (`docs/run6-full-colmap_flythrough.mp4`):
+
+<!-- upload docs/run6-full-colmap_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+
+<p align="center"><sub>Regenerate any of these with <code>scripts/render_gs_video.py --scene scene-0061 --run &lt;run&gt; --mode flythrough --colmap-poses</code> (add <code>--max-frames 5 --holdout-every 2 --holdout-offset 1</code> for the five-frame runs).</sub></p>
 
 ### Qualitative outputs
 
-Produced by the viz scripts (into the gitignored `out/`):
+Produced by the viz scripts (into the gitignored `out/`), each pose-source aware:
 
-- `scripts/render_gs_video.py --mode panel` — a grid of train + held-out views, GT over the
-  render, evolving across the run's snapshots.
-- `scripts/render_gs_video.py --mode flythrough --trajectory both` — the final snapshot rendered
-  along the estimated and the actual GT camera trajectory (GT poses mapped into the recon frame
-  via the Sim(3)); the ~2 m offset is what makes the GT flythrough mis-register.
-- `scripts/replay_gs_rrd.py` — the Gaussian evolution + curves + GT/render images as a Rerun
-  `.rrd`, scrubbable on the `iter` timeline.
+- `scripts/render_gs_video.py --mode flythrough` — the final Gaussians rendered along the camera
+  trajectory (`--colmap-poses` / `--gt-poses` to fly the run's own poses).
+- `scripts/render_progress_video.py` — the run's saved train + held-out renders, GT over estimate,
+  stitched across iterations (correct for any pose source, no re-render).
+- `scripts/replay_gs_rrd.py` — the full-density Gaussian evolution (all snapshots + the final) +
+  curves + GT/render images as a Rerun `.rrd`, scrubbable on the `iter` timeline.
 
 ## Roadmap
 
-- Dynamic objects — segment vehicles with CLIPSeg and either drop them from the static-scene loss
-  or reconstruct them as posed per-instance Gaussians composed back onto the scene.
-- Pose refinement — unfreeze the camera poses and optimize them through the rasterizer via an
-  SE(3) tangent-space delta, to close the ~2 m gap that caps render quality.
-- Ground/wheel scale anchor — the semantic metric anchor acting directly on the Gaussians,
-  de-risked first with an explicit scalar, then folded into the joint optimization.
+- Bound the reconstruction — drop points beyond a range threshold from every camera at
+  initialization, and supervise their pixels toward black during optimization (reusing the
+  sky→black term). The init cloud back-projects one 3-D point per pixel, so each pixel's range to
+  the trajectory is known: a pixel whose point is farther than the threshold from all poses is left
+  unconstrained today and grows arbitrary floaters, so pushing it to black spends the capped
+  Gaussian budget on the scene instead (currently most of the 5M land outside the scene on the full
+  drive). Pair with a low-opacity prune.
+- Dynamic objects — vehicles are already masked out of the loss and init (SAM3); the next step is
+  reconstructing them as posed per-instance Gaussians composed back onto the static scene.
+- Pose refinement — refine the COLMAP poses jointly through the rasterizer via an SE(3)
+  tangent-space delta, folding pose and geometry into one optimization.
+- Ground/wheel scale anchor — the semantic metric anchor acting directly on the Gaussians (the
+  GT-free scale source), de-risked first with an explicit scalar, then folded into the joint
+  optimization.
 - Factor-graph SLAM — lift the batch optimization into a GTSAM/iSAM2 graph with the render as a
   factor, plus IMU/GPS/wheel fusion and loop closure.
 
@@ -237,19 +349,32 @@ Metric upgrade → metric-up-to-scale reconstruction:
 # --eval-gt (oracle) Sim(3)-aligns to GT to print ATE and the scale the GPS fit should reproduce
 ```
 
-Gaussian-splat reconstruction (sky masked; snapshots + curves + renders written under the run dir):
+Camera poses — masked COLMAP SfM, aligned to metres, cached per keyframe (uses the cached sky/vehicle
+SAM3 masks):
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/run_gs.py --scene scene-0061 --train \
-    --mask-sky --voxel 0.3 --run-name run4
+PYTHONPATH=src .venv/bin/python scripts/cache_colmap_poses.py   # -> out/frontend_cache/<scene>/colmap_poses_global.npz
+```
+
+Gaussian-splat reconstruction (COLMAP poses; sky + vehicles masked; depth + sky supervision and MCMC
+regularizers; snapshots + curves + renders written under the run dir):
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/run_gs.py --scene scene-0061 --train --colmap-poses \
+    --mask-sky --sky-threshold 0.5 --mask-vehicles --vehicle-prompt "moving vehicle" \
+    --opacity-reg 0.01 --scale-reg 0.01 --depth-lambda 0.05 --sky-lambda 0.05 \
+    --voxel 0.3 --run-name run6-full-colmap
+# five-frame window: add --max-frames 5 --holdout-every 2 --holdout-offset 1
+# oracle pose baseline: swap --colmap-poses for --gt-poses
 ```
 
 Result figures and videos:
 
 ```bash
-python scripts/make_readme_figures.py --scene scene-0061 --run run4     # docs/ montage, curves, trajectory
-python scripts/render_gs_video.py --scene scene-0061 --run run4 --mode both --trajectory both
-python scripts/replay_gs_rrd.py --scene scene-0061 --run run4           # out/run4.rrd  (open: rerun out/run4.rrd)
+python scripts/make_readme_figures.py --scene scene-0061 --run run6-full-colmap   # docs/ montage + curves
+python scripts/render_gs_video.py --scene scene-0061 --run run6-full-colmap --mode flythrough --colmap-poses
+python scripts/render_progress_video.py --scene scene-0061 --run run6-full-colmap # out/<run>_progress.mp4
+python scripts/replay_gs_rrd.py --scene scene-0061 --run run6-full-colmap --max-pts 5200000 --every 1
 ```
 
 Tests: `.venv/bin/python -m pytest tests/ -q` (data-dependent tests skip if the mini split is absent).
@@ -261,7 +386,7 @@ src/nuslam/
   transforms.py          SE(3) helpers (numpy)
   types.py               data contract: CameraCalib, Keyframe, TrackSet, GroundMask, DepthMap, streams
   data/                  nuScenes monocular source, CAN streams, lidar->camera projection
-  frontend/              DA3 depth + DA3-Base reconstruction, CLIPSeg, tracking (CoTracker+KLT), cache
+  frontend/              DA3 depth + DA3-Base reconstruction, SAM3/CLIPSeg segmentation, tracking (CoTracker+KLT), cache
   viz/                   Rerun logging (images/frusta/points/GaussianSplats3D) + figures
   eval/                  Umeyama Sim(3)/SE(3) + ATE/RPE + depth-vs-lidar (GT as oracle)
   backend/               factor-graph SLAM — parked
@@ -270,6 +395,7 @@ src/nuslam/
     gaussians.py           3DGS representation, gsplat calls, training loop, photometric loss — built
     (ground/wheel scale anchor, pose refinement, metric-anchor loss — in progress)
 scripts/                 setup, data, inspect_sample, run_frontend, run_depth, run_recon,
-                         run_metric_upgrade, run_gs, render_gs_video, replay_gs_rrd, make_readme_figures
+                         run_metric_upgrade, cache_colmap_poses, run_gs, render_gs_video,
+                         render_progress_video, replay_gs_rrd, make_readme_figures
 tests/                   unit (transforms/metrics/cache/seeding/refine/metric_upgrade) + mini-data
 ```

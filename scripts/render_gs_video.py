@@ -65,11 +65,11 @@ def load_geometry(args):
     # match the run's training cameras: GT / COLMAP runs live in the nuScenes global frame,
     # so the flythrough must fly the SAME poses (rendering the Gaussians from DA3 poses would
     # be garbage). Mirrors run_gs's --gt-poses / --colmap-poses.
-    if args.gt_poses:
+    if getattr(args, "gt_poses", False):
         s2e_m = frames[0][0].calib.sensor2ego.matrix()
         poses_m = np.stack([kf.ego2global_gt.matrix() @ s2e_m for kf, _ in frames])
         print("[geometry] using GT camera poses (global frame)")
-    elif args.colmap_poses:
+    elif getattr(args, "colmap_poses", False):
         cp = Path(args.cache_root) / scene_name / "colmap_poses_global.npz"
         d = np.load(cp, allow_pickle=True)
         cmap = {str(t): P for t, P in zip(d["tokens"], d["poses"])}
@@ -92,7 +92,8 @@ def load_geometry(args):
     # stack once: train_gaussians does torch.tensor(images), which is ~200x slower on a
     # list of arrays than on a single ndarray (83s -> 0.4s per snapshot load).
     images = np.stack([kf.image() for kf, _ in frames])
-    train_idx, test_idx = holdout_indices(len(frames), every=args.holdout_every, offset=args.holdout_offset)
+    train_idx, test_idx = holdout_indices(len(frames), every=args.holdout_every,
+                                          offset=getattr(args, "holdout_offset", 0))
     return frames, poses_m, K_true, images, np.asarray(train_idx), np.asarray(test_idx), gt_poses_recon
 
 
