@@ -234,12 +234,18 @@ and both are clearly best on the full COLMAP run.
 
 Five-frame renders, depth supervision (left) versus none (right):
 
+https://github.com/user-attachments/assets/77ce4b9b-1048-42a1-b21f-19c910fc7b5d
+
+https://github.com/user-attachments/assets/a3965007-feaf-4e47-9d17-df4808a910f2
+
 <p align="center">
   <img src="docs/colmap_5frame_depth.png" width="49%" alt="5-frame COLMAP with depth supervision, rendered view">
   <img src="docs/colmap_5frame_nodepth.png" width="49%" alt="5-frame COLMAP without depth supervision, rendered view">
 </p>
 
 Full 39-frame reconstruction, rendered along the trajectory:
+
+https://github.com/user-attachments/assets/aee273a4-ce12-43dd-ab8c-20867f21840d
 
 <p align="center">
   <img src="docs/full_colmap_1.png" width="49%" alt="Full COLMAP reconstruction, rendered view 1">
