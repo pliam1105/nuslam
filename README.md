@@ -234,18 +234,12 @@ and both are clearly best on the full COLMAP run.
 
 Five-frame renders, depth supervision (left) versus none (right):
 
-https://github.com/user-attachments/assets/77ce4b9b-1048-42a1-b21f-19c910fc7b5d
-
-https://github.com/user-attachments/assets/a3965007-feaf-4e47-9d17-df4808a910f2
-
 <p align="center">
   <img src="docs/colmap_5frame_depth.png" width="49%" alt="5-frame COLMAP with depth supervision, rendered view">
   <img src="docs/colmap_5frame_nodepth.png" width="49%" alt="5-frame COLMAP without depth supervision, rendered view">
 </p>
 
 Full 39-frame reconstruction, rendered along the trajectory:
-
-https://github.com/user-attachments/assets/aee273a4-ce12-43dd-ab8c-20867f21840d
 
 <p align="center">
   <img src="docs/full_colmap_1.png" width="49%" alt="Full COLMAP reconstruction, rendered view 1">
@@ -273,15 +267,15 @@ Flythroughs — the final Gaussians rendered along the camera trajectory. The so
 
 Five-frame COLMAP, with depth supervision (`docs/run5-5frame-colmap_flythrough.mp4`):
 
-<!-- upload docs/run5-5frame-colmap_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+https://github.com/user-attachments/assets/77ce4b9b-1048-42a1-b21f-19c910fc7b5d
 
 Five-frame COLMAP, no depth supervision (`docs/run5-5frame-colmap-nodepth_flythrough.mp4`):
 
-<!-- upload docs/run5-5frame-colmap-nodepth_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+https://github.com/user-attachments/assets/a3965007-feaf-4e47-9d17-df4808a910f2
 
 Full 39-frame COLMAP (`docs/run6-full-colmap_flythrough.mp4`):
 
-<!-- upload docs/run6-full-colmap_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+https://github.com/user-attachments/assets/aee273a4-ce12-43dd-ab8c-20867f21840d
 
 <p align="center"><sub>Regenerate any of these with <code>scripts/render_gs_video.py --scene scene-0061 --run &lt;run&gt; --mode flythrough --colmap-poses</code> (add <code>--max-frames 5 --holdout-every 2 --holdout-offset 1</code> for the five-frame runs).</sub></p>
 
