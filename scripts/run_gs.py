@@ -110,6 +110,8 @@ def parse_args():
     p.add_argument("--no-scale", action="store_true", help="skip Route-B metric scaling (leave up-to-scale)")
     p.add_argument("--train", action="store_true", help="fit the Gaussians (else only prep + overlays)")
     p.add_argument("--num-iters", type=int, default=10000, help="optimization iterations")
+    p.add_argument("--batch-size", type=int, default=1,
+                   help="views rendered/optimized per step (multi-view batch averages the loss)")
     p.add_argument("--structural-lambda", type=float, default=0.2, help="weight of the structural (D-SSIM) term")
     p.add_argument("--log-every", type=int, default=100, help="log progress/renders every N iters (0 = off)")
     p.add_argument("--snapshot-every", type=int, default=500, help="save a GS .npz snapshot every N iters")
@@ -170,7 +172,15 @@ def parse_args():
                         "do not grow arbitrary floaters. Per-pixel, keyed off the init cloud's one "
                         "point per pixel")
     p.add_argument("--range-thresh", type=float, default=60.0,
-                   help="range threshold in metres for --range-mask (min distance to all cameras)")
+                   help="range threshold in metres, shared by --range-mask (per-pixel) and "
+                        "--prune-offscene (per-centroid): min distance to all cameras")
+    p.add_argument("--prune-offscene", action="store_true",
+                   help="every --prune-every steps, remove Gaussians whose CENTROIDS are off-scene: "
+                        "invisible in all views, farther than --range-thresh from every camera, or "
+                        "projecting onto non-kept (sky/vehicle/far) pixels in most views. MCMC refills "
+                        "the freed budget in-scene (doubles as relocation). No warmup")
+    p.add_argument("--prune-every", type=int, default=100,
+                   help="cadence (steps) of the --prune-offscene pass")
     p.add_argument("--rerun", action="store_true", help="spawn a native Rerun viewer (needs a display)")
     p.add_argument("--save", type=Path, default=None, help="write a .rrd (opened later, not live)")
     p.add_argument("--serve", action="store_true",
@@ -532,8 +542,10 @@ def main() -> int:
         for kf, _ in frames:
             f = far_masks[kf.token]
             black_src[kf.token] = f if kf.token not in black_src else (black_src[kf.token] | f)
+    # pass the black mask (sky ∪ far) when the sky->black loss OR the off-scene prune needs it (the
+    # loss term stays gated on sky_lambda>0 inside train_gaussians; the prune uses it as the empty mask).
     sky_only_masks = ([black_src[kf.token] for kf, _ in frames]
-                      if (args.sky_lambda > 0 and black_src) else None)
+                      if (black_src and (args.sky_lambda > 0 or args.prune_offscene)) else None)
     # scale the means LR by the scene extent (3DGS spatial_lr_scale = camera-bounding radius): the
     # 1.6e-4 base is meant to be multiplied by this, else in a metric scene of tens of metres the
     # means barely move. Also scales the MCMC position-noise (which uses lr_for["means"]).
@@ -544,12 +556,14 @@ def main() -> int:
           f"(base {LR_FOR['means']:.1e})")
     gs_tuple, render = train_gaussians(
         xyz, rgb, poses_m, K_true, images, train_idx,
-        lr_for=lr_for, num_iters=args.num_iters, structural_lambda=args.structural_lambda,
+        lr_for=lr_for, num_iters=args.num_iters, batch_size=args.batch_size,
+        structural_lambda=args.structural_lambda,
         log_every=args.log_every, on_log=on_log, init_gaussians=ckpt,
         clip_scales_to_knn=args.clip_scales, masks=train_masks, optimize_poses=args.optimize_poses,
         opacity_reg=args.opacity_reg, scale_reg=args.scale_reg,
         depths=depth_maps, depth_lambda=args.depth_lambda,
         sky_masks=sky_only_masks, sky_lambda=args.sky_lambda,
+        prune_offscene=args.prune_offscene, prune_range=args.range_thresh, prune_every=args.prune_every,
     )
     csv_file.close()
     print(f"\nfit complete ({args.num_iters} iters, structural_lambda={args.structural_lambda})")

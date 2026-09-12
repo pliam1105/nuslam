@@ -19,11 +19,51 @@ from __future__ import annotations
 import numpy as np
 import torch
 import gsplat
+from gsplat.strategy import ops as _gs_ops   # prune Gaussians + their optimizer/strategy state in lockstep
 import torchvision.transforms.functional as F
 
 from nuslam.pointcloud import nn_distances
 
 from nuslam.eval import render
+
+
+@torch.no_grad()
+def _offscene_prune_mask(means, viewmats, Ks, empty_img, width, height, prune_range):
+    """(N,) bool, True = prune. A Gaussian centroid is off-scene if it is:
+      (a) invisible in EVERY view (behind the camera or projecting out of bounds everywhere);
+      (b) farther than ``prune_range`` metres from EVERY camera centre (skipped if prune_range<=0);
+      (c) projecting onto a should-be-empty pixel (``empty_img``: sky OR far-range, NOT vehicle) in
+          ANY view -- those regions are supposed to be empty/black, so a Gaussian landing there even
+          once is a floater in confirmed-empty space. (Vehicles are excluded: real content sits
+          behind the mask, so a Gaussian projecting onto a vehicle may be legitimate in other views.)
+    Projection is looped over views to keep memory flat at ~5M Gaussians."""
+    N, V = means.shape[0], viewmats.shape[0]
+    dev = means.device
+    seen = torch.zeros(N, device=dev)
+    hit_empty = torch.zeros(N, dtype=torch.bool, device=dev)
+    mind = torch.full((N,), float("inf"), device=dev)
+    centres = torch.linalg.inv(viewmats)[:, :3, 3]                          # (V,3) world camera centres
+    for v in range(V):
+        Xc = means @ viewmats[v, :3, :3].T + viewmats[v, :3, 3]             # (N,3) camera coords
+        uvw = Xc @ Ks[v].T                                                  # (N,3)
+        u = uvw[:, 0] / uvw[:, 2]; y = uvw[:, 1] / uvw[:, 2]
+        inb = (Xc[:, 2] > 0) & (u >= 0) & (u < width) & (y >= 0) & (y < height)
+        seen += inb.float()
+        if empty_img is not None:
+            # sanitize before indexing: z~0 gives nan/inf u,y -> .long() would be out of bounds (CUDA
+            # assert). Those points are ~inb=False anyway, so index them at 0 and they get masked out.
+            ui = torch.nan_to_num(u, 0.0, 0.0, 0.0).clamp(0, width - 1).long()
+            yi = torch.nan_to_num(y, 0.0, 0.0, 0.0).clamp(0, height - 1).long()
+            is_empty = empty_img[v, 0, yi, ui] > 0.5                        # projects onto sky/far here?
+            hit_empty |= inb & is_empty                                     # ANY view
+        if prune_range > 0:
+            mind = torch.minimum(mind, torch.linalg.norm(means - centres[v], dim=1))
+    prune = seen == 0                                                       # (a)
+    if empty_img is not None:
+        prune = prune | hit_empty                                          # (c)
+    if prune_range > 0:
+        prune = prune | (mind > prune_range)                              # (b)
+    return prune
 
 def train_gaussians(
     init_xyz: np.ndarray,       # (M, 3) metric seed points -> Gaussian means
@@ -67,6 +107,13 @@ def train_gaussians(
     sky_masks=None,                      # optional per-view (H,W) bool sky masks: supervise those pixels
                                          # toward black (sky has nothing behind it -> the black background).
     sky_lambda: float = 0.0,             # weight of the sky->black loss (author-added at the seam).
+    prune_offscene: bool = False,        # every prune_every steps, remove Gaussians whose centroids are
+                                         # off-scene (invisible in all views, beyond prune_range from every
+                                         # camera, or projecting into the non-kept/black region in most
+                                         # views). MCMC's refill-to-cap re-adds the freed budget in-scene.
+    prune_range: float = 0.0,            # metres: prune centroids farther than this from EVERY camera
+                                         # (<=0 disables the range criterion; visibility/black still apply).
+    prune_every: int = 100,              # cadence (steps) of the off-scene prune. No warmup: starts at step 0.
 ):
     """Fit the Gaussians to the images and return the optimized set.
 
@@ -223,6 +270,23 @@ def train_gaussians(
         for o in optimizers.values():
             o.step()
             o.zero_grad()
+
+        # off-scene prune: drop Gaussians whose centroids are invisible / out of range / only on
+        # non-kept pixels, in lockstep across params + optimizer + strategy state. No warmup (from
+        # step 0); MCMC's step_post_backward refills to cap_max next refine, re-adding the freed
+        # budget by sampling in-scene Gaussians -- so this doubles as relocation.
+        if prune_offscene and step % prune_every == 0:
+            pm = _offscene_prune_mask(params["means"].detach(), viewmats, Ks,
+                                      sky_img, width, height, prune_range)   # sky_img = sky ∪ far (black region)
+            if bool(pm.any()):
+                # prune params + their Adam states in lockstep. NOT gsplat.ops.remove: that also
+                # indexes the strategy `state` per Gaussian, but MCMC's state is only a fixed (51,51)
+                # `binoms` table (not per-Gaussian) -> out-of-bounds. MCMC itself prunes via this same
+                # _update_param_with_optimizer and never touches state per Gaussian.
+                sel = torch.where(~pm)[0]                              # indices to keep
+                _gs_ops._update_param_with_optimizer(
+                    lambda name, p: torch.nn.Parameter(p[sel], requires_grad=p.requires_grad),
+                    lambda name, v: v[sel], params, optimizers)
 
         # observability (viz / logging) -- handled by the caller's callback
         if on_log is not None and log_every and step % log_every == 0:

@@ -135,6 +135,29 @@ actually move rather than freezing. The photometric term is scale-free; the metr
 reconstruction natively metric, with joint pose refinement through the rasterizer, the current work
 (see Roadmap).
 
+### Bounding the reconstruction
+
+A forward drive spans ~90 m, and with MCMC densifying to a 5M-Gaussian cap most of that budget ends
+up on distant floaters outside the scene (on the full run only ~9% of the 5M sit within 200 m of the
+trajectory). Two mechanisms bound it to the driven corridor:
+
+- **Range mask (pixel-space).** The init cloud back-projects one point per pixel, so each pixel's
+  range to the trajectory is known. Pixels whose point lies farther than a threshold from every
+  camera are dropped from the init and supervised toward black (reusing the sky→black term), so the
+  far field is not left to grow floaters. This bounds the *image*, but it also blacks out the
+  well-observed mid-distance, which is where a forward camera's texture lives — so a tight threshold
+  hurts (see Results).
+- **Off-scene prune (mean-space).** Every few steps, a Gaussian is removed if its *centroid* is
+  invisible in every view, farther than the range limit from every camera, or projects onto a
+  should-be-empty pixel (sky or far-range) in any view — pruning params and Adam state in lockstep,
+  after which MCMC's refill-to-cap re-adds the freed budget by sampling in-scene Gaussians (so the
+  prune doubles as relocation). This bounds the *representation* directly, holding the model to a few
+  hundred thousand in-scene Gaussians instead of 5M at no quality cost — and, being ~15× smaller,
+  training is far faster.
+
+`run_gs.py --range-mask --range-thresh` and `--prune-offscene --prune-every`; `--batch-size` renders
+several views per step for a lower-variance gradient.
+
 ## Architecture
 
 | Component | Module / symbol | Status |
@@ -235,32 +258,88 @@ and both are clearly best on the full COLMAP run.
 Five-frame renders, depth supervision (left) versus none (right):
 
 <p align="center">
-  <img src="docs/colmap_5frame_depth.png" width="49%" alt="5-frame COLMAP with depth supervision, rendered view">
-  <img src="docs/colmap_5frame_nodepth.png" width="49%" alt="5-frame COLMAP without depth supervision, rendered view">
+  <img src="docs/colmap_5frame_depth.png" width="49%" alt="run5-5frame-colmap (5-frame, COLMAP poses, depth) rendered view">
+  <img src="docs/colmap_5frame_nodepth.png" width="49%" alt="run5-5frame-colmap-nodepth (5-frame, COLMAP poses, no depth) rendered view">
 </p>
+<p align="center"><sub>Five-frame window (train 3 / hold out 2), COLMAP poses: <code>run5-5frame-colmap</code> with depth (left) vs <code>run5-5frame-colmap-nodepth</code> without (right).</sub></p>
 
-Full 39-frame reconstruction, rendered along the trajectory:
+Full 39-frame reconstruction (`run6-full-colmap`: COLMAP poses, depth + sky→black + opacity/scale
+regularizers, 5M Gaussians), rendered along the trajectory:
 
 <p align="center">
-  <img src="docs/full_colmap_1.png" width="49%" alt="Full COLMAP reconstruction, rendered view 1">
-  <img src="docs/full_colmap_2.png" width="49%" alt="Full COLMAP reconstruction, rendered view 2">
+  <img src="docs/full_colmap_1.png" width="49%" alt="run6-full-colmap rendered view 1">
+  <img src="docs/full_colmap_2.png" width="49%" alt="run6-full-colmap rendered view 2">
 </p>
 <p align="center">
-  <img src="docs/full_colmap_3.png" width="49%" alt="Full COLMAP reconstruction, rendered view 3">
-  <img src="docs/full_colmap_4.png" width="49%" alt="Full COLMAP reconstruction, rendered view 4">
+  <img src="docs/full_colmap_3.png" width="49%" alt="run6-full-colmap rendered view 3">
+  <img src="docs/full_colmap_4.png" width="49%" alt="run6-full-colmap rendered view 4">
 </p>
+<p align="center"><sub>Novel-view renders from <code>run6-full-colmap</code> (full 39 keyframes, COLMAP poses, 5M Gaussians).</sub></p>
 
-<p align="center"><img src="docs/training_curves.png" width="90%" alt="Full-run training loss, held-out PSNR, and Gaussian count rising to the 5M cap"></p>
+<p align="center"><img src="docs/training_curves.png" width="90%" alt="run6-full-colmap training loss, held-out PSNR, and Gaussian count rising to the 5M cap"></p>
+<p align="center"><sub>Training curves for <code>run6-full-colmap</code>: loss, held-out PSNR, and Gaussian count to the 5M cap.</sub></p>
 
 The remaining limit is density, not poses. A 39-frame drive spans ~90 m, and the 5M-Gaussian cap
 spreads thin over that extent — worse, most of the budget scatters far outside the scene (at the
-final iteration only ~0.46M of the 5M sit within 200 m of the centre). The reconstruction looks
-sparse and spiky where coverage is thin:
+final iteration only ~0.46M of the 5M sit within 200 m of the centre). The `run6-full-colmap`
+reconstruction looks sparse and spiky where coverage is thin:
 
-<p align="center"><img src="docs/full_extent_sparsity.png" width="80%" alt="Full-scene Gaussians spread thin and spiky over the large scene extent"></p>
+<p align="center"><img src="docs/full_extent_sparsity.png" width="80%" alt="run6-full-colmap: Gaussians spread thin and spiky over the large scene extent"></p>
+<p align="center"><sub><code>run6-full-colmap</code> Gaussians — thin and spiky, most of the 5M scattered off the driven corridor.</sub></p>
 
-The next step is to bound the reconstruction — mask out far-away points at both initialization and
-during optimization — so the Gaussian budget is spent on the scene rather than on distant floaters.
+### Bounding the reconstruction
+
+The pixel range mask and the mean-space prune both bound the model to the driven corridor, but only
+the prune does it without a quality cost. Held-out over 5 novel views (full scene, no regularizers):
+
+| Run | Bound | N (final) | PSNR | SSIM | L1 |
+|---|---|---|---|---|---|
+| run6 | none (reg) | 5,000,000 | 10.62 | 0.592 | 0.158 |
+| run9 | range mask (25 m) | 5,000,000 | 9.22 | 0.499 | 0.213 |
+| **run10** | range mask + **prune** | **277,779** | 9.25 | 0.504 | 0.214 |
+
+The **range mask alone** darkens the well-observed mid-distance (where a forward camera's texture
+lives), so quality drops vs the unbounded run — and it doesn't even keep Gaussians out: with pixel
+supervision only, MCMC still scatters most of the 5M off-scene (below left: **run7**'s cloud is a
+small scene engulfed in a dust cloud of floaters). The **off-scene prune** fixes it in mean-space:
+run10 matches the range run's quality with **18× fewer Gaussians** (278k vs 5M) and trains ~15×
+faster; a pruned model's cloud (below right: **run13**, a warm-start in the same prune regime) sits
+concentrated on the road corridor instead of a floater halo.
+
+<p align="center">
+  <img src="docs/range_floaters_cloud.png" width="49%" alt="run7 (range mask, no prune): scene is a small cluster engulfed in a dust cloud of off-scene floaters">
+  <img src="docs/prune_bounded_cloud.png" width="49%" alt="run13 (range mask + prune): Gaussians concentrated in-scene on the road corridor">
+</p>
+<p align="center">
+  <img src="docs/floaters_cloud_side.png" width="49%" alt="run7 (range mask, no prune), side view: sparse floaters spread over the whole extent">
+  <img src="docs/bounded_cloud_side.png" width="49%" alt="run13 (range mask + prune), side view: Gaussians bounded to the driven corridor">
+</p>
+<p align="center"><sub><b>run7</b> (range mask, no prune, left) still scatters most Gaussians off-scene as a floater cloud; the mean-space prune keeps them in-scene on the road corridor (<b>run13</b>, right). Wide view (top), close view (bottom).</sub></p>
+
+Warm-starting the bounded model and training further — even with a lower-variance batch of 5–10
+views/step — did not move held-out quality (it stayed ~8.5 dB while N drifted back up): the bounded
+model is already converged, and the binding constraint is the 25 m range mask, not the optimizer.
+The open direction is bounding only in mean-space (looser or no pixel mask) so the mid-distance stays
+supervised while the prune still removes the off-scene floaters.
+
+Rendered views from **run9** (range mask, no regularizers, no prune, 5M Gaussians) — the
+range-masked run that motivated the prune:
+
+<p align="center">
+  <img src="docs/run9_render_1.png" width="32%" alt="run9 rendered view 1">
+  <img src="docs/run9_render_2.png" width="32%" alt="run9 rendered view 2">
+  <img src="docs/run9_render_3.png" width="32%" alt="run9 rendered view 3">
+</p>
+<p align="center">
+  <img src="docs/run9_render_4.png" width="32%" alt="run9 rendered view 4">
+</p>
+<p align="center"><sub>Rendered views from <b>run9</b> (range mask, no reg, no prune, 5M Gaussians).</sub></p>
+
+And the bounded, warm-started model rendered along the trajectory (**run13**, batch-10 warm-start of
+the prune regime):
+
+<p align="center"><img src="docs/run13_render.png" width="60%" alt="run13 (range mask + prune, batch-10 warm-start) rendered view"></p>
+<p align="center"><sub>Rendered view from <b>run13</b> (range mask + prune, batch-10 warm-start).</sub></p>
 
 Flythroughs — the final Gaussians rendered along the camera trajectory. The source `.mp4`s live in
 `docs/`; upload each via the GitHub GUI and paste its attachment link under the matching heading.
@@ -277,6 +356,10 @@ Full 39-frame COLMAP (`docs/run6-full-colmap_flythrough.mp4`):
 
 https://github.com/user-attachments/assets/aee273a4-ce12-43dd-ab8c-20867f21840d
 
+Full 39-frame COLMAP, bounded by the off-scene prune — 278k Gaussians (`docs/run10-full-colmap-range25-noreg-prune_flythrough.mp4`):
+
+<!-- upload docs/run10-full-colmap-range25-noreg-prune_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+
 <p align="center"><sub>Regenerate any of these with <code>scripts/render_gs_video.py --scene scene-0061 --run &lt;run&gt; --mode flythrough --colmap-poses</code> (add <code>--max-frames 5 --holdout-every 2 --holdout-offset 1</code> for the five-frame runs).</sub></p>
 
 ### Qualitative outputs
@@ -292,13 +375,10 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
 
 ## Roadmap
 
-- Bound the reconstruction — drop points beyond a range threshold from every camera at
-  initialization, and supervise their pixels toward black during optimization (reusing the
-  sky→black term). The init cloud back-projects one 3-D point per pixel, so each pixel's range to
-  the trajectory is known: a pixel whose point is farther than the threshold from all poses is left
-  unconstrained today and grows arbitrary floaters, so pushing it to black spends the capped
-  Gaussian budget on the scene instead (currently most of the 5M land outside the scene on the full
-  drive). Pair with a low-opacity prune.
+- Bound only in mean-space — the pixel range mask and the off-scene prune are built (see Results);
+  the range mask darkens the well-observed mid-distance, so the next step is to keep the mean-space
+  prune (which holds the model to ~278k in-scene Gaussians at no quality cost) while loosening or
+  dropping the pixel mask, so the mid-distance stays supervised. Consider a low-opacity prune too.
 - Dynamic objects — vehicles are already masked out of the loss and init (SAM3); the next step is
   reconstructing them as posed per-instance Gaussians composed back onto the static scene.
 - Pose refinement — refine the COLMAP poses jointly through the rasterizer via an SE(3)
@@ -366,6 +446,9 @@ PYTHONPATH=src .venv/bin/python scripts/run_gs.py --scene scene-0061 --train --c
     --voxel 0.3 --run-name run6-full-colmap
 # five-frame window: add --max-frames 5 --holdout-every 2 --holdout-offset 1
 # oracle pose baseline: swap --colmap-poses for --gt-poses
+# bound the model: --prune-offscene --prune-every 100 (mean-space prune; --range-thresh sets the
+#   distance). Add --range-mask for the pixel range mask too. --batch-size N renders N views/step.
+# warm-start a finished/snapshotted run: --from-checkpoint <run>/gs_final.npz
 ```
 
 Result figures and videos:
