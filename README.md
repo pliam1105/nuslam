@@ -361,7 +361,7 @@ https://github.com/user-attachments/assets/aee273a4-ce12-43dd-ab8c-20867f21840d
 
 Full 39-frame COLMAP, bounded by the off-scene prune (`run13`, batch-10 warm-start of the prune regime) (`docs/run13-warmstart-batch10_flythrough.mp4`):
 
-<!-- upload docs/run13-warmstart-batch10_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+https://github.com/user-attachments/assets/4997c045-ad1f-4506-9948-d8f3dbc0cac1
 
 <p align="center"><sub>Regenerate any of these with <code>scripts/render_gs_video.py --scene scene-0061 --run &lt;run&gt; --mode flythrough --colmap-poses</code> (add <code>--max-frames 5 --holdout-every 2 --holdout-offset 1</code> for the five-frame runs).</sub></p>
 
