@@ -77,6 +77,22 @@ def _sky_keep_mask(means, poses_m, K, frames, sky_masks):
     return ~((seen > 0) & (frac > 0.5))                   # keep unless seen and majority-sky
 
 
+def _range_far_mask(depth_m, K, pose, centres, thresh):
+    """(H, W) bool: pixels whose back-projected metric point lies farther than ``thresh`` metres from
+    EVERY camera centre. The init cloud back-projects one point per pixel, so each pixel's range to
+    the trajectory is known here directly. ``depth_m`` is the per-pixel metric depth (metres), ``pose``
+    its camera->world (metric, the training frame), ``centres`` (N, 3) all camera centres. Pixels with
+    non-positive depth are never marked far (their point is undefined)."""
+    H, W = depth_m.shape
+    vv, uu = np.mgrid[0:H, 0:W]
+    rays = np.stack([uu, vv, np.ones_like(uu)], -1).astype(np.float64) @ np.linalg.inv(K).T   # (H,W,3)
+    world = (rays * depth_m[..., None]) @ pose[:3, :3].T + pose[:3, 3]                          # (H,W,3)
+    mind = np.full((H, W), np.inf)
+    for c in centres:
+        mind = np.minimum(mind, np.linalg.norm(world - c, axis=-1))
+    return (mind > thresh) & (depth_m > 0)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataroot", type=Path, default=Path("data/nuscenes"))
@@ -147,6 +163,14 @@ def parse_args():
     p.add_argument("--vehicle-prompt", default="vehicle", help="CLIPSeg prompt for the vehicle class")
     p.add_argument("--vehicle-threshold", type=float, default=0.5,
                    help="vehicle mask threshold (CLIPSeg sigmoid prob, or SAM3 detection score)")
+    p.add_argument("--range-mask", action="store_true",
+                   help="bound the reconstruction by range: drop init-cloud points farther than "
+                        "--range-thresh from EVERY camera, and (with --sky-lambda) supervise their "
+                        "pixels toward black via the sky->black term, so distant unobserved regions "
+                        "do not grow arbitrary floaters. Per-pixel, keyed off the init cloud's one "
+                        "point per pixel")
+    p.add_argument("--range-thresh", type=float, default=60.0,
+                   help="range threshold in metres for --range-mask (min distance to all cameras)")
     p.add_argument("--rerun", action="store_true", help="spawn a native Rerun viewer (needs a display)")
     p.add_argument("--save", type=Path, default=None, help="write a .rrd (opened later, not live)")
     p.add_argument("--serve", action="store_true",
@@ -283,12 +307,14 @@ def main() -> int:
     if _seg_cache.get("sam3") is not None:
         _seg_cache["sam3"].release()   # free the ~3.5 GB SAM3 off the GPU before training
 
+    far_masks = {}   # token -> (H,W) bool, populated below once metric_depths/poses exist (--range-mask)
+
     def drop_mask(kf, dm, *, da3_sky=True):
-        """Pixels to exclude: union of the enabled sky and vehicle masks for this frame. The init
-        cloud passes ``da3_sky=True`` so it also drops DA3's own sky estimate when ``--mask-sky``
-        is off (preserving prior behaviour); the loss passes ``da3_sky=False`` so it masks only the
-        explicitly-requested CLIPSeg classes. Returns an (H, W) bool mask, or None if nothing is
-        masked for this frame."""
+        """Pixels to exclude: union of the enabled sky, vehicle and far-range masks for this frame.
+        The init cloud passes ``da3_sky=True`` so it also drops DA3's own sky estimate when
+        ``--mask-sky`` is off (preserving prior behaviour); the loss passes ``da3_sky=False`` so it
+        masks only the explicitly-requested classes. Returns an (H, W) bool mask, or None if nothing
+        is masked for this frame."""
         if args.mask_sky:
             m = sky_masks.get(kf.token)
         else:
@@ -296,6 +322,9 @@ def main() -> int:
         if args.mask_vehicles and vehicle_masks.get(kf.token) is not None:
             v = vehicle_masks[kf.token]
             m = v if m is None else (m | v)
+        if args.range_mask and far_masks.get(kf.token) is not None:
+            f = far_masks[kf.token]
+            m = f if m is None else (m | f)
         return m
 
     # ---- init cloud: back-project depth (metres), voxel-downsample PER KEYFRAME, then
@@ -306,6 +335,17 @@ def main() -> int:
     # Up-to-scale here; * scale -> metres. This is the depth the cloud AND the depth loss use.
     metric_depths = [metric_depth(dm.depth, dm.intrinsic, dm.extrinsic, mu.H, np.linalg.inv(world_from_cam[i]))
                      for i, (kf, dm) in enumerate(frames)]
+    # range mask: per pixel, is its metric init point beyond --range-thresh from EVERY camera? Uses the
+    # training poses (poses_m) so the point matches the cloud exactly. Feeds drop_mask (init + loss
+    # exclusion) and the black-supervision mask below. Must precede the cloud loop, which calls drop_mask.
+    if args.range_mask:
+        centres = poses_m[:, :3, 3]
+        for i, (kf, dm) in enumerate(frames):
+            far_masks[kf.token] = _range_far_mask(metric_depths[i] * scale, K_true, poses_m[i],
+                                                  centres, args.range_thresh)
+        frac = np.mean([m.mean() for m in far_masks.values()]) if far_masks else 0.0
+        print(f"range mask: pixels > {args.range_thresh:.0f} m from all cameras -> ~{frac:.1%} per frame "
+              f"(dropped from init, supervised black with --sky-lambda)")
     raw_xyz, raw_rgb, ds_xyz, ds_rgb = [], [], [], []
     voxel_ok = True
     for i, (kf, dm) in enumerate(frames):
@@ -475,14 +515,25 @@ def main() -> int:
             print(f"removed sky Gaussians: {n0} -> {len(ckpt['means'])} kept")
     # per-frame keep-masks (complement of the sky/vehicle drop mask), so the training loss ignores
     # those pixels and no Gaussians are grown to reconstruct them
-    masking = bool((args.mask_sky and sky_masks) or (args.mask_vehicles and vehicle_masks))
+    masking = bool((args.mask_sky and sky_masks) or (args.mask_vehicles and vehicle_masks)
+                   or (args.range_mask and far_masks))
     train_masks = [~drop_mask(kf, dm, da3_sky=False) for kf, dm in frames] if masking else None
     # per-view DA3 metric depth (recon depth * scale, same units as the Gaussians) for the
     # expected-depth loss; only built when the depth loss is on
     depth_maps = [metric_depths[i] * scale for i in range(len(frames))] if args.depth_lambda > 0 else None
-    # per-frame sky masks (separate from the union keep-mask) for the sky->black supervision
-    sky_only_masks = ([sky_masks[kf.token] for kf, _ in frames]
-                      if (args.sky_lambda > 0 and args.mask_sky and sky_masks) else None)
+    # pixels supervised toward black by the sky_lambda term: the segmented sky, plus (--range-mask) the
+    # far-range pixels whose init point lies beyond the threshold from every camera -- left out of the
+    # photometric loss above, so pushing them black keeps them from growing arbitrary floaters.
+    black_src = {}
+    if args.mask_sky and sky_masks:
+        for kf, _ in frames:
+            black_src[kf.token] = sky_masks[kf.token]
+    if args.range_mask and far_masks:
+        for kf, _ in frames:
+            f = far_masks[kf.token]
+            black_src[kf.token] = f if kf.token not in black_src else (black_src[kf.token] | f)
+    sky_only_masks = ([black_src[kf.token] for kf, _ in frames]
+                      if (args.sky_lambda > 0 and black_src) else None)
     # scale the means LR by the scene extent (3DGS spatial_lr_scale = camera-bounding radius): the
     # 1.6e-4 base is meant to be multiplied by this, else in a metric scene of tens of metres the
     # means barely move. Also scales the MCMC position-noise (which uses lr_for["means"]).
