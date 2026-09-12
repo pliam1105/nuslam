@@ -322,6 +322,9 @@ model is already converged, and the binding constraint is the 25 m range mask, n
 The open direction is bounding only in mean-space (looser or no pixel mask) so the mid-distance stays
 supervised while the prune still removes the off-scene floaters.
 
+<p align="center"><img src="docs/prune_batch_curves.png" width="100%" alt="run10 and run13 training curves: loss, held-out PSNR, Gaussian count; run9 and run11 overlaid"></p>
+<p align="center"><sub>Top — <b>run10</b> (off-scene prune): loss and held-out PSNR converge while the Gaussian count stays near 0.3M, versus <b>run9</b> (no prune) climbing to the 5M cap (right). Bottom — <b>run13</b> (batch 10) vs <b>run11</b> (batch 1): the larger batch gives a much lower-variance loss, but held-out PSNR plateaus either way (the model is already converged), and the count stays bounded.</sub></p>
+
 Rendered views from **run9** (range mask, no regularizers, no prune, 5M Gaussians) — the
 range-masked run that motivated the prune:
 
@@ -356,9 +359,9 @@ Full 39-frame COLMAP (`docs/run6-full-colmap_flythrough.mp4`):
 
 https://github.com/user-attachments/assets/aee273a4-ce12-43dd-ab8c-20867f21840d
 
-Full 39-frame COLMAP, bounded by the off-scene prune — 278k Gaussians (`docs/run10-full-colmap-range25-noreg-prune_flythrough.mp4`):
+Full 39-frame COLMAP, bounded by the off-scene prune (`run13`, batch-10 warm-start of the prune regime) (`docs/run13-warmstart-batch10_flythrough.mp4`):
 
-<!-- upload docs/run10-full-colmap-range25-noreg-prune_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
+<!-- upload docs/run13-warmstart-batch10_flythrough.mp4 via the GitHub GUI and paste the attachment URL on the next line -->
 
 <p align="center"><sub>Regenerate any of these with <code>scripts/render_gs_video.py --scene scene-0061 --run &lt;run&gt; --mode flythrough --colmap-poses</code> (add <code>--max-frames 5 --holdout-every 2 --holdout-offset 1</code> for the five-frame runs).</sub></p>
 
