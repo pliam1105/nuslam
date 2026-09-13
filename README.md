@@ -158,6 +158,19 @@ trajectory). Two mechanisms bound it to the driven corridor:
 `run_gs.py --range-mask --range-thresh` and `--prune-offscene --prune-every`; `--batch-size` renders
 several views per step for a lower-variance gradient.
 
+### Pose refinement
+
+The camera poses can be refined jointly with the Gaussians through the rasterizer (`--optimize-poses`).
+Each view's pose is a raw quaternion $q_i$ + translation $t_i$ (normalized at use, no Lie-algebra
+retraction), initialized from the input SE(3) and stepped by a separate optimizer (the MCMC
+densification indexes the Gaussian params by id, so the poses are kept out of that dict); the
+viewmats are rebuilt from $(q_i,t_i)$ each step so the gradient flows pose → render. Two conditioning
+pieces matter: the world origin is recentered to the scene (camera centroid) before optimizing —
+in the global nuScenes frame the scene sits ~1.2 km from origin, so $|t_{wc}|\approx1.2$ km and a
+sub-degree rotation residual swings the camera centre metres ($C=-R^{\top}t_{wc}$); and the first
+view can be pinned with a hard prior (`--first-pose-*-reg`) to fix the global gauge. Optional L2
+priors keep poses near their init. The refined poses are returned in the global frame.
+
 ## Architecture
 
 | Component | Module / symbol | Status |
@@ -365,6 +378,23 @@ https://github.com/user-attachments/assets/4997c045-ad1f-4506-9948-d8f3dbc0cac1
 
 <p align="center"><sub>Regenerate any of these with <code>scripts/render_gs_video.py --scene scene-0061 --run &lt;run&gt; --mode flythrough --colmap-poses</code> (add <code>--max-frames 5 --holdout-every 2 --holdout-offset 1</code> for the five-frame runs).</sub></p>
 
+### Pose refinement
+
+Refining the poses through the rasterizer (run15: full scene, warm-started from run13, first view
+anchored) confirms the COLMAP poses are already essentially correct here — there is little to gain.
+Over the run, held-out PSNR stays flat (~8.5 dB), the train poses move only centimetres from the
+COLMAP init, and the pose error against GT — measured after aligning the first (anchored) pose, so
+it reflects *relative* error rather than a global gauge offset — holds at ~0.57 m (0.581 → 0.573 m),
+i.e. it does not drift away from GT:
+
+<p align="center"><img src="docs/pose_opt_run15.png" width="90%" alt="run15 pose refinement: flat loss/PSNR, centimetre pose drift, and ATE-vs-GT flat ~0.57 m"></p>
+<p align="center"><sub><b>run15</b> — left: loss and held-out PSNR (flat); right: pose drift from COLMAP init (cm-scale) and first-pose-aligned ATE vs GT (~0.57 m, flat). The COLMAP frontend poses are already near-GT, so joint refinement adds little on this scene.</sub></p>
+
+This is expected: because the GPS-anchored COLMAP poses are so good, pose refinement is nearly
+redundant here. It is worth revisiting alongside the **semantic ground/wheel anchor** (see Roadmap),
+where fixing the ground level and the metric scale *without* GPS will need the poses to move — and
+where depth supervision helps scale but not levelling.
+
 ### Qualitative outputs
 
 Produced by the viz scripts (into the gitignored `out/`), each pose-source aware:
@@ -384,11 +414,22 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   dropping the pixel mask, so the mid-distance stays supervised. Consider a low-opacity prune too.
 - Dynamic objects — vehicles are already masked out of the loss and init (SAM3); the next step is
   reconstructing them as posed per-instance Gaussians composed back onto the static scene.
-- Pose refinement — refine the COLMAP poses jointly through the rasterizer via an SE(3)
-  tangent-space delta, folding pose and geometry into one optimization.
-- Ground/wheel scale anchor — the semantic metric anchor acting directly on the Gaussians (the
-  GT-free scale source), de-risked first with an explicit scalar, then folded into the joint
-  optimization.
+- Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
+  `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
+  are already near-GT; parked until the ground-anchor route needs the poses to move.
+- Ground/wheel scale anchor — the semantic metric anchor acting directly on the Gaussians, the
+  GT-free scale source. Because GPS already makes scale/poses near-perfect here (so pose refinement
+  is redundant, see Results), run this route **without GPS**, in this sequence: (1) ground-align on
+  the **DA3** reconstruction to recover the metric scale from the ground plane (no GPS); (2) fit the
+  **COLMAP** poses to the DA3 ones (Umeyama) to carry that scale onto COLMAP — so the scale comes
+  from the ground, but the trajectory shape comes from COLMAP, avoiding DA3's bad poses corrupting
+  it; (3) back-project the scaled depth from the scaled COLMAP poses to seed a cloud with
+  approximately-correct scale and trajectory; (4) jointly optimize the 3DGS + poses with the ground
+  anchor to fix any residual scale / ground-level / Z drift together. Depth supervision helps scale
+  but not levelling, and fixing the ground level must move the poses accordingly. Run a
+  **depth-supervision-only vs ground-anchor-only vs neither** ablation to isolate each effect, and
+  re-run the pose/depth-vs-LiDAR evals (below) after, to check accuracy improves over the GPS route.
+  De-risk first with an explicit scalar, then fold into the joint optimization.
 - Factor-graph SLAM — lift the batch optimization into a GTSAM/iSAM2 graph with the render as a
   factor, plus IMU/GPS/wheel fusion and loop closure.
 
@@ -439,18 +480,19 @@ SAM3 masks):
 PYTHONPATH=src .venv/bin/python scripts/cache_colmap_poses.py   # -> out/frontend_cache/<scene>/colmap_poses_global.npz
 ```
 
-Gaussian-splat reconstruction (COLMAP poses; sky + vehicles masked; depth + sky supervision and MCMC
-regularizers; snapshots + curves + renders written under the run dir):
+Gaussian-splat reconstruction. The defaults are the best-found recipe (COLMAP poses; sky + vehicles
+masked; depth + sky→black supervision; range mask + off-scene prune; batch 10; no MCMC regularizers;
+voxel 0.3), so the minimal command reproduces it — snapshots + curves + renders land under the run dir:
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/run_gs.py --scene scene-0061 --train --colmap-poses \
-    --mask-sky --sky-threshold 0.5 --mask-vehicles --vehicle-prompt "moving vehicle" \
-    --opacity-reg 0.01 --scale-reg 0.01 --depth-lambda 0.05 --sky-lambda 0.05 \
-    --voxel 0.3 --run-name run6-full-colmap
-# five-frame window: add --max-frames 5 --holdout-every 2 --holdout-offset 1
-# oracle pose baseline: swap --colmap-poses for --gt-poses
-# bound the model: --prune-offscene --prune-every 100 (mean-space prune; --range-thresh sets the
-#   distance). Add --range-mask for the pixel range mask too. --batch-size N renders N views/step.
+PYTHONPATH=src .venv/bin/python scripts/run_gs.py --scene scene-0061 --train --run-name myrun
+# batch size is clamped to the number of training views.
+# toggles (all default ON): --no-colmap-poses (fall back to DA3 poses), --no-mask-sky,
+#   --no-mask-vehicles, --no-range-mask, --no-prune-offscene
+# knobs: --range-thresh 25  --depth-lambda 0.05  --sky-lambda 0.05  --batch-size 10  --voxel 0.3
+# oracle pose baseline: --gt-poses (overrides COLMAP)
+# add MCMC regularizers: --opacity-reg 0.01 --scale-reg 0.01
+# five-frame window: --max-frames 5 --holdout-every 2 --holdout-offset 1
 # warm-start a finished/snapshotted run: --from-checkpoint <run>/gs_final.npz
 ```
 

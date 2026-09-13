@@ -26,6 +26,7 @@ from nuslam.pointcloud import nn_distances
 
 from nuslam.eval import render
 
+from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 
 @torch.no_grad()
 def _offscene_prune_mask(means, viewmats, Ks, empty_img, width, height, prune_range):
@@ -65,6 +66,13 @@ def _offscene_prune_mask(means, viewmats, Ks, empty_img, width, height, prune_ra
         prune = prune | (mind > prune_range)                              # (b)
     return prune
 
+def viewmats_from_qt(translations: torch.tensor, quaternions: torch.tensor):
+    viewmats = torch.zeros((translations.shape[0], 4, 4), dtype=torch.float32, device="cuda")
+    viewmats[:, :3, :3] = quaternion_to_matrix(quaternions)
+    viewmats[:, :3, 3] = translations
+    viewmats[:, 3, 3] = 1.0
+    return viewmats
+
 def train_gaussians(
     init_xyz: np.ndarray,       # (M, 3) metric seed points -> Gaussian means
     init_rgb: np.ndarray,       # (M, 3) uint8 seed colours
@@ -98,6 +106,14 @@ def train_gaussians(
                                          # SE(3) only for input/output. Off by default: poses stay
                                          # frozen at the recovered solution. Parametrization is core
                                          # geometry -- seam below.
+    pose_trans_reg: float = 0.0,         # weight for a pose-translation regularizer (e.g. deviation from
+                                         # the init translation); loss term author-added at the seam. 0=off.
+    pose_quat_reg: float = 0.0,          # weight for a pose-rotation regularizer on the NORMALIZED
+                                         # quaternion; loss term author-added at the seam. 0=off.
+    first_pose_trans_reg: float = 0.0,   # weight for a HARD prior pinning the FIRST view's translation to
+                                         # its init (anchors the global gauge); loss author-added. 0=off.
+    first_pose_quat_reg: float = 0.0,    # weight for a HARD prior pinning the FIRST view's rotation
+                                         # (normalized quaternion) to its init; loss author-added. 0=off.
     opacity_reg: float = 0.0,            # MCMC opacity-sparsity weight lambda_o (L1 on sigmoid(opacities)).
     scale_reg: float = 0.0,              # MCMC covariance weight lambda_Sigma (L1 on exp(scales)).
                                          # Loss terms are author-added at the "total loss" seam; ~0.01 typical.
@@ -123,6 +139,21 @@ def train_gaussians(
     (means, scales, quaternions, opacities, colours) together with a render(view)
     method for scoring; the exact shape follows the representation.
     """
+    # ---- recenter the world origin at the scene (train-camera centroid). In the global nuScenes
+    # frame the scene sits ~1 km from origin, so the world->cam translation |t_wc| ~ 1 km and a
+    # sub-degree rotation error swings the camera centre (C = -R^T t_wc) by metres -- badly
+    # conditioned for pose optimization. Rendering is translation-equivariant, so shifting all means
+    # and all camera centres by one offset changes nothing but the numbers; we optimize in this
+    # local frame and transform means + refined poses back to the global frame on return/at the seams.
+    scene_center = np.asarray(poses[train_idx][:, :3, 3].mean(0), dtype=np.float32)   # (3,) global offset
+    poses = poses.copy(); poses[:, :3, 3] -= scene_center
+    if init_gaussians is not None:
+        init_gaussians = {**init_gaussians,
+                          "means": np.asarray(init_gaussians["means"], np.float32) - scene_center}
+    else:
+        init_xyz = np.asarray(init_xyz, np.float32) - scene_center
+    center_t = torch.tensor(scene_center, dtype=torch.float32, device="cuda")         # local->global on the seams
+
     # specifying the parameters to be optimized. scales are sized to the local point
     # spacing (mean kNN distance) so Gaussians start ~as big as their neighbourhood,
     # not an arbitrary fixed size -- a zeros log-scale would be exp(0)=1 m per Gaussian.
@@ -150,7 +181,6 @@ def train_gaussians(
         opacities_logits = torch.nn.Parameter(torch.zeros((init_xyz.shape[0],), dtype=torch.float32).to("cuda"))
         colors_sh_coeff = torch.nn.Parameter(torch.zeros((init_xyz.shape[0], 4, 3), dtype=torch.float32).to("cuda")) # degrees 0,1 -> 4 coeffs
         colors_sh_coeff.data[:,0,:] = torch.tensor((init_rgb.astype(np.float32)/255.0-0.5)*2*np.sqrt(np.pi)) # initialize degree 0 (homogeneous color) with the rgb
-    viewmats = torch.nn.Parameter(torch.linalg.inv(torch.tensor(poses[train_idx], dtype=torch.float32).to("cuda")))
     Ks = torch.tensor([K]*len(train_idx), dtype=torch.float32).to("cuda")
     width, height = images[0].shape[1], images[0].shape[0]
     gt_img = torch.tensor(images)[train_idx].to("cuda").permute(0,3,1,2).to(torch.float32)/255.0 # (N,3,H,W)
@@ -167,10 +197,16 @@ def train_gaussians(
         "scales": log_scales,
         "opacities": opacities_logits,
         "colors": colors_sh_coeff,
-        # "viewmats": viewmats, # frozen for now
     })
 
     optimizers = {k: torch.optim.Adam([p], lr=lr_for[k]) for k, p in params.items()}
+
+    viewmats = torch.linalg.inv(torch.tensor(poses[train_idx], dtype=torch.float32).to("cuda"))
+    viewmats /= viewmats[:,3:,3:]
+    init_translations = viewmats[:, :3, 3].clone()
+    translations = init_translations.clone()
+    init_quaternions = matrix_to_quaternion(viewmats[:, :3, :3]).clone()
+    quaternions = init_quaternions.clone()
 
     if optimize_poses:
         # SEAM (core geometry, to implement): free the camera poses through the rasterizer.
@@ -183,10 +219,11 @@ def train_gaussians(
         #   indexes every param in that dict by Gaussian id and would resize/corrupt per-view poses.
         #   Step this optimizer manually in the loop (zero_grad before, step after backward).
         # Read the refined poses back out as SE(3) via the return. Left unimplemented by design.
-        raise NotImplementedError(
-            "optimize_poses: pose refinement through the rasterizer is not implemented yet "
-            "(raw per-view quaternion + translation in a separate optimizer, viewmats rebuilt each step)."
-        )
+        translations = torch.nn.Parameter(translations)
+        quaternions = torch.nn.Parameter(quaternions)
+
+        optim_translations = torch.optim.Adam([translations], lr=lr_for["pose_trans"])
+        optim_quaternions = torch.optim.Adam([quaternions], lr=lr_for["pose_quats"])
 
     # auto-densification strategy
     strategy = gsplat.MCMCStrategy(cap_max=5_000_000)
@@ -194,8 +231,11 @@ def train_gaussians(
     state = strategy.initialize_state()
 
     def render(pose: np.ndarray, K: np.ndarray):
+        # callers pass a GLOBAL camera->world pose; shift it into the local (recentered) frame the
+        # means live in before rendering.
         with torch.no_grad():
-            pose = torch.tensor(pose, dtype=torch.float32, device="cuda")
+            pose = torch.tensor(pose, dtype=torch.float32, device="cuda").clone()
+            pose[:3, 3] -= center_t
             K = torch.tensor(K, dtype=torch.float32, device="cuda")
             render_colors, render_alphas, info = gsplat.rasterization(params["means"], params["quats"], torch.exp(params["scales"]), torch.sigmoid(params["opacities"]), params["colors"], torch.linalg.inv(pose).reshape(1,4,4), K.reshape(1,3,3), width, height, render_mode="RGB", sh_degree=1)
         return render_colors[0].clamp(0,1).cpu().numpy()
@@ -207,7 +247,7 @@ def train_gaussians(
         mk = keep_img[step_batch] if keep_img is not None else None   # (b,1,H,W) non-sky, or None
 
         # rasterization forward pass
-        render_colors_e_depths, render_alphas, info = gsplat.rasterization(params["means"], params["quats"], torch.exp(params["scales"]), torch.sigmoid(params["opacities"]), params["colors"], viewmats[step_batch], Ks[step_batch], width, height, render_mode="RGB+ED", sh_degree=1, packed=True)
+        render_colors_e_depths, render_alphas, info = gsplat.rasterization(params["means"], params["quats"], torch.exp(params["scales"]), torch.sigmoid(params["opacities"]), params["colors"], viewmats_from_qt(translations[step_batch], quaternions[step_batch]), Ks[step_batch], width, height, render_mode="RGB+ED", sh_degree=1, packed=True)
         
         render_colors = render_colors_e_depths[..., :3].permute(0,3,1,2) # (N,3,H,W)
         render_depths = render_colors_e_depths[..., 3:] # (N.H,W,3)
@@ -240,7 +280,14 @@ def train_gaussians(
         #   loss += opacity_reg * torch.sigmoid(params["opacities"]).mean()   # opacity L1 (sparsity)
         #   loss += scale_reg   * torch.exp(params["scales"]).mean()          # covariance L1 (sqrt-eig = scales)
         # opacity_reg / scale_reg default 0.0 (no-op) until wired.
-        loss = (1-structural_lambda)*photometric_loss + structural_lambda*dssim + opacity_reg*torch.sigmoid(params["opacities"]).mean() + scale_reg*torch.exp(params["scales"]).mean()
+        loss = (1-structural_lambda)*photometric_loss + structural_lambda*dssim + \
+            opacity_reg*torch.sigmoid(params["opacities"]).mean() + \
+            scale_reg*torch.exp(params["scales"]).mean() + \
+            pose_trans_reg*torch.square(translations - init_translations).mean() + \
+            pose_quat_reg*torch.square(quaternions/quaternions.norm(keepdim=True, dim=1) - init_quaternions/init_quaternions.norm(keepdim=True, dim=1)).mean() + \
+            first_pose_trans_reg*torch.square(translations[0]-init_translations[0]).mean() + \
+            first_pose_quat_reg*torch.square(quaternions[0]/quaternions[0].norm(keepdim=True) - init_quaternions[0]/init_quaternions[0].norm(keepdim=True)).mean()
+
         # depth-supervision seam (author, §3d): supervise the rendered expected depth toward the DA3
         # metric depth where valid + non-masked. render_depths is (b,H,W,1), gt_depth[step_batch] is
         # (b,1,H,W). e.g. masked L1 (also gate out zero/invalid DA3 depth as needed):
@@ -271,12 +318,18 @@ def train_gaussians(
             o.step()
             o.zero_grad()
 
+        if optimize_poses:   # the pose optimizers only exist when poses are being refined
+            optim_translations.step()
+            optim_quaternions.step()
+            optim_translations.zero_grad()
+            optim_quaternions.zero_grad()
+
         # off-scene prune: drop Gaussians whose centroids are invisible / out of range / only on
         # non-kept pixels, in lockstep across params + optimizer + strategy state. No warmup (from
         # step 0); MCMC's step_post_backward refills to cap_max next refine, re-adding the freed
         # budget by sampling in-scene Gaussians -- so this doubles as relocation.
         if prune_offscene and step % prune_every == 0:
-            pm = _offscene_prune_mask(params["means"].detach(), viewmats, Ks,
+            pm = _offscene_prune_mask(params["means"].detach(), viewmats_from_qt(translations, quaternions), Ks,
                                       sky_img, width, height, prune_range)   # sky_img = sky ∪ far (black region)
             if bool(pm.any()):
                 # prune params + their Adam states in lockstep. NOT gsplat.ops.remove: that also
@@ -288,10 +341,30 @@ def train_gaussians(
                     lambda name, p: torch.nn.Parameter(p[sel], requires_grad=p.requires_grad),
                     lambda name, v: v[sel], params, optimizers)
 
-        # observability (viz / logging) -- handled by the caller's callback
+        # observability (viz / logging) -- handled by the caller's callback. Means are un-recentered
+        # (+ center_t) so snapshots / rrd land in the global frame the caller works in.
         if on_log is not None and log_every and step % log_every == 0:
-            gaussians = (params["means"], torch.exp(params["scales"]), params["quats"],
+            gaussians = (params["means"] + center_t, torch.exp(params["scales"]), params["quats"],
                          torch.sigmoid(params["opacities"]), params["colors"])
-            on_log(step, loss.item(), photometric_loss.item(), dssim.item(), gaussians, render)
+            # current train-view poses in the GLOBAL frame (camera->world), for live drift + snapshots;
+            # None when poses are frozen.
+            cur_poses = None
+            if optimize_poses:
+                with torch.no_grad():
+                    cp = torch.linalg.inv(viewmats_from_qt(translations, quaternions))
+                    cp[:, :3, 3] += center_t
+                    cur_poses = cp.cpu().numpy()
+            on_log(step, loss.item(), photometric_loss.item(), dssim.item(), gaussians, render, cur_poses)
 
-    return (params["means"], torch.exp(params["scales"]), params["quats"], torch.sigmoid(params["opacities"]), params["colors"]), render
+    # refined camera->world poses for the train views (None when poses were frozen). translations/
+    # quaternions parametrize world->cam (viewmats) in the LOCAL frame, so invert and add back the
+    # scene offset to return the global camera->world convention of the input `poses`.
+    refined_poses = None
+    if optimize_poses:
+        with torch.no_grad():
+            refined_poses = torch.linalg.inv(viewmats_from_qt(translations, quaternions))
+            refined_poses[:, :3, 3] += center_t
+            refined_poses = refined_poses.cpu().numpy()
+    # un-recenter the returned means back to the global frame (everything else is frame-invariant).
+    return (params["means"] + center_t, torch.exp(params["scales"]), params["quats"],
+            torch.sigmoid(params["opacities"]), params["colors"]), render, refined_poses

@@ -102,7 +102,7 @@ def parse_args():
     p.add_argument("--cache-root", type=Path, default=Path("out/frontend_cache"))
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--stride", type=int, default=4, help="depth back-projection pixel stride")
-    p.add_argument("--voxel", type=float, default=0.1, help="init-cloud voxel size (metres)")
+    p.add_argument("--voxel", type=float, default=0.3, help="init-cloud voxel size (metres)")
     p.add_argument("--holdout-every", type=int, default=8, help="hold out every k-th view for novel-view PSNR")
     p.add_argument("--holdout-offset", type=int, default=0,
                    help="phase of the held-out split: hold out frames where (i-offset) %% every == 0 "
@@ -110,8 +110,9 @@ def parse_args():
     p.add_argument("--no-scale", action="store_true", help="skip Route-B metric scaling (leave up-to-scale)")
     p.add_argument("--train", action="store_true", help="fit the Gaussians (else only prep + overlays)")
     p.add_argument("--num-iters", type=int, default=10000, help="optimization iterations")
-    p.add_argument("--batch-size", type=int, default=1,
-                   help="views rendered/optimized per step (multi-view batch averages the loss)")
+    p.add_argument("--batch-size", type=int, default=10,
+                   help="views rendered/optimized per step (multi-view batch averages the loss); "
+                        "clamped to the number of training views")
     p.add_argument("--structural-lambda", type=float, default=0.2, help="weight of the structural (D-SSIM) term")
     p.add_argument("--log-every", type=int, default=100, help="log progress/renders every N iters (0 = off)")
     p.add_argument("--snapshot-every", type=int, default=500, help="save a GS .npz snapshot every N iters")
@@ -122,29 +123,40 @@ def parse_args():
     p.add_argument("--optimize-poses", action="store_true",
                    help="refine camera poses jointly through the rasterizer (raw per-view quaternion "
                         "+ translation); off by default, poses frozen at the recovered solution")
+    p.add_argument("--pose-trans-reg", type=float, default=0.0,
+                   help="weight for the pose-translation regularizer (--optimize-poses); 0=off")
+    p.add_argument("--pose-quat-reg", type=float, default=0.0,
+                   help="weight for the pose-rotation regularizer on the normalized quaternion "
+                        "(--optimize-poses); 0=off")
+    p.add_argument("--first-pose-trans-reg", type=float, default=0.0,
+                   help="weight for a hard prior pinning the FIRST view's translation to its init "
+                        "(--optimize-poses; anchors the global gauge); 0=off")
+    p.add_argument("--first-pose-quat-reg", type=float, default=0.0,
+                   help="weight for a hard prior pinning the FIRST view's rotation to its init "
+                        "(--optimize-poses); 0=off")
     p.add_argument("--gt-poses", action="store_true",
                    help="ORACLE: use nuScenes GT camera poses (mapped into the metric-recon frame via "
                         "the Route-B Sim(3)) as the training cameras, to isolate DA3 pose error. Never "
                         "used for scale; diagnostic only")
-    p.add_argument("--colmap-poses", action="store_true",
+    p.add_argument("--colmap-poses", action=argparse.BooleanOptionalAction, default=True,
                    help="use cached COLMAP camera poses (aligned to the nuScenes global frame by the same "
-                        "Route-B Umeyama, built by scratchpad/cache_colmap_poses.py -> "
+                        "Route-B Umeyama, built by scripts/cache_colmap_poses.py -> "
                         "<cache>/<scene>/colmap_poses_global.npz) as the training cameras, subset by token. "
-                        "Like --gt-poses but SfM poses instead of the GT oracle; the DA3 metric depth still "
-                        "seeds the dense init cloud. Not used for scale")
+                        "DEFAULT on; --gt-poses overrides it, --no-colmap-poses falls back to DA3 poses. "
+                        "The DA3 metric depth still seeds the dense init cloud. Not used for scale")
     p.add_argument("--opacity-reg", type=float, default=0.0,
-                   help="MCMC opacity-sparsity weight (L1 on opacities); 0=off, ~0.01 typical")
+                   help="MCMC opacity-sparsity weight (L1 on opacities); 0=off (default), ~0.01 typical")
     p.add_argument("--scale-reg", type=float, default=0.0,
-                   help="MCMC covariance weight (L1 on scales); 0=off, ~0.01 typical")
-    p.add_argument("--depth-lambda", type=float, default=0.0,
+                   help="MCMC covariance weight (L1 on scales); 0=off (default), ~0.01 typical")
+    p.add_argument("--depth-lambda", type=float, default=0.05,
                    help="weight of the expected-depth loss vs the DA3 metric depth; 0=off")
-    p.add_argument("--sky-lambda", type=float, default=0.0,
-                   help="weight of the sky->black loss (needs --mask-sky); 0=off")
+    p.add_argument("--sky-lambda", type=float, default=0.05,
+                   help="weight of the sky->black loss (needs --mask-sky / --range-mask); 0=off")
     p.add_argument("--run-name", default=None,
                    help="subdirectory name for this run's logs/checkpoints/renders "
                         "(default: timestamp). Runs never overwrite each other.")
-    p.add_argument("--mask-sky", action="store_true",
-                   help="segment sky (CLIPSeg 'sky' prompt) and drop sky pixels from the init cloud")
+    p.add_argument("--mask-sky", action=argparse.BooleanOptionalAction, default=True,
+                   help="segment sky and drop sky pixels from the init cloud + loss (DEFAULT on; --no-mask-sky off)")
     p.add_argument("--remove-sky-gaussians", action="store_true",
                    help="drop Gaussians that project onto sky in most views (needs sky masks; "
                         "post-processes a warm-started/loaded set)")
@@ -155,30 +167,30 @@ def parse_args():
     p.add_argument("--no-seg-cache", action="store_true",
                    help="re-estimate sky/vehicle masks instead of loading the on-disk cache "
                         "(cache is keyed by segmenter+prompt+threshold under the scene cache dir)")
-    p.add_argument("--sky-threshold", type=float, default=0.35,
+    p.add_argument("--sky-threshold", type=float, default=0.5,
                    help="sky mask threshold (CLIPSeg sigmoid prob, or SAM3 detection score)")
     p.add_argument("--sky-gpu", action="store_true", help="run the CLIPSeg segmenter on GPU (default CPU)")
-    p.add_argument("--mask-vehicles", action="store_true",
+    p.add_argument("--mask-vehicles", action=argparse.BooleanOptionalAction, default=True,
                    help="segment vehicles (via --segmenter) and drop them from BOTH the init cloud and "
-                        "the training loss. Appearance-based, so ALL vehicles are removed (parked "
-                        "included) -- motion-aware removal needs the per-instance tracking step")
-    p.add_argument("--vehicle-prompt", default="vehicle", help="CLIPSeg prompt for the vehicle class")
+                        "the training loss (DEFAULT on; --no-mask-vehicles off). Appearance-based, so ALL "
+                        "vehicles are removed (parked included) -- motion-aware removal needs the tracking step")
+    p.add_argument("--vehicle-prompt", default="moving vehicle", help="segmentation prompt for the vehicle class")
     p.add_argument("--vehicle-threshold", type=float, default=0.5,
                    help="vehicle mask threshold (CLIPSeg sigmoid prob, or SAM3 detection score)")
-    p.add_argument("--range-mask", action="store_true",
+    p.add_argument("--range-mask", action=argparse.BooleanOptionalAction, default=True,
                    help="bound the reconstruction by range: drop init-cloud points farther than "
                         "--range-thresh from EVERY camera, and (with --sky-lambda) supervise their "
                         "pixels toward black via the sky->black term, so distant unobserved regions "
-                        "do not grow arbitrary floaters. Per-pixel, keyed off the init cloud's one "
-                        "point per pixel")
-    p.add_argument("--range-thresh", type=float, default=60.0,
+                        "do not grow arbitrary floaters (DEFAULT on; --no-range-mask off). Per-pixel, "
+                        "keyed off the init cloud's one point per pixel")
+    p.add_argument("--range-thresh", type=float, default=25.0,
                    help="range threshold in metres, shared by --range-mask (per-pixel) and "
                         "--prune-offscene (per-centroid): min distance to all cameras")
-    p.add_argument("--prune-offscene", action="store_true",
+    p.add_argument("--prune-offscene", action=argparse.BooleanOptionalAction, default=True,
                    help="every --prune-every steps, remove Gaussians whose CENTROIDS are off-scene: "
                         "invisible in all views, farther than --range-thresh from every camera, or "
-                        "projecting onto non-kept (sky/vehicle/far) pixels in most views. MCMC refills "
-                        "the freed budget in-scene (doubles as relocation). No warmup")
+                        "projecting onto a should-be-empty (sky/far) pixel in any view. MCMC refills "
+                        "the freed budget in-scene (doubles as relocation). DEFAULT on; --no-prune-offscene off")
     p.add_argument("--prune-every", type=int, default=100,
                    help="cadence (steps) of the --prune-offscene pass")
     p.add_argument("--rerun", action="store_true", help="spawn a native Rerun viewer (needs a display)")
@@ -247,7 +259,7 @@ def main() -> int:
         print(f"[gt-poses] ORACLE: raw GT camera poses in the GT metric frame ({len(gt_poses)} frames)")
 
     colmap_poses = None
-    if args.colmap_poses:
+    if args.colmap_poses and not args.gt_poses:   # COLMAP is the default; --gt-poses (oracle) overrides it
         # Cached COLMAP poses, already in the nuScenes global metric frame (aligned by the same
         # Route-B Umeyama over the full trajectory). Subset to `frames` by token so they stay 1:1,
         # exactly like the GT branch -- the seed cloud is rebuilt from them below.
@@ -483,8 +495,11 @@ def main() -> int:
 
     # ---- persistent training log (CSV) + GS snapshots + render PNGs + live Rerun ----
     csv_file = open(log_dir / "train_log.csv", "w", newline="")
-    cw = csv.writer(csv_file); cw.writerow(["step", "loss", "photometric", "dssim", "num_gaussians", "heldout_psnr"])
+    cw = csv.writer(csv_file)
+    cw.writerow(["step", "loss", "photometric", "dssim", "num_gaussians", "heldout_psnr", "pose_drift"])
     render_dir = log_dir / "renders"; render_dir.mkdir(parents=True, exist_ok=True)
+    pose_dir = log_dir / "pose_snapshots"; pose_dir.mkdir(parents=True, exist_ok=True)
+    init_train_poses = poses_m[train_idx].copy()   # global camera->world at init, to measure pose drift
     ti, hi = int(train_idx[0]), int(test_idx[0])
     Image.fromarray(frames[hi][0].image()).save(render_dir / "heldout_gt.png")   # gt once
     Image.fromarray(frames[ti][0].image()).save(render_dir / "train_gt.png")
@@ -492,17 +507,22 @@ def main() -> int:
     def _png(img01):  # (H,W,3) float [0,1] -> uint8
         return (np.clip(img01, 0, 1) * 255).astype(np.uint8)
 
-    def on_log(step, loss, photo, dssim, gaussians, render):
+    def on_log(step, loss, photo, dssim, gaussians, render, poses=None):
         gd = gs_numpy(gaussians)
         n = len(gd["means"])
-        ho = render(poses_m[hi], K_true)                 # render each view ONCE, reuse
-        tr = render(poses_m[ti], K_true)
+        ho = render(poses_m[hi], K_true)                 # held-out at its given pose
+        tr = render(poses[0] if poses is not None else poses_m[ti], K_true)  # train view at its current pose
         e = evaluate_render(ho, frames[hi][0].image())   # held-out score
+        # mean camera-centre drift of the (optimized) train poses from init; 0 when poses are frozen
+        drift = float(np.linalg.norm(poses[:, :3, 3] - init_train_poses[:, :3, 3], axis=1).mean()) \
+            if poses is not None else 0.0
         print(f"iter {step:6d}  loss {loss:.4f}  photo {photo:.4f}  dssim {dssim:.4f}  "
-              f"N={n}  heldout_psnr={e.psnr:.2f}")
-        cw.writerow([step, loss, photo, dssim, n, e.psnr]); csv_file.flush()
+              f"N={n}  heldout_psnr={e.psnr:.2f}  pose_drift={drift:.3f}")
+        cw.writerow([step, loss, photo, dssim, n, e.psnr, drift]); csv_file.flush()
         if args.snapshot_every and step % args.snapshot_every == 0:        # intermediate GS (disk-heavy)
             np.savez_compressed(gs_dir / f"gs_{step:06d}.npz", **gd)
+            if poses is not None:                                          # pose snapshot for evolution viz
+                np.savez_compressed(pose_dir / f"pose_{step:06d}.npz", poses=poses)
         Image.fromarray(_png(ho)).save(render_dir / f"heldout_est_{step:06d}.png")   # inspectable PNGs
         Image.fromarray(_png(tr)).save(render_dir / f"train_est_{step:06d}.png")
         if to_viz:
@@ -554,12 +574,17 @@ def main() -> int:
     lr_for = {**LR_FOR, "means": LR_FOR["means"] * spatial_lr_scale}
     print(f"spatial_lr_scale = {spatial_lr_scale:.1f} m -> means LR {lr_for['means']:.2e} "
           f"(base {LR_FOR['means']:.1e})")
-    gs_tuple, render = train_gaussians(
+    # batch is the minimum of the requested size and the number of training views (can't sample more)
+    batch_size = min(args.batch_size, len(train_idx))
+    print(f"batch size = {batch_size} (requested {args.batch_size}, {len(train_idx)} training views)")
+    gs_tuple, render, refined_poses = train_gaussians(
         xyz, rgb, poses_m, K_true, images, train_idx,
-        lr_for=lr_for, num_iters=args.num_iters, batch_size=args.batch_size,
+        lr_for=lr_for, num_iters=args.num_iters, batch_size=batch_size,
         structural_lambda=args.structural_lambda,
         log_every=args.log_every, on_log=on_log, init_gaussians=ckpt,
         clip_scales_to_knn=args.clip_scales, masks=train_masks, optimize_poses=args.optimize_poses,
+        pose_trans_reg=args.pose_trans_reg, pose_quat_reg=args.pose_quat_reg,
+        first_pose_trans_reg=args.first_pose_trans_reg, first_pose_quat_reg=args.first_pose_quat_reg,
         opacity_reg=args.opacity_reg, scale_reg=args.scale_reg,
         depths=depth_maps, depth_lambda=args.depth_lambda,
         sky_masks=sky_only_masks, sky_lambda=args.sky_lambda,
@@ -567,6 +592,14 @@ def main() -> int:
     )
     csv_file.close()
     print(f"\nfit complete ({args.num_iters} iters, structural_lambda={args.structural_lambda})")
+    # if poses were refined through the rasterizer, adopt the optimized camera->world for the train
+    # views so the final renders/scoring below use them (held-out views keep their given poses).
+    if refined_poses is not None:
+        drift = np.linalg.norm(refined_poses[:, :3, 3] - poses_m[train_idx][:, :3, 3], axis=1)
+        np.savez_compressed(pose_dir / "pose_final.npz", poses=refined_poses)   # final state for the evolution viz
+        poses_m = poses_m.copy(); poses_m[train_idx] = refined_poses
+        print(f"[optimize-poses] adopted refined train poses (Δcentre mean {drift.mean():.3f} m, "
+              f"max {drift.max():.3f} m; first/pinned view {drift[0]:.3f} m)")
 
     # ---- final GS: persist + score the held-out views + log the run's metrics ----
     final_gd = gs_numpy(gs_tuple)

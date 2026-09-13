@@ -111,7 +111,7 @@ def render_from_snapshot(snap_path, poses_m, K_true, images, train_idx):
     d = np.load(snap_path)
     snap = {k: d[k] for k in ("means", "scales", "quats", "opacities", "sh")}
     dummy = np.zeros((len(snap["means"]), 3), np.float32)
-    (_gs, render) = train_gaussians(
+    (_gs, render, _refined) = train_gaussians(
         dummy, dummy, poses_m, K_true, images, train_idx,
         lr_for=LR_FOR, num_iters=0, init_gaussians=snap,
     )
