@@ -144,6 +144,11 @@ def parse_args():
     p.add_argument("--first-pose-quat-reg", type=float, default=0.0,
                    help="weight for a hard prior pinning the FIRST view's rotation to its init "
                         "(--optimize-poses); 0=off")
+    p.add_argument("--first-pose-horizontal-only", action=argparse.BooleanOptionalAction, default=False,
+                   help="restrict the first-pose priors to the HORIZONTAL gauge only (x,y translation + "
+                        "yaw), leaving z and tilt (roll/pitch) free for the ground/ego anchor to set. Use "
+                        "when the ground anchor is doing the leveling, so the first-pose anchor doesn't "
+                        "fight it. DEFAULT off (full 6-DoF first-pose prior)")
     p.add_argument("--gt-poses", action="store_true",
                    help="ORACLE: use nuScenes GT camera poses (mapped into the metric-recon frame via "
                         "the Route-B Sim(3)) as the training cameras, to isolate DA3 pose error. Never "
@@ -166,6 +171,12 @@ def parse_args():
                    help="MCMC covariance weight (L1 on scales); 0=off (default), ~0.01 typical")
     p.add_argument("--depth-lambda", type=float, default=0.05,
                    help="weight of the expected-depth loss vs the DA3 metric depth; 0=off")
+    p.add_argument("--depth-silog", action=argparse.BooleanOptionalAction, default=False,
+                   help="use the scale-invariant log (SILog) depth loss instead of absolute L1, so depth "
+                        "supervises shape only and doesn't fight the ground anchor's metric scale. DEFAULT off")
+    p.add_argument("--depth-silog-lambda", type=float, default=1.0,
+                   help="SILog lambda in [0,1]: mean(d^2)-lambda*mean(d)^2, d=log(pred)-log(gt). "
+                        "1.0=fully scale-invariant, ~0.85 keeps a little scale coupling")
     p.add_argument("--sky-lambda", type=float, default=0.05,
                    help="weight of the sky->black loss (needs --mask-sky / --range-mask); 0=off")
     p.add_argument("--run-name", default=None,
@@ -219,6 +230,15 @@ def parse_args():
                         "GPS ground track by an SE(2) fit (SO(2) rotation + 2D translation, NO scale -- "
                         "scale is the ground anchor's). Places the levelled reconstruction in the "
                         "nuScenes map frame and overlays the GPS + GT tracks in Rerun. DEFAULT off")
+    p.add_argument("--ground-anchor-lambda", type=float, default=0.0,
+                   help="weight of the ground-plane anchor loss during 3DGS training: back-project the "
+                        "rendered expected depth at ground/road pixels to world and residual it to the "
+                        "ground plane (z=0 in the levelled frame). Needs a levelled frame (--ground-anchor). "
+                        "Loss term author-written in nuslam.recon.gaussians. 0=off")
+    p.add_argument("--camera-height-lambda", type=float, default=0.0,
+                   help="weight of the camera-height / ego-on-ground anchor loss: from each (optimized) "
+                        "camera pose place the ego centre (via sensor2ego) and residual it onto the ground "
+                        "plane. Loss term author-written. 0=off")
     p.add_argument("--prune-offscene", action=argparse.BooleanOptionalAction, default=True,
                    help="every --prune-every steps, remove Gaussians whose CENTROIDS are off-scene: "
                         "invisible in all views, farther than --range-thresh from every camera, or "
@@ -378,6 +398,13 @@ def main() -> int:
         print(f"vehicle masks: segmented {len(vehicle_masks)} keyframes "
               f"({args.segmenter} '{args.vehicle_prompt}'), ~{frac:.1%} vehicle")
 
+    ground_seg = {}                              # road/ground masks for the ground anchor (segmented here,
+    if args.ground_anchor:                       # while SAM3 is loaded, so the early anchor below can use them)
+        ground_seg = _segment(args.ground_prompt, args.ground_threshold)
+        frac = np.mean([m.mean() for m in ground_seg.values()]) if ground_seg else 0.0
+        print(f"ground masks: segmented {len(ground_seg)} keyframes "
+              f"({args.segmenter} '{args.ground_prompt}'), ~{frac:.1%} ground")
+
     if _seg_cache.get("sam3") is not None:
         _seg_cache["sam3"].release()   # free the ~3.5 GB SAM3 off the GPU before training
 
@@ -401,14 +428,49 @@ def main() -> int:
             m = f if m is None else (m | f)
         return m
 
-    # ---- init cloud: back-project depth (metres), voxel-downsample PER KEYFRAME, then
-    #      concatenate and downsample the merged cloud once more. Thinning each frame
-    #      before the merge keeps the concat + final pass cheap. ----
+    # ---- init cloud: back-project depth (metres) and concatenate the raw per-frame clouds. The
+    #      voxel downsample is deferred to POST-scale (after the metric scale / ground-anchor is
+    #      applied below), so the voxel size is always in final metric units regardless of the build
+    #      frame (e.g. DA3 units for --colmap-to-da3, where the metric scale comes from the anchor). ----
     # rectify each DA3 depth to metric via the DAQ homography H (H acts in the world frame, so per
     # pixel: unproject with the DA3 pose -> apply H -> reproject with the metric pose to read z).
     # Up-to-scale here; * scale -> metres. This is the depth the cloud AND the depth loss use.
     metric_depths = [metric_depth(dm.depth, dm.intrinsic, dm.extrinsic, mu.H, np.linalg.inv(world_from_cam[i]))
                      for i, (kf, dm) in enumerate(frames)]
+
+    # ---- ground-plane pre-alignment (metric scale + level) BEFORE the range mask / cloud, so every
+    #      metric-threshold op below (range mask, voxel, prune) runs in METRES. Fit the anchor from the
+    #      road points (minus sky/vehicle; the far mask isn't built yet and needs this metric frame),
+    #      apply the levelling Sim(3) to the poses, and FOLD the recovered scale into `scale` so
+    #      metric_depths*scale is metric. The fit is core (author); the wiring/apply is plumbing. ----
+    ga_applied = False   # ground anchor applied -> frame levelled to +Z-up and metric
+    ga_ground = None     # ground-segmented points (metric, levelled) for the overlay
+    if args.ground_anchor:
+        cam_h = args.camera_height
+        if cam_h is None:
+            cam_h = float(frames[0][0].calib.sensor2ego.matrix()[2, 3])   # camera height above road (m)
+        ga_in = ground_anchor_inputs(
+            [metric_depths[i] * scale for i in range(len(frames))],
+            [kf.image() for kf, _ in frames], ground_seg,
+            [kf.token for kf, _ in frames], K_true, poses_m, cam_h,
+            stride=args.stride,
+            extra_drop={kf.token: drop_mask(kf, dm, da3_sky=False) for kf, dm in frames})  # sky u vehicle
+        print(f"[ground-anchor] {len(ga_in.ground_points)} ground points, {len(ga_in.camera_centres)} "
+              f"cameras, camera height {ga_in.camera_height:.3f} m -> fitting Sim(3)")
+        try:
+            anchor = fit_ground_anchor(ga_in)
+            resid = ground_anchor_residual(anchor, ga_in)
+            poses_before = poses_m.copy()
+            poses_m = apply_ground_anchor(anchor, poses_before, poses_before[:, :3, 3])[0]  # metric+levelled poses
+            _, ga_ground = apply_ground_anchor(anchor, poses_before, ga_in.ground_points)   # ground pts (metric)
+            scale = scale * float(anchor.scale)     # fold metric scale: metric_depths*scale is now metres
+            override_poses = poses_m                # cloud built from these (metric) poses below
+            ga_applied = True
+            print(f"[ground-anchor] applied: scale {anchor.scale:.4f}, up {np.round(anchor.up, 4)}, "
+                  f"vertical residual {resid:.3f} m -> metric from here (range/voxel/prune all in metres)")
+        except NotImplementedError as e:
+            print(f"[ground-anchor] fit not implemented -- skipping pre-alignment ({e})")
+
     # range mask: per pixel, is its metric init point beyond --range-thresh from EVERY camera? Uses the
     # training poses (poses_m) so the point matches the cloud exactly. Feeds drop_mask (init + loss
     # exclusion) and the black-supervision mask below. Must precede the cloud loop, which calls drop_mask.
@@ -420,8 +482,7 @@ def main() -> int:
         frac = np.mean([m.mean() for m in far_masks.values()]) if far_masks else 0.0
         print(f"range mask: pixels > {args.range_thresh:.0f} m from all cameras -> ~{frac:.1%} per frame "
               f"(dropped from init, supervised black with --sky-lambda)")
-    raw_xyz, raw_rgb, ds_xyz, ds_rgb = [], [], [], []
-    voxel_ok = True
+    raw_xyz, raw_rgb = [], []
     for i, (kf, dm) in enumerate(frames):
         if override_poses is not None:   # GT/COLMAP run: metric depth (metres) back-projected from those poses
             pts, cols = metric_point_cloud(metric_depths[i] * scale, kf.image(), K_true, override_poses[i],
@@ -431,59 +492,17 @@ def main() -> int:
                                            stride=args.stride, conf=dm.conf, sky=drop_mask(kf, dm))
             pts = pts * scale
         raw_xyz.append(pts); raw_rgb.append(cols)
-        if voxel_ok:
-            try:
-                p, c = voxel_downsample(pts, cols, voxel_size=args.voxel)  # per-keyframe
-                ds_xyz.append(p); ds_rgb.append(c)
-            except NotImplementedError:
-                voxel_ok = False
-    n_raw = sum(len(p) for p in raw_xyz)
-    if voxel_ok:
-        xyz, rgb = voxel_downsample(np.concatenate(ds_xyz), np.concatenate(ds_rgb),
-                                    voxel_size=args.voxel)               # merged pass
-        print(f"init cloud: {n_raw} raw -> {sum(len(p) for p in ds_xyz)} (per-frame) "
-              f"-> {len(xyz)} merged points (voxel {args.voxel} m)")
-    else:
-        xyz = np.concatenate(raw_xyz); rgb = np.concatenate(raw_rgb)
+    xyz = np.concatenate(raw_xyz); rgb = np.concatenate(raw_rgb)   # raw cloud (already metric: scale folds in
+    n_raw = len(xyz)                                               # the ground-anchor scale, applied above)
+
+    # ---- voxel downsample: the cloud is in metric units (GPS scale, or the ground-anchor scale folded
+    #      into `scale` above), so the voxel size is metric. ga_ground is viz-only; left full-density. ----
+    try:
+        xyz, rgb = voxel_downsample(xyz, rgb, voxel_size=args.voxel)
+        print(f"init cloud: {n_raw} raw -> {len(xyz)} points (voxel {args.voxel} m)")
+    except NotImplementedError:
         print(f"[init cloud] voxel_downsample not implemented -- using {n_raw} raw points "
               f"(implement nuslam.pointcloud.voxel_downsample to thin)")
-
-    # ---- ground-plane pre-alignment (GPS-free metric scale, author-written fit) ----
-    # Segment the ground, back-project it, and hand the ground points + camera centres +
-    # known metric camera height to fit_ground_anchor; apply the leveling/scaling Sim(3)
-    # to the poses AND the init cloud before training. The fit is core (author); assembling
-    # its inputs and applying its result are plumbing. Degrades to a no-op (with a note) until
-    # the author implements the fit.
-    ga_applied = False   # whether the ground anchor was applied (frame is levelled to +Z-up)
-    ga_ground = None     # the ground-segmented points in the levelled frame, for the overlay
-    if args.ground_anchor:
-        ground_masks = _segment(args.ground_prompt, args.ground_threshold)
-        cam_h = args.camera_height
-        if cam_h is None:
-            cam_h = float(frames[0][0].calib.sensor2ego.matrix()[2, 3])  # camera height above road
-        # poses_m is the frame training + viz use; the init cloud is back-projected to match it, so the
-        # ground points + camera centres for the fit come straight from poses_m (metric depth in metres).
-        md_scaled = [metric_depths[i] * scale for i in range(len(frames))]
-        ga_in = ground_anchor_inputs(
-            md_scaled, [kf.image() for kf, _ in frames], ground_masks,
-            [kf.token for kf, _ in frames], K_true, poses_m, cam_h,
-            stride=args.stride,
-            extra_drop={kf.token: drop_mask(kf, dm) for kf, dm in frames})
-        print(f"[ground-anchor] {len(ga_in.ground_points)} ground points, {len(ga_in.camera_centres)} "
-              f"cameras, camera height {ga_in.camera_height:.3f} m -> fitting Sim(3)")
-        try:
-            anchor = fit_ground_anchor(ga_in)
-            resid = ground_anchor_residual(anchor, ga_in)
-            poses_before = poses_m.copy()   # same poses -> same (sR, t), so cloud + ground points align
-            poses_m, xyz = apply_ground_anchor(anchor, poses_before, xyz)   # level + scale into the new frame
-            _, ga_ground = apply_ground_anchor(anchor, poses_before, ga_in.ground_points)  # ground pts, levelled
-            ga_applied = True
-            if override_poses is not None:
-                override_poses = poses_m
-            print(f"[ground-anchor] applied: scale {anchor.scale:.4f}, up {np.round(anchor.up, 4)}, "
-                  f"vertical residual {resid:.3f} m")
-        except NotImplementedError as e:
-            print(f"[ground-anchor] fit not implemented -- skipping pre-alignment ({e})")
 
     # ---- held-out split for novel-view PSNR ----
     train_idx, test_idx = holdout_indices(len(frames), every=args.holdout_every, offset=args.holdout_offset)
@@ -688,6 +707,18 @@ def main() -> int:
     # per-view DA3 metric depth (recon depth * scale, same units as the Gaussians) for the
     # expected-depth loss; only built when the depth loss is on
     depth_maps = [metric_depths[i] * scale for i in range(len(frames))] if args.depth_lambda > 0 else None
+    # ground-plane anchor mask: ground/road pixels minus sky/vehicle/far, for the ground residual loss.
+    # SAM3 'road' masks are disk-cached (segmented once), so this is cheap even without --ground-anchor.
+    ground_px_masks = None
+    if args.ground_anchor_lambda > 0:
+        road_masks = _segment(args.ground_prompt, args.ground_threshold)
+        ground_px_masks = []
+        for kf, dm in frames:
+            g = np.asarray(road_masks[kf.token], bool)
+            d = drop_mask(kf, dm, da3_sky=False)
+            ground_px_masks.append(g & ~d if d is not None else g)
+    s2e_matrix = torch.tensor(frames[0][0].calib.sensor2ego.matrix(),   # camera->ego, for the camera-height
+                              dtype=torch.float32, device="cuda")        # anchor (used with torch ops in the loss)
     # pixels supervised toward black by the sky_lambda term: the segmented sky, plus (--range-mask) the
     # far-range pixels whose init point lies beyond the threshold from every camera -- left out of the
     # photometric loss above, so pushing them black keeps them from growing arbitrary floaters.
@@ -722,9 +753,13 @@ def main() -> int:
         clip_scales_to_knn=args.clip_scales, masks=train_masks, optimize_poses=args.optimize_poses,
         pose_trans_reg=args.pose_trans_reg, pose_quat_reg=args.pose_quat_reg,
         first_pose_trans_reg=args.first_pose_trans_reg, first_pose_quat_reg=args.first_pose_quat_reg,
+        first_pose_horizontal_only=args.first_pose_horizontal_only,
         opacity_reg=args.opacity_reg, scale_reg=args.scale_reg,
         depths=depth_maps, depth_lambda=args.depth_lambda,
+        depth_silog=args.depth_silog, depth_silog_lambda=args.depth_silog_lambda,
         sky_masks=sky_only_masks, sky_lambda=args.sky_lambda,
+        ground_masks=ground_px_masks, ground_lambda=args.ground_anchor_lambda,
+        sensor2ego=s2e_matrix, camera_height_lambda=args.camera_height_lambda,
         prune_offscene=args.prune_offscene, prune_range=args.range_thresh, prune_every=args.prune_every,
     )
     csv_file.close()

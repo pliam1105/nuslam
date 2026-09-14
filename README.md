@@ -123,6 +123,15 @@ and the **camera height carries the scale** — a flat plane alone is scale-blin
 plane leaves it flat, so the pose-height term is the scale-bearing constraint, not an add-on, and is
 weighted up against the many noisier ground points.
 
+> **Level-vehicle assumption.** The height $h$ is taken as the camera's z-offset in the ego frame
+> (`sensor2ego[2,3]` $\approx 1.5$ m), and the residual pins the *camera* centre to $z = h$. That equals
+> the true height above the ground only when the ego origin is on the ground **and the vehicle is level**
+> (no pitch/roll, so the ego z-axis is vertical) — otherwise the true height is $(R_\text{ego}\,\ell)_z$
+> for lever $\ell$. On scene-0061 this costs the ~±0.02 m the GT camera height actually varies by (ego z
+> is pinned to 0, so the wobble is pure tilt). The joint-optimization anchor (step 5) drops this
+> assumption: it places the **ego** centre through the *optimized camera pose* and constrains only the
+> ego's ground contact ($z = 0$), so pitch/roll is absorbed by the pose rather than assumed away.
+
 **Balancing the two families.** Left unweighted this least-squares is degenerate: with ~$10^6$ ground
 rows and only ~$10^1$ camera rows, and a near-flat ground whose per-point vertical residual scales
 with $\lVert m\rVert$, the fit shrinks $\lVert m\rVert = s \to 0$ to kill the dominant ground term,
@@ -254,6 +263,66 @@ in the global nuScenes frame the scene sits ~1.2 km from origin, so $|t_{wc}|\ap
 sub-degree rotation residual swings the camera centre metres ($C=-R^{\top}t_{wc}$); and the first
 view can be pinned with a hard prior (`--first-pose-*-reg`) to fix the global gauge. Optional L2
 priors keep poses near their init. The refined poses are returned in the global frame.
+
+### Metric anchor in joint optimization
+
+The ground-plane pre-alignment sets the metric frame before training; the same constraints then act
+**directly on the Gaussians** during the joint 3DGS + pose optimization (the Rung-2 core), so the
+reconstruction stays natively metric as it refines. All residuals are evaluated in the levelled frame
+the pre-alignment produced (ground at world $z=0$), and because training runs in the recentered frame
+(scene centroid subtracted, offset $c=$ `center_t`) each residual adds back $c_z$ to read the global
+height.
+
+**Ground anchor** (`--ground-anchor-lambda`). Each step, the rendered expected depth (`RGB+ED`) at the
+road/ground pixels is back-projected to the world and its height is pulled to the ground plane. For a
+ground pixel $u$ in view $i$ with rendered depth $\hat z$, the world point is
+$X = T_i\,\hat z\,K^{-1}\tilde u$ ($T_i$ the camera-to-world of the — possibly optimized — pose), and
+
+$$\mathcal{L}_\text{ground} = \frac{1}{|\mathcal{G}|}\sum_{u\in\mathcal{G}} \big(X_z(u) + c_z\big)^2$$
+
+over the ground mask $\mathcal{G}$ (road $\cap\ \lnot(\text{sky}\cup\text{vehicle}\cup\text{far})$). It
+moves the Gaussians so the rendered ground surface lands at $z=0$.
+
+**Ego-on-ground anchor** (`--camera-height-lambda`). Rather than pin the camera to a fixed height
+$h$ (which assumes a level vehicle — see the note under "Ground-plane pre-alignment"), the ego centre
+is placed through the *optimized* pose and constrained to the ground: with camera-to-world $T_i$ and
+the `sensor2ego` extrinsic, $E_i = T_i\,(\text{sensor2ego})^{-1}$ is the ego-to-world, and
+
+$$\mathcal{L}_\text{ego} = \frac{1}{N}\sum_i \big((E_i)_z + c_z\big)^2$$
+
+Because the lever arm is rotated by the actual pose, pitch/roll are absorbed and only the ground
+contact ($z=0$) is constrained — no level-vehicle assumption. With `--optimize-poses` this term moves
+the poses; frozen, it only informs the geometry.
+
+**Scale-invariant depth** (`--depth-silog`). Absolute-L1 depth supervision toward the DA3 metric depth
+would *fight* the anchor: an L1 on depth pins the absolute scale, exactly the DOF the ground anchor
+resolves (and in the GPS-free frame the DA3 target is up-to-scale, ~20× off the anchored metric scene).
+The scale-invariant log loss (Eigen et al.) removes this — with $d_u=\log\hat z_u-\log z_u$ over the
+valid pixels,
+
+$$\mathcal{L}_\text{SILog} = \operatorname{mean}(d^2) - \lambda\,\operatorname{mean}(d)^2, \qquad \lambda\in[0,1]$$
+
+At $\lambda=1$ it is the variance of $d$ — invariant to a global depth scaling (which shifts every
+$d_u$ by a constant) — so depth constrains only *shape* and leaves metric scale to the ground anchor.
+Depths are clamped positive before the log; the quadratic form (no $\sqrt{\cdot}$) avoids the
+infinite gradient at zero residual.
+
+**Horizontal-only first-pose anchor** (`--first-pose-horizontal-only`). When the ground/ego anchor is
+setting tilt (roll/pitch) and vertical, a full 6-DoF first-pose prior fights it, so the first-pose
+anchor is restricted to the gauge the anchor leaves free: the camera-centre horizontal position and
+the yaw. Translation pins $C_0^{xy}$ only ($C_0=-R_{wc}^{\top}t_{wc}$, not the raw $t_{wc}$). Yaw is
+pinned by a **tilt-invariant heading**: the camera forward $f=R_{cw}e_z$ is projected to the ground
+plane, $\hat f = f_{xy}/\lVert f_{xy}\rVert$, and $\mathcal{L}=1-\hat f\cdot\hat f_\text{init}$
+(i.e. $1-\cos\Delta\psi$). Unlike the $\mathfrak{so}(3)$ log-map's $z$-component — which equals the
+yaw only for small tilt — the horizontal-heading dot isolates yaw under an arbitrarily large tilt
+correction, leaving roll/pitch/$z$ to the ground anchor.
+
+> **Non-level closed form.** If the pre-alignment (closed-form) fit were extended to a non-level
+> vehicle — placing the ego through each pose's orientation rather than assuming a constant $h$ — the
+> lever term enters as $g\cdot(Q_i a)$ with $g=m/\lVert m\rVert$ the up-direction, which is nonlinear
+> in $m$. It would then be solved as an **iterated least-squares fixed point** (hold $g$, fold the
+> rotated lever into the target, run the linear solve, update $g$) — the same structure as the GPS
+> lever-arm Umeyama. In the joint optimization above this is free: autograd handles the nonlinearity.
 
 ## Architecture
 

@@ -114,15 +114,35 @@ def train_gaussians(
                                          # its init (anchors the global gauge); loss author-added. 0=off.
     first_pose_quat_reg: float = 0.0,    # weight for a HARD prior pinning the FIRST view's rotation
                                          # (normalized quaternion) to its init; loss author-added. 0=off.
+    first_pose_horizontal_only: bool = False,  # when the ground/ego anchor sets tilt (roll/pitch) + vertical,
+                                         # a full first-pose anchor fights it. If True, the first-pose priors
+                                         # should pin only the HORIZONTAL gauge the anchor leaves free:
+                                         # the x,y of the translation (not z) and the YAW of the rotation
+                                         # (rotation about world +z, not roll/pitch). Author restricts the
+                                         # first_pose_*_reg terms accordingly at the seam. Default False = full.
     opacity_reg: float = 0.0,            # MCMC opacity-sparsity weight lambda_o (L1 on sigmoid(opacities)).
     scale_reg: float = 0.0,              # MCMC covariance weight lambda_Sigma (L1 on exp(scales)).
                                          # Loss terms are author-added at the "total loss" seam; ~0.01 typical.
     depths=None,                         # optional per-view (H,W) metric depth (DA3, same units as means)
                                          # to supervise the rendered expected depth. Aligned with images.
     depth_lambda: float = 0.0,           # weight of the expected-depth loss (author-added at the seam).
+    depth_silog: bool = False,           # if True, use the scale-invariant log (SILog) depth loss instead of
+                                         # absolute L1, so depth supervises SHAPE only and doesn't fight the
+                                         # ground anchor's metric scale. Author-branched at the depth seam.
+    depth_silog_lambda: float = 1.0,     # SILog lambda in [0,1]: mean(d^2) - lambda*mean(d)^2, d=log(pred)-log(gt).
+                                         # 1.0 = fully scale-invariant (pure variance); ~0.85 keeps a little scale.
     sky_masks=None,                      # optional per-view (H,W) bool sky masks: supervise those pixels
                                          # toward black (sky has nothing behind it -> the black background).
     sky_lambda: float = 0.0,             # weight of the sky->black loss (author-added at the seam).
+    ground_masks=None,                   # optional per-view (H,W) bool: True at ground/road pixels, for the
+                                         # ground-plane anchor -- back-project their rendered expected depth
+                                         # to world and residual it to the ground plane (z=0 in the levelled
+                                         # frame). Aligned with images. Author-added loss at the seam.
+    ground_lambda: float = 0.0,          # weight of the ground-plane residual (author-added at the seam).
+    sensor2ego=None,                     # (4,4) camera->ego extrinsic; with each (optimized) camera pose it
+                                         # places the ego centre in world for the camera-height anchor
+                                         # (constrain the ego centre onto the ground plane). Author-added.
+    camera_height_lambda: float = 0.0,   # weight of the ego-on-ground / camera-height residual (author-added).
     prune_offscene: bool = False,        # every prune_every steps, remove Gaussians whose centroids are
                                          # off-scene (invisible in all views, beyond prune_range from every
                                          # camera, or projecting into the non-kept/black region in most
@@ -190,6 +210,8 @@ def train_gaussians(
         torch.tensor(np.stack(depths))[train_idx].to("cuda").to(torch.float32)[:, None]  # (N,1,H,W) metric
     sky_img = None if sky_masks is None else \
         torch.tensor(np.stack(sky_masks))[train_idx].to("cuda").float()[:, None]  # (N,1,H,W), 1=sky
+    ground_img = None if ground_masks is None else \
+        torch.tensor(np.stack(ground_masks))[train_idx].to("cuda").float()[:, None]  # (N,1,H,W), 1=ground
 
     params = torch.nn.ParameterDict({
         "means": means,
@@ -203,10 +225,12 @@ def train_gaussians(
 
     viewmats = torch.linalg.inv(torch.tensor(poses[train_idx], dtype=torch.float32).to("cuda"))
     viewmats /= viewmats[:,3:,3:]
-    init_translations = viewmats[:, :3, 3].clone()
-    translations = init_translations.clone()
-    init_quaternions = matrix_to_quaternion(viewmats[:, :3, :3]).clone()
-    quaternions = init_quaternions.clone()
+    translations = viewmats[:, :3, 3]
+    camera_centers = torch.linalg.inv(viewmats)[:, :3, 3]
+    init_camera_centers = camera_centers.clone()
+    quaternions = matrix_to_quaternion(viewmats[:, :3, :3])
+    init_quaternions = quaternions.clone()
+    init_rotations = viewmats[:, :3, :3].clone()
 
     if optimize_poses:
         # SEAM (core geometry, to implement): free the camera poses through the rasterizer.
@@ -230,6 +254,9 @@ def train_gaussians(
     strategy.check_sanity(params, optimizers)
     state = strategy.initialize_state()
 
+    vv, uu = torch.meshgrid(torch.arange(height, device="cuda", dtype=torch.float32), torch.arange(width, device="cuda", dtype=torch.float32))
+    uvs = torch.stack([uu, vv, torch.ones_like(uu)], dim=2)[None] # (1, H, W, 3)
+
     def render(pose: np.ndarray, K: np.ndarray):
         # callers pass a GLOBAL camera->world pose; shift it into the local (recentered) frame the
         # means live in before rendering.
@@ -246,11 +273,13 @@ def train_gaussians(
         batch_gt = gt_img[step_batch]
         mk = keep_img[step_batch] if keep_img is not None else None   # (b,1,H,W) non-sky, or None
 
+        viewmats = viewmats_from_qt(translations[step_batch], quaternions[step_batch])
+
         # rasterization forward pass
-        render_colors_e_depths, render_alphas, info = gsplat.rasterization(params["means"], params["quats"], torch.exp(params["scales"]), torch.sigmoid(params["opacities"]), params["colors"], viewmats_from_qt(translations[step_batch], quaternions[step_batch]), Ks[step_batch], width, height, render_mode="RGB+ED", sh_degree=1, packed=True)
+        render_colors_e_depths, render_alphas, info = gsplat.rasterization(params["means"], params["quats"], torch.exp(params["scales"]), torch.sigmoid(params["opacities"]), params["colors"], viewmats, Ks[step_batch], width, height, render_mode="RGB+ED", sh_degree=1, packed=True)
         
         render_colors = render_colors_e_depths[..., :3].permute(0,3,1,2) # (N,3,H,W)
-        render_depths = render_colors_e_depths[..., 3:] # (N.H,W,3)
+        render_depths = render_colors_e_depths[..., 3:] # (N.H,W,1)
 
         # pre-backward densification strategy step
         strategy.step_pre_backward(params, optimizers, state, step, info, packed=True)
@@ -280,13 +309,27 @@ def train_gaussians(
         #   loss += opacity_reg * torch.sigmoid(params["opacities"]).mean()   # opacity L1 (sparsity)
         #   loss += scale_reg   * torch.exp(params["scales"]).mean()          # covariance L1 (sqrt-eig = scales)
         # opacity_reg / scale_reg default 0.0 (no-op) until wired.
+        all_viewmats = viewmats_from_qt(translations, quaternions)
+        camera_centers = torch.linalg.inv(all_viewmats)[:, :3, 3]
         loss = (1-structural_lambda)*photometric_loss + structural_lambda*dssim + \
             opacity_reg*torch.sigmoid(params["opacities"]).mean() + \
             scale_reg*torch.exp(params["scales"]).mean() + \
-            pose_trans_reg*torch.square(translations - init_translations).mean() + \
-            pose_quat_reg*torch.square(quaternions/quaternions.norm(keepdim=True, dim=1) - init_quaternions/init_quaternions.norm(keepdim=True, dim=1)).mean() + \
-            first_pose_trans_reg*torch.square(translations[0]-init_translations[0]).mean() + \
-            first_pose_quat_reg*torch.square(quaternions[0]/quaternions[0].norm(keepdim=True) - init_quaternions[0]/init_quaternions[0].norm(keepdim=True)).mean()
+            pose_trans_reg*torch.square(camera_centers - init_camera_centers).mean() + \
+            pose_quat_reg*torch.square(quaternions/quaternions.norm(keepdim=True, dim=1) - init_quaternions/init_quaternions.norm(keepdim=True, dim=1)).mean()
+        
+        if not first_pose_horizontal_only:
+            loss += first_pose_trans_reg*torch.square(camera_centers[0]-init_camera_centers[0]).mean()
+            loss += first_pose_quat_reg*torch.square(quaternions[0]/quaternions[0].norm(keepdim=True) - init_quaternions[0]/init_quaternions[0].norm(keepdim=True)).mean()
+        else:
+            loss += first_pose_trans_reg*torch.square(camera_centers[0, :2]-init_camera_centers[0, :2]).mean()
+
+            camera_forward = all_viewmats[0, 2, :3]
+            init_camera_forward = init_rotations[0, 2, :3]
+
+            camera_forward_2d = camera_forward[:2]/torch.norm(camera_forward[:2], keepdim=True) # (2,)
+            init_camera_forward_2d = init_camera_forward[:2]/torch.norm(init_camera_forward[:2], keepdim=True) # (2,)
+            
+            loss += first_pose_quat_reg*(1-(camera_forward_2d[None] @ init_camera_forward_2d[:, None])[0,0])
 
         # depth-supervision seam: supervise the rendered expected depth toward the DA3
         # metric depth where valid + non-masked. render_depths is (b,H,W,1), gt_depth[step_batch] is
@@ -298,7 +341,11 @@ def train_gaussians(
             rd = render_depths.permute(0, 3, 1, 2)
             w  = mk if mk is not None else torch.ones_like(rd)
             w = w * (gt_depth[step_batch] > 0)
-            loss += depth_lambda * ((rd - gt_depth[step_batch]).abs() * w).sum() / (w.sum() + 1e-8)
+            if not depth_silog:
+                loss += depth_lambda * ((rd - gt_depth[step_batch]).abs() * w).sum() / (w.sum() + 1e-8)
+            elif (w>0).any():
+                g_i = torch.log(rd[w > 0].clamp_min(1e-6)) - torch.log(gt_depth[step_batch][w > 0].clamp_min(1e-6))
+                loss += depth_lambda * ((g_i**2).mean() - depth_silog_lambda * (g_i.mean())**2)
 
         # sky->black seam: push the render toward black on sky pixels (sky has nothing
         # behind it, so black = the background). sky_img[step_batch] is (b,1,H,W), render_colors (b,3,H,W).
@@ -309,6 +356,26 @@ def train_gaussians(
         if sky_lambda > 0 and sky_img is not None:
             sb = sky_img[step_batch]
             loss += sky_lambda * (render_colors.abs() * sb).sum() / (sb.sum() * 3 + 1e-8)
+
+        # ground point anchor
+        if ground_lambda > 0 and ground_img is not None:
+            ground_mk = ground_img[step_batch, 0] # (N, H, W)
+            camera_backproj = render_depths[..., None] * torch.linalg.inv(Ks[step_batch])[:, None, None] @ uvs[..., None] # (N, H, W, 3, 1)
+            hom_camera_backproj = torch.concat([camera_backproj, torch.ones_like(camera_backproj)[..., :1, :]], dim=3) # (N, H, W, 4, 1)
+            hom_world_pts = torch.linalg.inv(viewmats)[:, None, None] @ hom_camera_backproj # (N, H, W, 4, 1)
+            world_pts = hom_world_pts[..., :3, 0]/hom_world_pts[..., 3:, 0] # (N, H, W, 3)
+
+            # world_pts are in the recentered frame (means/poses had center_t subtracted); + center_t[2]
+            # gives the global height, so the residual pulls ground pixels to the global ground z=0.
+            loss += ground_lambda * torch.square(ground_mk * (world_pts[..., 2] + center_t[2])).sum()/(ground_mk.sum() + 1e-8)
+
+        # ego height anchor
+        if camera_height_lambda > 0:
+            camera_poses = torch.linalg.inv(viewmats) # (N, 4, 4), camera2world
+            ego_poses = camera_poses @ torch.linalg.inv(sensor2ego)[None] # (N, 4, 4), ego2world
+            # ego_poses[:,2,3] is the ego height in the recentered frame; + center_t[2] -> global height,
+            # so the residual puts the ego centre on the global ground z=0.
+            loss += camera_height_lambda * torch.square(ego_poses[:, 2, 3] + center_t[2]).mean()
 
         loss.backward() # backprop
 
