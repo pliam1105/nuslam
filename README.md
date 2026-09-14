@@ -17,7 +17,8 @@ from cameras plus cheap proprioception.
 The approach collapses one ambiguity at a time with an independent piece of knowledge: known
 intrinsics collapse the projective reconstruction to metric-up-to-scale via a dual-absolute-quadric
 (DAQ) solve, and the remaining global scale is resolved from a GPS/IMU reference trajectory (with
-a semantic ground/wheel anchor as the eventual, GT-free scale source). Resolving metric scale
+a semantic ground anchor as a GPS-free alternative, now built and validated — both are onboard, neither
+reads GT). Resolving metric scale
 inside a Gaussian-splat reconstruction, projective collapsed to metric-up-to-scale first, is the
 contribution. Ground truth (nuScenes poses, lidar) is used only as an oracle to score a finished
 reconstruction; scale is never fitted from it.
@@ -86,8 +87,9 @@ closes, so no finite closed form exists. It is solved as a fixed point: initiali
 modified targets $y_i - R\,b_i$, run a plain closed-form Umeyama Sim(3) fit of $\{C_i\}$ onto them,
 and repeat (two–three iterations suffice). The $z = 0$ pin supplies the vertical a 2-D GPS track
 lacks; the camera height enters only through the measured $a$, never assumed. The semantic
-ground/wheel-contact anchor — the intended scale source, acting directly on the Gaussians — is the
-core next step (see Roadmap). The same Umeyama fit against GT scores a finished reconstruction
+ground + ego-height anchor — the scale source, acting directly on the Gaussians — is now **built and
+validated** (see Roadmap step 5 and "Joint metric anchor + pose refinement"); wheel-contact points
+remain future work. The same Umeyama fit against GT scores a finished reconstruction
 (ATE/RPE); once scale is resolved legitimately its $s$ reads $\approx 1$.
 
 ### Ground-plane pre-alignment (GPS-free metric scale)
@@ -175,8 +177,9 @@ vertical residual $m^{\top}p_i + b$ over the ground points and $m^{\top}c_j + b 
 evaluated at the fitted $(g, s, b)$.
 
 This runs as a **pre-alignment**: the fitted Sim(3) is applied to the poses and the init cloud so
-training starts levelled and metrically scaled; the same two residuals become the direct-on-Gaussians
-anchor in the joint optimization (Roadmap). The fit is authored core (`nuslam.recon.fit_ground_anchor`,
+training starts levelled and metrically scaled; the same two residuals are the direct-on-Gaussians
+anchor in the joint optimization (built + validated; see "Joint metric anchor + pose refinement"). The
+fit is authored core (`nuslam.recon.fit_ground_anchor`,
 section 3e); assembling its inputs — segment the ground, back-project it, read $h$ from calibration —
 and building the Sim(3) + residual from $(g,s)$ are plumbing. `run_gs.py --ground-anchor` applies it to
 the poses and init cloud before training and, with `--save`, logs a before/after overlay (the raw
@@ -224,9 +227,10 @@ $$\mathcal{L}=\mathcal{L}_{\mathrm{photo}}+\lambda_{d}\,\frac{\sum m\,\lvert \ha
 The means learning rate follows the 3DGS `spatial_lr_scale` convention — the base rate times the
 camera-bounding radius ($\times 1.1$) — so in a metric scene tens of metres across the means
 actually move rather than freezing. The photometric term is scale-free; the metric-anchor loss
-(ground-plane + wheel-contact residual) is the term that will break the scale gauge and make the
-reconstruction natively metric, with joint pose refinement through the rasterizer, the current work
-(see Roadmap).
+(ground-plane + ego-height residual) is the term that breaks the scale gauge and makes the
+reconstruction natively metric — now **built and validated** (see "Joint metric anchor + pose
+refinement"; scale held to ~2% vs LiDAR, cm-level height residuals). Joint pose refinement through the
+rasterizer was tested here and found net-harmful, so it's dropped from the anchor route (see Roadmap).
 
 ### Bounding the reconstruction
 
@@ -335,7 +339,7 @@ correction, leaving roll/pitch/$z$ to the ground anchor.
 | DA3 metric upgrade: DAQ solve, rectifying homography, metric cameras/depth/cloud | `nuslam.recon.metric_upgrade` | core — built + tested |
 | GPS/IMU Sim(3) scale fit | `nuslam.recon` | core — built |
 | COLMAP (masked SfM) camera poses, Umeyama-aligned to metres | `pycolmap` + `nuslam.recon` | infrastructure |
-| Ground/wheel-contact scale anchor; Gaussian pose refinement; metric-anchor loss | `nuslam.recon` | core — in progress |
+| Ground + ego-height scale anchor (direct-on-Gaussians metric-anchor loss); Gaussian pose refinement | `nuslam.recon` | core — built + validated (pose-opt found net-harmful; wheel-contact + inverse-cov weighting pending) |
 | 3DGS representation, gsplat calls, training loop, photometric + depth + sky losses, MCMC regularizers, sky/vehicle masking | `nuslam.recon.gaussians` | core — built |
 | Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure |
 | Trajectory eval (Umeyama Sim(3)/SE(3), ATE/RPE) — GT as oracle | `nuslam.eval` | infrastructure |
@@ -557,9 +561,10 @@ i.e. it does not drift away from GT:
 <p align="center"><sub><b>run15</b> — left: loss and held-out PSNR (flat); right: pose drift from COLMAP init (cm-scale) and first-pose-aligned ATE vs GT (~0.57 m, flat). The COLMAP frontend poses are already near-GT, so joint refinement adds little on this scene.</sub></p>
 
 This is expected: because the GPS-anchored COLMAP poses are so good, pose refinement is nearly
-redundant here. It is worth revisiting alongside the **semantic ground/wheel anchor** (see Roadmap),
-where fixing the ground level and the metric scale *without* GPS will need the poses to move — and
-where depth supervision helps scale but not levelling.
+redundant here. It was revisited inside the **semantic ground anchor**'s joint optimization (step 5,
+GPS-free) — but fixing scale and level did *not* need the poses to move: `--optimize-poses` there
+drifted them 0.5°→7° and jittered positions ~2 m, hurting the metric result, so it's dropped from the
+anchor route (see "Joint metric anchor + pose refinement").
 
 ### Ground-plane pre-alignment (GPS-free metric)
 
@@ -674,7 +679,7 @@ scene — it should be dropped, leaving the near-GT pre-alignment poses. (Compar
 0.19 m / 0.71° poses, depth scale 0.974 — the GPS-free route matches on scale and, without pose-opt,
 should match on poses.)
 
-_Flythrough — the final Gaussians rendered along the **training** poses, overfit to them (novel/held-out
+Flythrough — the final Gaussians rendered along the **training** poses, overfit to them (novel/held-out
 views are noticeably softer, held-out PSNR ~8.5 dB):
 
 https://github.com/user-attachments/assets/3e46d913-1f25-4f6d-84be-57d96aa75bc2
@@ -700,8 +705,10 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   reconstructing them as posed per-instance Gaussians composed back onto the static scene.
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
-  are already near-GT; parked until the ground-anchor route needs the poses to move.
-- Ground/wheel scale anchor — the semantic metric anchor, the GT-free scale source. The GPS-free
+  are already near-GT, and — now tested inside the joint ground-anchor optimization (step 5) — it is
+  actively **net-harmful** (drifts poses 0.5°→7°, jitters positions ~2 m); dropped from the anchor route.
+- Ground/wheel scale anchor — the semantic metric anchor, a **GPS-free** scale source (cameras +
+  calibration + ground segmentation, no GPS; GPS itself is onboard proprioception, also never GT). The GPS-free
   pre-alignment is built (`--ground-anchor`, `--colmap-to-da3`; `nuslam.recon.ground_anchor`, method in
   "Ground-plane pre-alignment"), and **steps (1)–(4) below are validated** (numbers vs the GPS-derived
   scale 20.6 / vs GT, GPS used only for the display-time eval alignment, not to build the scene):
@@ -715,16 +722,23 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   - **(4) re-fit the ground anchor on the COLMAP-in-DA3 + DA3-depth combination** to refine scale +
     orientation (`--colmap-to-da3 --ground-anchor`) — recovers $s \approx 20.0$ (**~3%**), trajectory
     RMS vs GT **2.1 m** and horizontal RMS vs GPS **1.5 m** (roughly half the DA3-only error). **Done.**
-  - **(5) joint 3DGS + pose optimization with the ground anchor acting directly on the Gaussians** (the
-    Rung-2 core) to fix residual scale / ground-level / Z drift together. Depth supervision helps scale
-    but not levelling, and fixing the ground level must move the poses accordingly. Run a
-    **depth-only vs ground-anchor-only vs neither** ablation to isolate each effect, and re-run the
-    pose/depth-vs-LiDAR evals (below) after, to check accuracy beats the GPS route. **Next.**
+  - **(5) joint 3DGS + pose optimization with the ground/ego-height anchor acting directly on the
+    Gaussians** (the Rung-2 core) — **built and validated** (`--ground-anchor --depth-silog`, plus the
+    per-batch ground-point + camera-height residuals acting on the Gaussians; run `step5-full-silog`, see
+    "Joint metric anchor + pose refinement"). The anchors act directly on the Gaussians and hold metric
+    scale **natively**: geometry scale ~1.0–1.02 vs LiDAR (matching the GPS route), converged height
+    residuals ~8 cm (ground) / ~5 cm (ego), and photometric kept improving alongside (no anchor-vs-render
+    tension). The pose/depth-vs-LiDAR evals were re-run — the GPS-free route matches the GPS route on
+    metric scale. **Done.** Key finding: joint `--optimize-poses` is **net-harmful** on this
+    well-registered scene (drifts poses 0.5°→7°, jitters positions ~2 m), so the trained-pose
+    depth-vs-LiDAR is dominated by that drift; the next full run should **drop `--optimize-poses`** and
+    keep the near-GT pre-alignment poses. Still open: a clean depth-only vs anchor-only vs neither
+    ablation, and the wheel-contact (vs ground-region-only) anchor.
 
   Also: replace the anchor's $1/\sqrt{N}$ family balancing with inverse-covariance weighting (per-point
   depth variance + camera-height variance; see "Ground-plane pre-alignment"), which also returns a
-  covariance on $(g,s)$. De-risk first with the explicit pre-alignment above, then fold into the joint
-  optimization.
+  covariance on $(g,s)$. De-risked with the explicit pre-alignment above; **not yet** folded into the
+  joint optimization.
 - Factor-graph SLAM — lift the batch optimization into a GTSAM/iSAM2 graph with the render as a
   factor, plus IMU/GPS/wheel fusion and loop closure.
 
@@ -816,7 +830,8 @@ src/nuslam/
   recon/                 reconstruction core — written by hand
     metric_upgrade.py      DAQ metric upgrade -> metric-up-to-scale — built + tested
     gaussians.py           3DGS representation, gsplat calls, training loop, photometric loss — built
-    (ground/wheel scale anchor, pose refinement, metric-anchor loss — in progress)
+    (ground + ego-height scale anchor, direct-on-Gaussians metric-anchor loss — built + validated;
+     pose refinement dropped as net-harmful; wheel-contact + inverse-cov weighting pending)
 scripts/                 setup, data, inspect_sample, run_frontend, run_depth, run_recon,
                          run_metric_upgrade, cache_colmap_poses, run_gs, render_gs_video,
                          render_progress_video, replay_gs_rrd, make_readme_figures
