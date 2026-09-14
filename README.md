@@ -421,6 +421,19 @@ PSNR is depressed and roughly flat across these runs because the sky→black ter
 sky dark against bright-sky GT over the whole frame; SSIM and L1 are the cleaner cross-run signal,
 and both are clearly best on the full COLMAP run.
 
+**Accuracy vs ground truth** (GPS route, `run13`: COLMAP poses + metric depth + defaults, 39 frames).
+The COLMAP camera poses are **0.19 m mean / 0.12 m median from GT** (0.71° mean rotation), and the
+depth is metric against LiDAR:
+
+| depth source | AbsRel | RMSE | δ<1.25 | recovered scale |
+|---|---|---|---|---|
+| init metric depth (×GPS scale 20.57) | 0.166 | 7.01 m | 0.826 | 0.987 |
+| 3DGS expected depth (`gs_002000`) | 0.299 | 10.1 m | 0.736 | 0.974 |
+
+(The 3DGS row is an iter-2000 snapshot — that run kept no `gs_final` — so it trails the init cloud;
+depth-accuracy wasn't an explicit objective, and expected-depth off a splat is noisier than the clean
+back-projected cloud.)
+
 Five-frame renders, depth supervision (left) versus none (right):
 
 <p align="center">
@@ -567,6 +580,18 @@ already trims the GT error 3.91→3.36 m; **re-fitting the anchor** on this comb
 big win — scale 18.58→19.96 (~10%→~3%), GT error →2.08 m (roughly half of stage 1), residual →0.160 m.
 `run_gs.py --colmap-to-da3 --ground-anchor --gps-align`.
 
+The resulting **GPS-free init cloud is as metric as the GPS one** — scored against LiDAR (metric DA3
+depth × the anchor scale 19.96, back-projected), matching the GPS route (run13 init, ×20.57) point for
+point:
+
+| init cloud | AbsRel | RMSE | δ<1.25 | recovered scale |
+|---|---|---|---|---|
+| GPS (COLMAP + metric depth ×20.57) | 0.166 | 7.01 m | 0.826 | 0.987 |
+| **GPS-free** (colmap→DA3 + anchor ×19.96) | **0.159** | **6.83 m** | **0.845** | 1.017 |
+
+So the semantic ground anchor recovers metric scale to ~2% with **no GPS**, indistinguishable from the
+GPS-derived scale on the depth-vs-LiDAR metrics.
+
 The DA3 camera poses have a bad vertical: DA3-only camera height swings 1.17→1.70 m against GT's flat
 ~1.5 m, while COLMAP→DA3 tracks it. The per-keyframe ground-point mean height (levelled frame) also
 sits tighter around 0 for COLMAP→DA3 — the residual wave is the real road profile (a dip mid-scene, a
@@ -592,6 +617,67 @@ ground cloud below:
   <img src="docs/ground_anchor_colmap_da3_overview.png" width="49%"/>
   <img src="docs/ground_anchor_colmap_da3_closeup.png" width="49%"/>
 </p>
+
+### Joint metric anchor + pose refinement (step 5, GPS-free)
+
+Starting from that pre-aligned metric frame, the ground/ego height anchors act **directly on the
+Gaussians** during a joint 3DGS optimization (10k iters), together with camera pose refinement and a
+**scale-invariant (SILog) depth** term — all GPS-free (`run_gs.py --colmap-to-da3 --ground-anchor
+--optimize-poses --first-pose-horizontal-only --depth-silog`). This is the Rung-2 core. The result and,
+importantly, the finding that **`--optimize-poses` hurts here** are below.
+
+**Poses vs GT** (SE(3)-rigid aligned; medians in parens — the mean is skewed by a few jagged poses):
+
+| | position error | orientation error | yaw | tilt (roll/pitch) |
+|---|---|---|---|---|
+| **pre-opt** (colmap→DA3 + anchor) | 1.28 m (**1.14 m**) | 0.60° (**0.53°**) | 0.20° | 0.48° |
+| **post-opt** (10k, `--optimize-poses`) | 1.97 m (**1.50 m**) | 7.05° (**6.35°**) | 4.92° | 3.34° |
+
+The pose-opt **degraded** both: it jitters the trajectory positions (see the comparison plot) and drifts
+camera orientation ~5° yaw + ~3° tilt from GT, whereas the pre-alignment poses are already near-GT
+(0.5° rotation, COLMAP quality). Photometric consistency can't penalize this — the render stays fine
+while the poses wander to GT-wrong-but-photometrically-equivalent configurations.
+
+![pre/post pose-opt trajectories (arrows = camera forward)](docs/pose_preopt_postopt.png)
+![per-keyframe position & orientation error vs GT](docs/step5_pose_error.png)
+
+**Depth vs LiDAR** (`median(lidar/rendered)`; 1.0 = perfect metric):
+
+| depth source | AbsRel | RMSE | δ<1.25 | recovered scale |
+|---|---|---|---|---|
+| init metric depth (pre-training reconstruction) | 0.159 | 6.83 m | 0.845 | 1.017 |
+| 3DGS `gs_final`, rendered from its **trained poses** (as-is) | 0.352 | 12.4 m | 0.330 | **1.323** |
+| 3DGS `gs_final`, rendered from **GT-aligned poses** (pose-decoupled) | 0.427 | 13.9 m | 0.557 | 1.107 |
+
+The reconstruction's cameras *are* the trained poses, so **1.32 is the honest end-to-end number** —
+rendering from GT poses (1.11) asks the model for a viewpoint it was never fit to (a diagnostic, not the
+reconstruction's output). Crucially the **metric scale itself is held** by photometric consistency +
+the height anchors (init 1.02; the geometry read from good poses is ~1.0) — the 1.32 is *pose error*
+showing up as depth error, not a scale-holding failure. The gap between 1.32 (trained) and 1.11
+(GT-aligned) is **mostly camera tilt**: the ground/ego anchors fix the vertical scale, and horizontal
+position/yaw barely change depth-to-ground as long as the render is consistent, but a camera tilted
+(roll/pitch) off GT reads the ground at a different distance — so the trained poses' ~3.3° tilt is what
+inflates the depth scale.
+
+**Anchors behaved** — they converged to a few cm and did **not** overpower the render:
+
+- ground-height residual → **~0.078 m**, camera-height residual → **~0.047 m** (converged medians).
+- photometric L1 fell 0.124 → **0.027** alongside the total (0.30 → 0.040) and held-out PSNR crept
+  8.3 → 8.5 dB — so the anchor/depth terms coexisted with photometric improvement; no destructive
+  over-weighting (the pose degradation is a pose-gauge effect, not anchor-vs-photometric tension).
+
+![training curves: total vs photometric loss, PSNR, anchor residuals, Gaussian count](docs/step5_training_curves.png)
+
+**Takeaway:** the GPS-free anchor mechanism works (metric scale ~2%, cm-level height residuals, poses
+0.5° from GT *before* pose-opt), but joint `--optimize-poses` is net-harmful on this well-registered
+scene — it should be dropped, leaving the near-GT pre-alignment poses. (Compare the GPS route, run13:
+0.19 m / 0.71° poses, depth scale 0.974 — the GPS-free route matches on scale and, without pose-opt,
+should match on poses.)
+
+_Flythrough (rendered along the **training** poses — overfit to them; novel/held-out views are
+noticeably softer, held-out PSNR ~8.5 dB):_
+
+<!-- flythrough video: upload out/step5-full-silog_flythrough.mp4 via the GitHub web UI here -->
 
 ### Qualitative outputs
 
