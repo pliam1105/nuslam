@@ -652,7 +652,8 @@ def main() -> int:
     # ---- persistent training log (CSV) + GS snapshots + render PNGs + live Rerun ----
     csv_file = open(log_dir / "train_log.csv", "w", newline="")
     cw = csv.writer(csv_file)
-    cw.writerow(["step", "loss", "photometric", "dssim", "num_gaussians", "heldout_psnr", "pose_drift"])
+    cw.writerow(["step", "loss", "photometric", "dssim", "num_gaussians", "heldout_psnr", "pose_drift",
+                 "ground_resid", "camera_resid"])
     render_dir = log_dir / "renders"; render_dir.mkdir(parents=True, exist_ok=True)
     pose_dir = log_dir / "pose_snapshots"; pose_dir.mkdir(parents=True, exist_ok=True)
     init_train_poses = poses_m[train_idx].copy()   # global camera->world at init, to measure pose drift
@@ -663,7 +664,8 @@ def main() -> int:
     def _png(img01):  # (H,W,3) float [0,1] -> uint8
         return (np.clip(img01, 0, 1) * 255).astype(np.uint8)
 
-    def on_log(step, loss, photo, dssim, gaussians, render, poses=None):
+    def on_log(step, loss, photo, dssim, gaussians, render, poses=None,
+               ground_resid=float("nan"), camera_resid=float("nan")):
         gd = gs_numpy(gaussians)
         n = len(gd["means"])
         ho = render(poses_m[hi], K_true)                 # held-out at its given pose
@@ -673,8 +675,9 @@ def main() -> int:
         drift = float(np.linalg.norm(poses[:, :3, 3] - init_train_poses[:, :3, 3], axis=1).mean()) \
             if poses is not None else 0.0
         print(f"iter {step:6d}  loss {loss:.4f}  photo {photo:.4f}  dssim {dssim:.4f}  "
-              f"N={n}  heldout_psnr={e.psnr:.2f}  pose_drift={drift:.3f}")
-        cw.writerow([step, loss, photo, dssim, n, e.psnr, drift]); csv_file.flush()
+              f"N={n}  heldout_psnr={e.psnr:.2f}  pose_drift={drift:.3f}  "
+              f"ground_resid={ground_resid:.3f}  cam_resid={camera_resid:.3f}")
+        cw.writerow([step, loss, photo, dssim, n, e.psnr, drift, ground_resid, camera_resid]); csv_file.flush()
         if args.snapshot_every and step % args.snapshot_every == 0:        # intermediate GS (disk-heavy)
             np.savez_compressed(gs_dir / f"gs_{step:06d}.npz", **gd)
             if poses is not None:                                          # pose snapshot for evolution viz

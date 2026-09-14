@@ -90,7 +90,8 @@ def train_gaussians(
     ssim_k2: float = 0.03,      # the K2 used for SSIM
     ssim_l: float = 1.0,        # the L used for SSIM
     log_every: int = 0,         # call on_log every this many steps (0 = never)
-    on_log=None,                # observability callback: on_log(step, loss, photo, dssim, gaussians, render)
+    on_log=None,                # observability callback: on_log(step, loss, photo, dssim, gaussians, render,
+                                #   poses, ground_resid, cam_resid) -- last two are RMS anchor residuals (m)
     init_gaussians: dict | None = None,  # warm start: if given, seed params from this checkpoint
                                          # ({means, scales, quats, opacities, sh}) instead of the
                                          # point cloud -- invert the activations (log_scales=log(scales),
@@ -357,6 +358,7 @@ def train_gaussians(
             sb = sky_img[step_batch]
             loss += sky_lambda * (render_colors.abs() * sb).sum() / (sb.sum() * 3 + 1e-8)
 
+        ground_resid_t = cam_resid_t = None   # RMS anchor residuals (metres) for logging; set below when active
         # ground point anchor
         if ground_lambda > 0 and ground_img is not None:
             ground_mk = ground_img[step_batch, 0] # (N, H, W)
@@ -368,6 +370,9 @@ def train_gaussians(
             # world_pts are in the recentered frame (means/poses had center_t subtracted); + center_t[2]
             # gives the global height, so the residual pulls ground pixels to the global ground z=0.
             loss += ground_lambda * torch.square(ground_mk * (world_pts[..., 2] + center_t[2])).sum()/(ground_mk.sum() + 1e-8)
+            # RMS ground residual (metres) over ground pixels, for logging only (detached, no grad).
+            ground_resid_t = torch.sqrt(
+                (torch.square(ground_mk * (world_pts[..., 2] + center_t[2])).sum() / (ground_mk.sum() + 1e-8)).detach())
 
         # ego height anchor
         if camera_height_lambda > 0:
@@ -376,6 +381,8 @@ def train_gaussians(
             # ego_poses[:,2,3] is the ego height in the recentered frame; + center_t[2] -> global height,
             # so the residual puts the ego centre on the global ground z=0.
             loss += camera_height_lambda * torch.square(ego_poses[:, 2, 3] + center_t[2]).mean()
+            # RMS ego-height residual (metres) over the batch cameras, for logging only.
+            cam_resid_t = torch.sqrt(torch.square(ego_poses[:, 2, 3] + center_t[2]).mean().detach())
 
         loss.backward() # backprop
 
@@ -421,7 +428,10 @@ def train_gaussians(
                     cp = torch.linalg.inv(viewmats_from_qt(translations, quaternions))
                     cp[:, :3, 3] += center_t
                     cur_poses = cp.cpu().numpy()
-            on_log(step, loss.item(), photometric_loss.item(), dssim.item(), gaussians, render, cur_poses)
+            ground_resid = ground_resid_t.item() if ground_resid_t is not None else float("nan")
+            cam_resid = cam_resid_t.item() if cam_resid_t is not None else float("nan")
+            on_log(step, loss.item(), photometric_loss.item(), dssim.item(), gaussians, render, cur_poses,
+                   ground_resid, cam_resid)
 
     # refined camera->world poses for the train views (None when poses were frozen). translations/
     # quaternions parametrize world->cam (viewmats) in the LOCAL frame, so invert and add back the
