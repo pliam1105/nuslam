@@ -90,6 +90,90 @@ ground/wheel-contact anchor — the intended scale source, acting directly on th
 core next step (see Roadmap). The same Umeyama fit against GT scores a finished reconstruction
 (ATE/RPE); once scale is resolved legitimately its $s$ reads $\approx 1$.
 
+### Ground-plane pre-alignment (GPS-free metric scale)
+
+GPS is a stand-in. The intended, sensor-free scale source is the **semantic ground**: the road is
+locally planar and the camera sits at a known metric height $h$ above it (from the `sensor2ego`
+extrinsic — measured, not assumed). Before training, a Sim(3) $x' = sRx + t$ levels and scales the
+reconstruction by minimizing two residual families that both read only the *transformed vertical*:
+
+$$r^{\text{ground}}_i = e_z^{\top}(sRp_i + t),\qquad r^{\text{cam}}_j = e_z^{\top}(sRc_j + t) - h$$
+
+over the road-segmented points $\{p_i\}$ and the camera centres $\{c_j\}$. This is the same
+height-residual scale disambiguation as the Theseus DEM tutorial, with the DEM degenerate to one
+plane.
+
+**Only 4 of the 7 DoF are observable.** $e_z^{\top}$ keeps only the third row of $sR$ and the third
+component of $t$, so the residuals depend on the transform through the up-direction $R^{\top}e_z$
+(2 DoF), the scale $s$, and $t_z$ — while yaw about the vertical and the horizontal translation
+$(t_x,t_y)$ are a 3-D gauge a flat ground and a constant height cannot see. Fitting a full Sim(3)
+with only these residuals is rank-deficient; the fit is set up over the observable part alone.
+
+**The observable part is linear.** The third row of a similarity is an *unconstrained* vector
+$m = s\,g \in \mathbb{R}^3$ (its magnitude is the scale, its direction the up-vector $g$), so with
+$b = t_z$ the vertical is $z'(x) = m^{\top}x + b$ and both residuals are **linear in $(m,b)$**:
+
+$$m^{\top}p_i + b = 0,\qquad m^{\top}c_j + b - h = 0$$
+
+a weighted least-squares in four unknowns (robustified — RANSAC/IRLS — against segmentation bleed
+onto curbs and low objects). The scale is recovered as $s = \lVert m\rVert$, the up-direction as
+$g = m/\lVert m\rVert$; the unobservable yaw and $(t_x,t_y)$ are gauged out by minimizing
+displacement from the current frame. Crucially the **ground points carry the tilt** (plane normal),
+and the **camera height carries the scale** — a flat plane alone is scale-blind, since scaling a
+plane leaves it flat, so the pose-height term is the scale-bearing constraint, not an add-on, and is
+weighted up against the many noisier ground points.
+
+**Balancing the two families.** Left unweighted this least-squares is degenerate: with ~$10^6$ ground
+rows and only ~$10^1$ camera rows, and a near-flat ground whose per-point vertical residual scales
+with $\lVert m\rVert$, the fit shrinks $\lVert m\rVert = s \to 0$ to kill the dominant ground term,
+collapsing the scale (empirically $s \approx 0.004$ instead of $\approx 1$). The fix is to weight each
+row — the whole row of the design matrix *and* its target — by $1/\sqrt{N_{\text{family}}}$, so each
+family contributes its **mean** squared residual rather than its **sum**: $A^{\top}A$ becomes
+$\operatorname{mean}_{\text{ground}}(\cdot) + \operatorname{mean}_{\text{cam}}(\cdot)$, count-balanced,
+with the ground still supplying the tilt and the handful of cameras still pinning the scale. The
+count-imbalance sign is the tell — a collapsed scale with a correct up-direction is exactly this
+weighting failure. (Empirically: on the up-to-scale DA3 cloud this recovers $s \approx 18.6$ against
+the GPS-derived $20.6$ — metric scale to ~10% with no GPS.)
+
+**A probabilistically-sane upgrade (covariances).** The $1/\sqrt{N}$ balancing is a count heuristic;
+it treats every ground point as equally certain, which they are not — a monocular back-projected
+ground point's vertical uncertainty grows with depth (roughly $\propto z^2$), and the camera-height
+constraint has its own small variance (calibration + pose). The principled form is inverse-covariance
+(whitened) least-squares — the MLE under Gaussian noise — weighting residual $i$ by $1/\sigma_i^2$:
+propagate each pixel's depth covariance through the back-projection to a per-point vertical variance
+$\sigma_{g,i}^2$, set $\sigma_c^2$ from the camera-height/pose uncertainty, and solve
+$(A^{\top}\Sigma^{-1}A)\,x = A^{\top}\Sigma^{-1}b$ with $\Sigma = \operatorname{diag}(\sigma_i^2)$. This
+subsumes the count balancing (near ground points, being many *and* precise, rightly dominate; far
+noisy ones are down-weighted), returns a covariance on $(m,b)$ hence on $(g,s)$ for downstream use,
+and is the natural bridge to the factor-graph stage, where these become ground / height factors with
+real noise models (see Roadmap). Not yet implemented — the current fit uses the $1/\sqrt{N}$ weighting.
+
+**From $(g, s)$ to the Sim(3).** The fit returns only the two observable quantities — the unit
+up-direction $g$ and the scale $s$ — and the pre-alignment transform is built from them. The rotation
+is the **shortest arc** taking $g$ to the world vertical $e_z$: an axis–angle rotation whose axis is
+$g \times e_z$ and whose angle has $\cos\theta = g\cdot e_z$, $\sin\theta = \lVert g\times e_z\rVert$.
+Writing $v = g\times e_z$ and $c = g\cdot e_z$, Rodrigues' formula collapses (no $\theta$, no
+normalization) to
+
+$$R = I + [v]_\times + \frac{[v]_\times^{2}}{1+c}$$
+
+Rotating about $g\times e_z$ touches only the tilt and leaves yaw untouched — the minimal-displacement
+gauge. The similarity is then $sR$, and the translation sets the leveled vertical to $m^{\top}x + b$
+with $m = s\,g$: the vertical component is the fitted intercept $t_z = b$ (so ground points land at
+$\approx 0$ and cameras at $\approx h$), while the horizontal $(t_x,t_y)$ — the one unobservable
+freedom left — is chosen to keep the camera centroid fixed. Fit quality is reported as the RMS
+vertical residual $m^{\top}p_i + b$ over the ground points and $m^{\top}c_j + b - h$ over the cameras,
+evaluated at the fitted $(g, s, b)$.
+
+This runs as a **pre-alignment**: the fitted Sim(3) is applied to the poses and the init cloud so
+training starts levelled and metrically scaled; the same two residuals become the direct-on-Gaussians
+anchor in the joint optimization (Roadmap). The fit is authored core (`nuslam.recon.fit_ground_anchor`,
+section 3e); assembling its inputs — segment the ground, back-project it, read $h$ from calibration —
+and building the Sim(3) + residual from $(g,s)$ are plumbing. `run_gs.py --ground-anchor` applies it to
+the poses and init cloud before training and, with `--save`, logs a before/after overlay (the raw
+tilted/up-to-scale cloud + track in red, the levelled + metrically-scaled result in colour) to inspect
+the pre-alignment.
+
 ### Camera poses (COLMAP)
 
 Because DA3's poses are corrupted by dynamic objects, the training cameras come from a
@@ -395,6 +479,51 @@ redundant here. It is worth revisiting alongside the **semantic ground/wheel anc
 where fixing the ground level and the metric scale *without* GPS will need the poses to move — and
 where depth supervision helps scale but not levelling.
 
+### Ground-plane pre-alignment (GPS-free metric)
+
+The semantic ground anchor recovers metric scale + level from the road plane and the known camera
+height, with **no GPS** (GPS is used only for the display-time SE(2) alignment and scoring below, never
+to build the reconstruction). Three stages, scored against the GPS-derived scale (20.57) and GT:
+
+| Stage | recovered scale (÷20.57) | anchor vertical residual | camera-track RMS vs GT | horizontal RMS vs GPS |
+|---|---|---|---|---|
+| **(1) DA3 poses + DA3 depth** + anchor | 18.58 (~10% low) | 0.211 m | 3.91 m | 3.40 m |
+| **(2–3) COLMAP→DA3 + DA3 depth**, pre-refit (DA3 anchor) | 18.58 | 0.218 m | 3.36 m | 3.01 m |
+| **(4) COLMAP→DA3 + DA3 depth** + re-fit anchor | **19.96 (~3% low)** | **0.160 m** | **2.08 m** | **1.54 m** |
+
+Stages 2–3 Umeyama-fit the COLMAP trajectory onto the DA3 poses (scale 0.047, fit RMS 0.108 in DA3
+units) to borrow DA3's scale onto COLMAP's clean, dynamic-object-free trajectory, and back-project the
+DA3 depth from those COLMAP-in-DA3 poses. Swapping in COLMAP's trajectory alone (keeping the DA3 anchor)
+already trims the GT error 3.91→3.36 m; **re-fitting the anchor** on this combination (stage 4) is the
+big win — scale 18.58→19.96 (~10%→~3%), GT error →2.08 m (roughly half of stage 1), residual →0.160 m.
+`run_gs.py --colmap-to-da3 --ground-anchor --gps-align`.
+
+The DA3 camera poses have a bad vertical: DA3-only camera height swings 1.17→1.70 m against GT's flat
+~1.5 m, while COLMAP→DA3 tracks it. The per-keyframe ground-point mean height (levelled frame) also
+sits tighter around 0 for COLMAP→DA3 — the residual wave is the real road profile (a dip mid-scene, a
+rise near the end), not noise.
+
+![Pre-alignment trajectories, SE(2)-aligned to GPS](docs/ground_anchor_trajectories.png)
+![Per-keyframe camera height and ground-point mean height](docs/ground_anchor_heights.png)
+
+Rerun (levelled to Z-up, ground horizontal; green = ground point cloud, blue = estimated trajectory,
+orange = GPS, cyan = GT, gray = camera frustums); each pair is overview + a close-up of the cameras +
+ground cloud below:
+
+**(1) DA3-only** — the ground cloud is more warped and the trajectory wanders off GPS/GT:
+
+<p>
+  <img src="docs/ground_anchor_da3_overview.png" width="49%"/>
+  <img src="docs/ground_anchor_da3_closeup.png" width="49%"/>
+</p>
+
+**(4) COLMAP→DA3 + DA3 depth** (re-fit anchor) — flatter ground, trajectory hugging GPS/GT:
+
+<p>
+  <img src="docs/ground_anchor_colmap_da3_overview.png" width="49%"/>
+  <img src="docs/ground_anchor_colmap_da3_closeup.png" width="49%"/>
+</p>
+
 ### Qualitative outputs
 
 Produced by the viz scripts (into the gitignored `out/`), each pose-source aware:
@@ -417,19 +546,30 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
   are already near-GT; parked until the ground-anchor route needs the poses to move.
-- Ground/wheel scale anchor — the semantic metric anchor acting directly on the Gaussians, the
-  GT-free scale source. Because GPS already makes scale/poses near-perfect here (so pose refinement
-  is redundant, see Results), run this route **without GPS**, in this sequence: (1) ground-align on
-  the **DA3** reconstruction to recover the metric scale from the ground plane (no GPS); (2) fit the
-  **COLMAP** poses to the DA3 ones (Umeyama) to carry that scale onto COLMAP — so the scale comes
-  from the ground, but the trajectory shape comes from COLMAP, avoiding DA3's bad poses corrupting
-  it; (3) back-project the scaled depth from the scaled COLMAP poses to seed a cloud with
-  approximately-correct scale and trajectory; (4) jointly optimize the 3DGS + poses with the ground
-  anchor to fix any residual scale / ground-level / Z drift together. Depth supervision helps scale
-  but not levelling, and fixing the ground level must move the poses accordingly. Run a
-  **depth-supervision-only vs ground-anchor-only vs neither** ablation to isolate each effect, and
-  re-run the pose/depth-vs-LiDAR evals (below) after, to check accuracy improves over the GPS route.
-  De-risk first with an explicit scalar, then fold into the joint optimization.
+- Ground/wheel scale anchor — the semantic metric anchor, the GT-free scale source. The GPS-free
+  pre-alignment is built (`--ground-anchor`, `--colmap-to-da3`; `nuslam.recon.ground_anchor`, method in
+  "Ground-plane pre-alignment"), and **steps (1)–(4) below are validated** (numbers vs the GPS-derived
+  scale 20.6 / vs GT, GPS used only for the display-time eval alignment, not to build the scene):
+  - **(1) ground-align the DA3 reconstruction** to recover metric scale from the ground plane, no GPS
+    (`--no-colmap-poses --no-scale --ground-anchor`) — recovers $s \approx 18.6$ (~10%), trajectory
+    RMS vs GT 3.9 m (DA3's own poses are corrupted by dynamic objects). **Done.**
+  - **(2) Umeyama-fit COLMAP → DA3** to borrow DA3's scale onto COLMAP's clean, dynamic-object-free
+    trajectory (scale comes from the ground, trajectory shape from COLMAP). **Done** (`--colmap-to-da3`).
+  - **(3) back-project the DA3 depth from those COLMAP-in-DA3 poses** — depth and poses now share a
+    scale, so the seed cloud has an approximately-correct scale and trajectory. **Done.**
+  - **(4) re-fit the ground anchor on the COLMAP-in-DA3 + DA3-depth combination** to refine scale +
+    orientation (`--colmap-to-da3 --ground-anchor`) — recovers $s \approx 20.0$ (**~3%**), trajectory
+    RMS vs GT **2.1 m** and horizontal RMS vs GPS **1.5 m** (roughly half the DA3-only error). **Done.**
+  - **(5) joint 3DGS + pose optimization with the ground anchor acting directly on the Gaussians** (the
+    Rung-2 core) to fix residual scale / ground-level / Z drift together. Depth supervision helps scale
+    but not levelling, and fixing the ground level must move the poses accordingly. Run a
+    **depth-only vs ground-anchor-only vs neither** ablation to isolate each effect, and re-run the
+    pose/depth-vs-LiDAR evals (below) after, to check accuracy beats the GPS route. **Next.**
+
+  Also: replace the anchor's $1/\sqrt{N}$ family balancing with inverse-covariance weighting (per-point
+  depth variance + camera-height variance; see "Ground-plane pre-alignment"), which also returns a
+  covariance on $(g,s)$. De-risk first with the explicit pre-alignment above, then fold into the joint
+  optimization.
 - Factor-graph SLAM — lift the batch optimization into a GTSAM/iSAM2 graph with the render as a
   factor, plus IMU/GPS/wheel fusion and loop closure.
 

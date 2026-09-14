@@ -8,6 +8,14 @@ and evaluation plumbing have something to call.
 """
 from .depth_init import backproject_depth_to_world, unproject_depth_to_world
 from .gaussians import train_gaussians
+from .ground_anchor import (
+    GroundAnchor,
+    GroundAnchorInputs,
+    apply_ground_anchor,
+    fit_ground_anchor,
+    ground_anchor_inputs,
+    ground_anchor_residual,
+)
 from .scale import ScaleResult, resolve_scale_gps
 from .metric_upgrade import (
     build_daq_system,
@@ -40,4 +48,10 @@ __all__ = [
     "resolve_scale_gps",
     "ScaleResult",
     "train_gaussians",
+    "GroundAnchor",
+    "GroundAnchorInputs",
+    "ground_anchor_inputs",
+    "fit_ground_anchor",
+    "ground_anchor_residual",
+    "apply_ground_anchor",
 ]

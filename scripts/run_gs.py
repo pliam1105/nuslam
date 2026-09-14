@@ -32,7 +32,17 @@ from nuslam.data import (  # noqa: E402
 from nuslam.eval import evaluate_render, holdout_indices, record_metrics  # noqa: E402
 from nuslam.frontend import RoadSegmenter, Sam3Segmenter, SegConfig, cache  # noqa: E402
 from nuslam.pointcloud import voxel_downsample  # noqa: E402
-from nuslam.recon import metric_depth, metric_point_cloud, resolve_scale_gps, train_gaussians  # noqa: E402
+from nuslam.transforms import umeyama  # noqa: E402
+from nuslam.recon import (  # noqa: E402
+    apply_ground_anchor,
+    fit_ground_anchor,
+    ground_anchor_inputs,
+    ground_anchor_residual,
+    metric_depth,
+    metric_point_cloud,
+    resolve_scale_gps,
+    train_gaussians,
+)
 from nuslam.viz import rerun_logging as rrlog  # noqa: E402
 
 # Reconstruction lives in camera-0's frame (RDF); rotate into a Z-up world for viz.
@@ -144,6 +154,12 @@ def parse_args():
                         "<cache>/<scene>/colmap_poses_global.npz) as the training cameras, subset by token. "
                         "DEFAULT on; --gt-poses overrides it, --no-colmap-poses falls back to DA3 poses. "
                         "The DA3 metric depth still seeds the dense init cloud. Not used for scale")
+    p.add_argument("--colmap-to-da3", action=argparse.BooleanOptionalAction, default=False,
+                   help="GPS-free scale transfer: Umeyama-fit the COLMAP trajectory to the DA3 poses "
+                        "(borrows DA3's up-to-scale scale onto COLMAP's clean, dynamic-object-free "
+                        "trajectory), then seed the cloud with the DA3 depth back-projected from those "
+                        "COLMAP-in-DA3 poses (depth and poses now share a scale). Forces scale=1 (no GPS); "
+                        "pair with --ground-anchor to recover metric scale + level. DEFAULT off")
     p.add_argument("--opacity-reg", type=float, default=0.0,
                    help="MCMC opacity-sparsity weight (L1 on opacities); 0=off (default), ~0.01 typical")
     p.add_argument("--scale-reg", type=float, default=0.0,
@@ -186,6 +202,23 @@ def parse_args():
     p.add_argument("--range-thresh", type=float, default=25.0,
                    help="range threshold in metres, shared by --range-mask (per-pixel) and "
                         "--prune-offscene (per-centroid): min distance to all cameras")
+    p.add_argument("--ground-anchor", action=argparse.BooleanOptionalAction, default=False,
+                   help="GPS-free ground-plane pre-alignment: fit a Sim(3) leveling + scaling the "
+                        "reconstruction so road/ground points lie on z=0 and the cameras sit at the "
+                        "known metric height, then apply it to the poses + init cloud before training. "
+                        "The fit itself is author-written (nuslam.recon.fit_ground_anchor). DEFAULT off")
+    p.add_argument("--ground-prompt", default="road",
+                   help="segmentation prompt for the ground-anchor ground mask (default 'road')")
+    p.add_argument("--ground-threshold", type=float, default=0.35,
+                   help="segmentation threshold for the ground-anchor ground mask")
+    p.add_argument("--camera-height", type=float, default=None,
+                   help="metric camera height above the road (m) for the ground anchor; default reads "
+                        "it from the sensor2ego extrinsic (CAM_FRONT ~1.5 m)")
+    p.add_argument("--gps-align", action=argparse.BooleanOptionalAction, default=False,
+                   help="after --ground-anchor, pin the leftover horizontal gauge (yaw + x,y) to the "
+                        "GPS ground track by an SE(2) fit (SO(2) rotation + 2D translation, NO scale -- "
+                        "scale is the ground anchor's). Places the levelled reconstruction in the "
+                        "nuScenes map frame and overlays the GPS + GT tracks in Rerun. DEFAULT off")
     p.add_argument("--prune-offscene", action=argparse.BooleanOptionalAction, default=True,
                    help="every --prune-every steps, remove Gaussians whose CENTROIDS are off-scene: "
                         "invisible in all views, farther than --range-thresh from every camera, or "
@@ -278,6 +311,25 @@ def main() -> int:
         poses_m = colmap_poses
         print(f"[colmap-poses] COLMAP poses in the global metric frame ({len(colmap_poses)} frames, "
               f"scale={float(d['scale']):.4f}, GPS residual={float(d['residual']):.3f} m)")
+
+    if args.colmap_to_da3:
+        # GPS-free scale transfer. Umeyama the COLMAP trajectory onto the DA3 poses (world_from_cam,
+        # DA3 up-to-scale units): borrow DA3's scale onto COLMAP's clean trajectory so the DA3 depth
+        # (DA3 units) and the COLMAP poses share a scale. DA3's own poses have a bad Z; COLMAP fixes
+        # the trajectory, DA3 supplies the dense depth. Scale forced to 1 (GPS-free) -- the ground
+        # anchor recovers absolute metric scale + level from this combination.
+        if colmap_poses is None:
+            print("[colmap-to-da3] needs COLMAP poses -- do not pass --no-colmap-poses"); return 1
+        s_cd, R_cd, t_cd = umeyama(colmap_poses[:, :3, 3], world_from_cam[:, :3, 3], with_scale=True)
+        colmap_da3 = colmap_poses.copy()
+        colmap_da3[:, :3, :3] = R_cd @ colmap_poses[:, :3, :3]                 # rotation composes (no scale)
+        colmap_da3[:, :3, 3] = colmap_poses[:, :3, 3] @ (s_cd * R_cd).T + t_cd  # centres scale + rotate + shift
+        fit_rms = np.sqrt(((colmap_da3[:, :3, 3] - world_from_cam[:, :3, 3]) ** 2).sum(1).mean())
+        scale = 1.0                     # DA3 units; the DA3 depth stays native and matches COLMAP-in-DA3
+        poses_m = colmap_da3
+        colmap_poses = colmap_da3       # so override_poses (below) back-projects the cloud from these
+        print(f"[colmap-to-da3] Umeyama COLMAP->DA3: scale {s_cd:.4f}, fit RMS {fit_rms:.3f} (DA3 units) "
+              f"-> COLMAP trajectory in DA3 frame + DA3 depth (scale forced to 1, GPS-free)")
 
     # GT / COLMAP both supply metric poses already in the global frame; the seed cloud is then
     # back-projected from THESE poses (metric DA3 depth * scale) instead of the DA3 metric-upgrade poses.
@@ -396,6 +448,43 @@ def main() -> int:
         print(f"[init cloud] voxel_downsample not implemented -- using {n_raw} raw points "
               f"(implement nuslam.pointcloud.voxel_downsample to thin)")
 
+    # ---- ground-plane pre-alignment (GPS-free metric scale, author-written fit) ----
+    # Segment the ground, back-project it, and hand the ground points + camera centres +
+    # known metric camera height to fit_ground_anchor; apply the leveling/scaling Sim(3)
+    # to the poses AND the init cloud before training. The fit is core (author); assembling
+    # its inputs and applying its result are plumbing. Degrades to a no-op (with a note) until
+    # the author implements the fit.
+    ga_applied = False   # whether the ground anchor was applied (frame is levelled to +Z-up)
+    ga_ground = None     # the ground-segmented points in the levelled frame, for the overlay
+    if args.ground_anchor:
+        ground_masks = _segment(args.ground_prompt, args.ground_threshold)
+        cam_h = args.camera_height
+        if cam_h is None:
+            cam_h = float(frames[0][0].calib.sensor2ego.matrix()[2, 3])  # camera height above road
+        # poses_m is the frame training + viz use; the init cloud is back-projected to match it, so the
+        # ground points + camera centres for the fit come straight from poses_m (metric depth in metres).
+        md_scaled = [metric_depths[i] * scale for i in range(len(frames))]
+        ga_in = ground_anchor_inputs(
+            md_scaled, [kf.image() for kf, _ in frames], ground_masks,
+            [kf.token for kf, _ in frames], K_true, poses_m, cam_h,
+            stride=args.stride,
+            extra_drop={kf.token: drop_mask(kf, dm) for kf, dm in frames})
+        print(f"[ground-anchor] {len(ga_in.ground_points)} ground points, {len(ga_in.camera_centres)} "
+              f"cameras, camera height {ga_in.camera_height:.3f} m -> fitting Sim(3)")
+        try:
+            anchor = fit_ground_anchor(ga_in)
+            resid = ground_anchor_residual(anchor, ga_in)
+            poses_before = poses_m.copy()   # same poses -> same (sR, t), so cloud + ground points align
+            poses_m, xyz = apply_ground_anchor(anchor, poses_before, xyz)   # level + scale into the new frame
+            _, ga_ground = apply_ground_anchor(anchor, poses_before, ga_in.ground_points)  # ground pts, levelled
+            ga_applied = True
+            if override_poses is not None:
+                override_poses = poses_m
+            print(f"[ground-anchor] applied: scale {anchor.scale:.4f}, up {np.round(anchor.up, 4)}, "
+                  f"vertical residual {resid:.3f} m")
+        except NotImplementedError as e:
+            print(f"[ground-anchor] fit not implemented -- skipping pre-alignment ({e})")
+
     # ---- held-out split for novel-view PSNR ----
     train_idx, test_idx = holdout_indices(len(frames), every=args.holdout_every, offset=args.holdout_offset)
     print(f"{len(frames)} frames: {len(train_idx)} train / {len(test_idx)} held-out for novel-view PSNR")
@@ -407,22 +496,68 @@ def main() -> int:
         app_id = f"nuslam-gs-{scene_name}" if args.train else f"nuslam-pointcloud-{scene_name}"
         rrlog.init(app_id, spawn=args.rerun, save=args.save,
                    serve=args.serve, serve_port=args.serve_port)
-        rrlog.log_points("init/cloud", xyz @ R_VIZ.T, colors=rgb, radii=args.point_size, static=True)
-        rrlog.log_trajectory("traj/est", poses_m[:, :3, 3] @ R_VIZ.T, color=(50, 120, 240), static=True)
+        # Display transform D: recon frame -> Rerun view frame (Z-up). Applied ONLY for logging --
+        # the trained poses_m / xyz are never touched. Rerun world is Z-up; R_VIZ rotates the
+        # un-levelled recon (up = -Y) into Z-up; the ground anchor already levels to +Z-up (identity).
+        # With --gps-align, D instead places the levelled recon into the nuScenes MAP frame by an
+        # SE(2) fit to the GPS track -- EVAL/DISPLAY ONLY (GPS is not used to build the reconstruction).
+        if ga_applied and args.gps_align:
+            if gps_xy is None:   # GPS not loaded under --no-scale; load it just for this overlay
+                streams = load_proprio_streams(args.dataroot, scene_name, version=args.version)
+                gps_xy, gps_valid = (gps_positions_at(streams, [kf.timestamp_us for kf, _ in frames])
+                                     if streams.gps else (None, None))
+            if gps_xy is not None and gps_valid.any():
+                cam = poses_m[:, :3, 3]; z0 = np.zeros(int(gps_valid.sum()))
+                # SE(2) = SO(2) about z + x,y translation, NO scale (z=0 embeddings keep it horizontal).
+                _, R2, t2 = umeyama(np.column_stack([cam[gps_valid, :2], z0]),
+                                    np.column_stack([gps_xy[gps_valid], z0]), with_scale=False)
+                D = np.eye(4); D[:3, :3] = R2; D[:3, 3] = t2
+            else:
+                print("[gps-align] no GPS -- showing the levelled frame without map alignment")
+                D = np.eye(4)
+        elif ga_applied:
+            D = np.eye(4)          # anchored: already levelled to Z-up
+        else:
+            D = T_VIZ              # raw recon: rotate -Y-up into Z-up
+        DR, Dt = D[:3, :3], D[:3, 3]
+        xf = lambda P: np.asarray(P, float) @ DR.T + Dt
+
+        rrlog.log_points("init/cloud", xf(xyz), colors=rgb, radii=args.point_size, static=True)
+        if ga_ground is not None:   # the ground-segmented points the anchor fit (levelled), in green
+            rrlog.log_points("ground/cloud", xf(ga_ground), colors=(80, 220, 120),
+                             radii=args.point_size, static=True)
+        rrlog.log_trajectory("traj/est", xf(poses_m[:, :3, 3]), color=(50, 120, 240), static=True)
         for i, (kf, _) in enumerate(frames):
-            rrlog.log_estimated_camera(f"est/{i:03d}", T_VIZ @ poses_m[i], K_true,
+            rrlog.log_estimated_camera(f"est/{i:03d}", D @ poses_m[i], K_true,
                                        kf.calib.width, kf.calib.height, channel=args.camera, static=True)
 
-        # ---- reference overlays: GPS track, and (oracle) GT trajectory + lidar ----
-        # These live in the nuScenes map frame; map them into this reconstruction frame
-        # with the Route-B Sim(3) inverse: map M -> recon P = (M - t) Rs, then R_VIZ.
-        if res is not None:
+        # ---- reference overlays: GPS + GT tracks (EVAL only) ----
+        if ga_applied and args.gps_align and gps_xy is not None and gps_valid.any():
+            # D placed the recon in the map frame; GPS + GT live in the map frame -> log directly.
+            aligned = xf(poses_m[:, :3, 3])
+            gps3 = np.column_stack([gps_xy[gps_valid], np.zeros(int(gps_valid.sum()))])
+            rrlog.log_trajectory("ref/gps", gps3, color=(230, 150, 40), radius=0.3, static=True)
+            s2e_m = frames[0][0].calib.sensor2ego.matrix()
+            gt_cam = np.stack([kf.ego2global_gt.matrix() @ s2e_m for kf, _ in frames])[:, :3, 3]
+            rrlog.log_trajectory("ref/gt", gt_cam, color=(60, 200, 255), radius=0.3, static=True)
+            herr = np.linalg.norm(aligned[gps_valid, :2] - gps_xy[gps_valid], axis=1)
+            gerr = np.linalg.norm(aligned - gt_cam, axis=1)
+            print(f"[gps-align] EVAL (display only): horizontal RMS vs GPS {np.sqrt((herr**2).mean()):.3f} m "
+                  f"| trajectory RMS vs GT {np.sqrt((gerr**2).mean()):.3f} m ({int(gps_valid.sum())} GPS frames)")
+            if args.eval_gt:
+                for i, (kf, _) in enumerate(frames):
+                    lx = lidar_points_global(source, kf)
+                    if len(lx):
+                        rrlog.log_points(f"ref/lidar/{i:03d}", lx, colors=(190, 190, 190),
+                                         radii=args.point_size, static=True)
+        elif res is not None:
+            # Route-B (GPS-scaled) runs: map GPS/GT/lidar from the map frame into the view frame.
             if override_poses is not None:        # poses_m already in the nuScenes global frame: no remap
-                to_view = lambda M: np.asarray(M, float) @ R_VIZ.T
+                to_view = lambda M: xf(M)
             else:                                 # DA3 recon frame: bring the map reference in via Sim(3) inv
                 Rs = res.T[:3, :3] / res.scale    # orthonormal (scale un-folded)
                 t_map = res.T[:3, 3]
-                to_view = lambda M: ((np.asarray(M, float) - t_map) @ Rs) @ R_VIZ.T
+                to_view = lambda M: xf((np.asarray(M, float) - t_map) @ Rs)
             if gps_xy is not None and gps_valid.any():  # GPS reference track (the fit target)
                 gps3 = np.column_stack([gps_xy[gps_valid], np.zeros(int(gps_valid.sum()))])
                 rrlog.log_trajectory("ref/gps", to_view(gps3), color=(230, 150, 40), radius=0.3, static=True)
@@ -438,8 +573,10 @@ def main() -> int:
         elif args.eval_gt:
             print("[eval-gt] no Route-B alignment (needs GPS) -- skipping GT/GPS/lidar overlay")
 
+        gps_aligned = ga_applied and args.gps_align and gps_xy is not None and gps_valid.any()
         print("logged init cloud + trajectory + frustums"
-              + ("  [+ GPS/GT/lidar reference]" if res is not None else "")
+              + ("  [+ GPS/GT eval overlay]" if gps_aligned else
+                 ("  [+ GPS/GT/lidar reference]" if res is not None else ""))
               + " to Rerun" + (f" -> {args.save}" if args.save else ""))
 
     # ===================================================================================

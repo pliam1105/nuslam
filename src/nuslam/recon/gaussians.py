@@ -276,7 +276,7 @@ def train_gaussians(
         dssim = 1 - (((2*m_x*m_y+C1)*(2*s_xy+C2))/((m_x**2+m_y**2+C1)*(s_x+s_y+C2))).mean()
 
         # total loss
-        # SEAM (author, §3d): add the MCMC regularizers here using the supplied weights, e.g.
+        # SEAM: add the MCMC regularizers here using the supplied weights, e.g.
         #   loss += opacity_reg * torch.sigmoid(params["opacities"]).mean()   # opacity L1 (sparsity)
         #   loss += scale_reg   * torch.exp(params["scales"]).mean()          # covariance L1 (sqrt-eig = scales)
         # opacity_reg / scale_reg default 0.0 (no-op) until wired.
@@ -288,7 +288,7 @@ def train_gaussians(
             first_pose_trans_reg*torch.square(translations[0]-init_translations[0]).mean() + \
             first_pose_quat_reg*torch.square(quaternions[0]/quaternions[0].norm(keepdim=True) - init_quaternions[0]/init_quaternions[0].norm(keepdim=True)).mean()
 
-        # depth-supervision seam (author, §3d): supervise the rendered expected depth toward the DA3
+        # depth-supervision seam: supervise the rendered expected depth toward the DA3
         # metric depth where valid + non-masked. render_depths is (b,H,W,1), gt_depth[step_batch] is
         # (b,1,H,W). e.g. masked L1 (also gate out zero/invalid DA3 depth as needed):
         #   rd = render_depths.permute(0, 3, 1, 2)
@@ -300,7 +300,7 @@ def train_gaussians(
             w = w * (gt_depth[step_batch] > 0)
             loss += depth_lambda * ((rd - gt_depth[step_batch]).abs() * w).sum() / (w.sum() + 1e-8)
 
-        # sky->black seam (author, §3d): push the render toward black on sky pixels (sky has nothing
+        # sky->black seam: push the render toward black on sky pixels (sky has nothing
         # behind it, so black = the background). sky_img[step_batch] is (b,1,H,W), render_colors (b,3,H,W).
         # e.g. L1 to black over sky pixels:
         #   sb = sky_img[step_batch]
