@@ -138,7 +138,7 @@ with $\lVert m\rVert$, the fit shrinks $\lVert m\rVert = s \to 0$ to kill the do
 collapsing the scale (empirically $s \approx 0.004$ instead of $\approx 1$). The fix is to weight each
 row — the whole row of the design matrix *and* its target — by $1/\sqrt{N_{\text{family}}}$, so each
 family contributes its **mean** squared residual rather than its **sum**: $A^{\top}A$ becomes
-$\operatorname{mean}_{\text{ground}}(\cdot) + \operatorname{mean}_{\text{cam}}(\cdot)$, count-balanced,
+$\mathrm{mean}_{\text{ground}}(\cdot) + \mathrm{mean}_{\text{cam}}(\cdot)$, count-balanced,
 with the ground still supplying the tilt and the handful of cameras still pinning the scale. The
 count-imbalance sign is the tell — a collapsed scale with a correct up-direction is exactly this
 weighting failure. (Empirically: on the up-to-scale DA3 cloud this recovers $s \approx 18.6$ against
@@ -151,7 +151,7 @@ constraint has its own small variance (calibration + pose). The principled form 
 (whitened) least-squares — the MLE under Gaussian noise — weighting residual $i$ by $1/\sigma_i^2$:
 propagate each pixel's depth covariance through the back-projection to a per-point vertical variance
 $\sigma_{g,i}^2$, set $\sigma_c^2$ from the camera-height/pose uncertainty, and solve
-$(A^{\top}\Sigma^{-1}A)\,x = A^{\top}\Sigma^{-1}b$ with $\Sigma = \operatorname{diag}(\sigma_i^2)$. This
+$(A^{\top}\Sigma^{-1}A)\,x = A^{\top}\Sigma^{-1}b$ with $\Sigma = \mathrm{diag}(\sigma_i^2)$. This
 subsumes the count balancing (near ground points, being many *and* precise, rightly dominate; far
 noisy ones are down-weighted), returns a covariance on $(m,b)$ hence on $(g,s)$ for downstream use,
 and is the natural bridge to the factor-graph stage, where these become ground / height factors with
@@ -300,7 +300,7 @@ resolves (and in the GPS-free frame the DA3 target is up-to-scale, ~20× off the
 The scale-invariant log loss (Eigen et al.) removes this — with $d_u=\log\hat z_u-\log z_u$ over the
 valid pixels,
 
-$$\mathcal{L}_\text{SILog} = \operatorname{mean}(d^2) - \lambda\,\operatorname{mean}(d)^2, \qquad \lambda\in[0,1]$$
+$$\mathcal{L}_\text{SILog} = \mathrm{mean}(d^2) - \lambda\,\mathrm{mean}(d)^2, \qquad \lambda\in[0,1]$$
 
 At $\lambda=1$ it is the variance of $d$ — invariant to a global depth scaling (which shifts every
 $d_u$ by a constant) — so depth constrains only *shape* and leaves metric scale to the ground anchor.
