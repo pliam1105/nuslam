@@ -679,8 +679,8 @@ scene — it should be dropped, leaving the near-GT pre-alignment poses. (Compar
 0.19 m / 0.71° poses, depth scale 0.974 — the GPS-free route matches on scale, and without pose-opt it
 matches on poses too — confirmed next.)
 
-Flythrough — the final Gaussians rendered along the **training** poses, overfit to them (novel/held-out
-views are noticeably softer, held-out PSNR ~8.5 dB):
+_Flythrough — the final Gaussians rendered along the **training** poses, overfit to them (novel/held-out
+views are noticeably softer, held-out PSNR ~8.5 dB): `docs/step5-full-silog_flythrough.mp4`._
 
 https://github.com/user-attachments/assets/3e46d913-1f25-4f6d-84be-57d96aa75bc2
 
