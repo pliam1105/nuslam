@@ -684,9 +684,10 @@ views are noticeably softer, held-out PSNR ~8.5 dB):
 
 https://github.com/user-attachments/assets/3e46d913-1f25-4f6d-84be-57d96aa75bc2
 
-**Confirmed — dropping `--optimize-poses`** (`step5-full-silog-nopose`: same recipe, poses fixed at the
-pre-alignment). It wins on every metric, and the depth is metric **end-to-end** (rendered from its own
-fixed poses — no alignment trick):
+**Confirmed — dropping `--optimize-poses`** (`step5-full-silog-nopose`: same recipe — **SILog
+(scale-invariant) depth + the ground/ego height anchors** — with poses fixed at the pre-alignment). It
+wins on every metric, and the depth is metric **end-to-end** (rendered from its own fixed poses — no
+alignment trick):
 
 | | pose-opt | **no-pose-opt** |
 |---|---|---|
@@ -698,7 +699,9 @@ fixed poses — no alignment trick):
 
 With the poses fixed at the near-GT pre-alignment (1.28 m / 0.60°), the 3DGS expected depth is **metric
 to ~2%** (scale **1.017**, δ<1.25 0.711) — right on the init cloud (1.017) and the GPS route (0.974),
-so the 1.32 of the pose-opt run was **entirely the pose drift**, not a scale-holding failure. Photometric
+so the 1.32 of the pose-opt run was **entirely the pose drift**, not a scale-holding failure. And because
+the depth term is SILog (scale-free), that metric scale comes from the **height anchors**, not the depth
+supervision — the whole point of the semantic anchor. Photometric
 also converged lower (0.0155 vs 0.027) and the model densified to ~1M Gaussians (the pose-opt run's
 moving cameras had capped it near 400k / OOM'd on extension). (RMSE is outlier-inflated by floaters in
 the denser model; the robust scale/AbsRel/δ are the read.) **So the GPS-free route without pose-opt
