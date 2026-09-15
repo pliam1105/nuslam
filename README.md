@@ -780,6 +780,10 @@ Caveats: the van depth is **onion-layered / drifts ~1.4 m** — DA3's depth on t
 depth-supervised 3DGS** (SILog, or metric depth supervision if SILog underconstrains) to densify the van
 into a clean metric object composed into the static scene. `out/vehicle_scaledposes.rrd`.
 
+*Planned refinement:* **point-cloud registration (ICP)** on the per-frame globally-scaled van-depth
+surfaces to refine the COLMAP poses — collapsing the onion layers onto one surface — so that when the
+vehicle is placed back into the global scene through those poses it lands exactly where it should.
+
 ### Qualitative outputs
 
 Produced by the viz scripts (into the gitignored `out/`), each pose-source aware:
@@ -802,7 +806,9 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   nearest-centroid association → single-vehicle track; tuned COLMAP for the per-instance poses (DA3 fails
   on the isolated van); depth-anchor scale from the global metric depth at the van mask (no ground
   anchor). **Next:** frozen-pose depth-supervised 3DGS to densify the van into a clean metric object;
-  then multi-vehicle, and the tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
+  ICP / point-cloud registration on the per-frame globally-scaled van depth to refine the poses (collapse
+  the onion layers) so the vehicle lands correctly in the global scene; then multi-vehicle, and the
+  tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
   are already near-GT, and — now tested inside the joint ground-anchor optimization (step 5) — it is
