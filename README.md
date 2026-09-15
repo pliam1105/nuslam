@@ -707,8 +707,10 @@ matches the GPS route on metric depth — no GPS, no GT.**
 Rerun views of the no-pose-opt reconstruction (levelled Z-up frame; **green = estimated trajectory,
 blue = GT** — the fixed pre-alignment poses track GT, the two lines overlap):
 
-<p align="center"><img src="docs/step5_nopose_rrd_1.png" width="90%" alt="no-pose-opt Gaussian reconstruction with estimate (green) and GT (blue) trajectories overlapping along the road"></p>
-<p align="center"><img src="docs/step5_nopose_rrd_2.png" width="90%" alt="close-up of the reconstructed road surface, estimate and GT trajectories hugging each other"></p>
+<p align="center">
+  <img src="docs/step5_nopose_rrd_1.png" width="49%" alt="no-pose-opt Gaussian reconstruction with estimate (green) and GT (blue) trajectories overlapping along the road"/>
+  <img src="docs/step5_nopose_rrd_2.png" width="49%" alt="close-up of the reconstructed road surface, estimate and GT trajectories hugging each other"/>
+</p>
 <p align="center"><sub>The Gaussian scene along the drive (overview + close-up); the estimate hugs GT. The spiky floaters in the denser ~1M-Gaussian model are what inflate the depth-vs-LiDAR RMSE while the robust scale/AbsRel/δ stay strong.</sub></p>
 
 Flythrough — no-pose-opt run, rendered along the fixed (true) trajectory (`docs/step5-full-silog-nopose_flythrough.mp4`):
