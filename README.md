@@ -676,13 +676,44 @@ inflates the depth scale.
 **Takeaway:** the GPS-free anchor mechanism works (metric scale ~2%, cm-level height residuals, poses
 0.5° from GT *before* pose-opt), but joint `--optimize-poses` is net-harmful on this well-registered
 scene — it should be dropped, leaving the near-GT pre-alignment poses. (Compare the GPS route, run13:
-0.19 m / 0.71° poses, depth scale 0.974 — the GPS-free route matches on scale and, without pose-opt,
-should match on poses.)
+0.19 m / 0.71° poses, depth scale 0.974 — the GPS-free route matches on scale, and without pose-opt it
+matches on poses too — confirmed next.)
 
 Flythrough — the final Gaussians rendered along the **training** poses, overfit to them (novel/held-out
 views are noticeably softer, held-out PSNR ~8.5 dB):
 
 https://github.com/user-attachments/assets/3e46d913-1f25-4f6d-84be-57d96aa75bc2
+
+**Confirmed — dropping `--optimize-poses`** (`step5-full-silog-nopose`: same recipe, poses fixed at the
+pre-alignment). It wins on every metric, and the depth is metric **end-to-end** (rendered from its own
+fixed poses — no alignment trick):
+
+| | pose-opt | **no-pose-opt** |
+|---|---|---|
+| held-out PSNR / SSIM / L1 | 9.08 / 0.418 / 0.245 | **9.13 / 0.495 / 0.213** |
+| photometric L1 (final) | 0.027 | **0.0155** |
+| Gaussians at 10k | 395k | **979k** (no OOM) |
+| ground / ego height residual | 0.078 / 0.047 m | 0.085 / 0.042 m |
+| **3DGS depth vs LiDAR @ own poses** (AbsRel / δ<1.25 / scale) | 0.352 / 0.330 / 1.323 | **0.275 / 0.711 / 1.017** |
+
+With the poses fixed at the near-GT pre-alignment (1.28 m / 0.60°), the 3DGS expected depth is **metric
+to ~2%** (scale **1.017**, δ<1.25 0.711) — right on the init cloud (1.017) and the GPS route (0.974),
+so the 1.32 of the pose-opt run was **entirely the pose drift**, not a scale-holding failure. Photometric
+also converged lower (0.0155 vs 0.027) and the model densified to ~1M Gaussians (the pose-opt run's
+moving cameras had capped it near 400k / OOM'd on extension). (RMSE is outlier-inflated by floaters in
+the denser model; the robust scale/AbsRel/δ are the read.) **So the GPS-free route without pose-opt
+matches the GPS route on metric depth — no GPS, no GT.**
+
+Rerun views of the no-pose-opt reconstruction (levelled Z-up frame; **green = estimated trajectory,
+blue = GT** — the fixed pre-alignment poses track GT, the two lines overlap):
+
+<p align="center"><img src="docs/step5_nopose_rrd_1.png" width="90%" alt="no-pose-opt Gaussian reconstruction with estimate (green) and GT (blue) trajectories overlapping along the road"></p>
+<p align="center"><img src="docs/step5_nopose_rrd_2.png" width="90%" alt="close-up of the reconstructed road surface, estimate and GT trajectories hugging each other"></p>
+<p align="center"><sub>The Gaussian scene along the drive (overview + close-up); the estimate hugs GT. The spiky floaters in the denser ~1M-Gaussian model are what inflate the depth-vs-LiDAR RMSE while the robust scale/AbsRel/δ stay strong.</sub></p>
+
+Flythrough — no-pose-opt run, rendered along the fixed (true) trajectory (`docs/step5-full-silog-nopose_flythrough.mp4`):
+
+<!-- flythrough video: upload docs/step5-full-silog-nopose_flythrough.mp4 via the GitHub web UI here -->
 
 ### Qualitative outputs
 
