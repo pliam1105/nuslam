@@ -718,7 +718,7 @@ blue = GT** — the fixed pre-alignment poses track GT, the two lines overlap):
 
 Flythrough — no-pose-opt run, rendered along the fixed (true) trajectory (`docs/step5-full-silog-nopose_flythrough.mp4`):
 
-<!-- flythrough video: upload docs/step5-full-silog-nopose_flythrough.mp4 via the GitHub web UI here -->
+https://github.com/user-attachments/assets/954b47e7-35c5-47ad-9289-b7372ed5fecc
 
 ### Qualitative outputs
 
