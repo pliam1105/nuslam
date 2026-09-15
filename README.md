@@ -720,6 +720,66 @@ Flythrough — no-pose-opt run, rendered along the fixed (true) trajectory (`doc
 
 https://github.com/user-attachments/assets/954b47e7-35c5-47ad-9289-b7372ed5fecc
 
+### Dynamic vehicles — per-instance reconstruction (GPS-free, anchor-free)
+
+The static pipeline masks moving vehicles out; this reintroduces the tracked ones as posed per-instance
+reconstructions composed back into the metric scene (the Roadmap's dynamic-objects step, as a proof of
+concept). No GPS, and — unlike the static scene — **no ground anchor** for the vehicle.
+
+**1. Per-frame instances + association.** SAM3 is an instance segmenter, but the static cache *unions*
+the instances, so `Sam3Segmenter.segment_instances` keeps them separate. Instances are linked
+frame-to-frame by **greedy nearest-centroid association**: globally take the closest (track, instance)
+centroid pair under a pixel threshold, remove both, recompute, repeat; unmatched instances seed new
+tracks. On scene-0061 (2 Hz keyframes → large inter-frame motion) this recovers a clean **39-frame
+single-vehicle track** for the leading van, verified single-identity by smooth centroid + area
+(frame-to-frame area ratio 0.87–1.25, centroid steps < 112 px). *Future: optical-flow-**predicted**
+centroid instead of the previous frame's, Hungarian assignment, OpenCV trackers.*
+
+**2. Per-instance geometry — two experiments.** The van is small, low-texture, reflective:
+
+| method | registration | far→near depth (truth 5.9×) | object-centric |
+|---|---|---|---|
+| DA3 on crop | — | 2.3× (collapsed) | no (wrong scale) |
+| DA3 on masked full frame | — | 2.0× (collapsed) | fragmented |
+| **COLMAP (tuned)** | **35/35, 1.35 px** | **4.9×** | **yes** |
+
+**DA3 fails on the isolated van.** It is intrinsic-agnostic (estimates its own `K`) and trained on
+coherent-camera scenes, so a per-frame crop is out-of-distribution: with the apparent-size cue removed
+and parallax already small at distance, it reads every frame as a close-up and **collapses the far→near
+depth** (2.3× vs the true 5.9× the *full-scene* recon recovers). Masking the full frame is no better —
+starved of context it fragments. **COLMAP works once tuned** like the static scene (known `K` held
+fixed, 20 k features, SIFT peak 0.0067→0.001 for the smooth surface, relaxed mapper): 3/35 → **35/35
+images**, and known-`K` triangulation recovers the correct **4.9×** far→near. COLMAP is the per-instance
+workhorse; DA3-per-instance is dropped.
+
+**3. Metric scale — a depth anchor (no ground plane).** COLMAP's reconstruction is up-to-scale, and the
+vehicle has no ground anchor, so scale is transferred from the **global metric scene's depth at the
+van's own mask pixels**: for every COLMAP point seen in a frame, its COLMAP depth `z_col` (point z in
+that camera) is compared to the global metric depth `z_glob` at its projected pixel, and
+`s = median(z_glob / z_col)` — one scalar, matching COLMAP's one-DoF ambiguity (9 452 observations,
+`s = 0.0804`). *Not* a pose anchor: the van moves, so there is no single Sim(3) between COLMAP's
+van-static frame and the world — only depth is frame-invariant. The scaled van comes out ≈ **2.3 m wide
+× 1.5 m tall** — correct van proportions.
+
+**4. Composition.** Bringing the van's global-depth surface into the scaled COLMAP frame via those poses,
+the 35 frames' surfaces **align into one van** — the verification that scale + poses are consistent (a
+wrong scale would fan the frames apart in depth). The frustums trace the ego arc approaching the
+near-stationary van:
+
+<p align="center"><img src="docs/vehicle_composed_overview.png" width="90%" alt="35 scaled COLMAP camera frustums tracing the ego arc, van global-depth surface at the near end"></p>
+<p align="center"><sub>Scaled COLMAP camera poses (red frustums, 35 frames) + the van's global-depth surface (coloured by frame). The ego arc approaches the near-stationary van.</sub></p>
+<p align="center">
+  <img src="docs/vehicle_van_depth.png" width="49%" alt="van global-depth surface coloured by frame, onion-layered but aligned"/>
+  <img src="docs/vehicle_colmap_sparse.png" width="49%" alt="sparse COLMAP van points instead of the global depth"/>
+</p>
+<p align="center"><sub>Left: the van's global-depth surface, coloured by frame — the per-frame surfaces align (onion-layered, ~1.4 m centroid drift). Right: the same view with COLMAP's own sparse points instead.</sub></p>
+
+Caveats: the van depth is **onion-layered / drifts ~1.4 m** — DA3's depth on the van itself is noisy
+(reflective, moving) and the COLMAP poses carry some error — and the raw cloud needs outlier trimming
+(currently a blunt percentile box). The **scale is sound**; the next step is **frozen-pose
+depth-supervised 3DGS** (SILog, or metric depth supervision if SILog underconstrains) to densify the van
+into a clean metric object composed into the static scene. `out/vehicle_scaledposes.rrd`.
+
 ### Qualitative outputs
 
 Produced by the viz scripts (into the gitignored `out/`), each pose-source aware:
@@ -737,8 +797,12 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   the range mask darkens the well-observed mid-distance, so the next step is to keep the mean-space
   prune (which holds the model to ~278k in-scene Gaussians at no quality cost) while loosening or
   dropping the pixel mask, so the mid-distance stays supervised. Consider a low-opacity prune too.
-- Dynamic objects — vehicles are already masked out of the loss and init (SAM3); the next step is
-  reconstructing them as posed per-instance Gaussians composed back onto the static scene.
+- Dynamic objects — reconstructing the masked-out vehicles as posed per-instance objects composed back
+  onto the static scene. **Built so far** (see "Dynamic vehicles"): SAM3 per-instance masks + greedy
+  nearest-centroid association → single-vehicle track; tuned COLMAP for the per-instance poses (DA3 fails
+  on the isolated van); depth-anchor scale from the global metric depth at the van mask (no ground
+  anchor). **Next:** frozen-pose depth-supervised 3DGS to densify the van into a clean metric object;
+  then multi-vehicle, and the tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
   are already near-GT, and — now tested inside the joint ground-anchor optimization (step 5) — it is
