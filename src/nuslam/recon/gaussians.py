@@ -151,6 +151,7 @@ def train_gaussians(
     prune_range: float = 0.0,            # metres: prune centroids farther than this from EVERY camera
                                          # (<=0 disables the range criterion; visibility/black still apply).
     prune_every: int = 100,              # cadence (steps) of the off-scene prune. No warmup: starts at step 0.
+    cap_max: int = 5_000_000,            # MCMC densification cap (max Gaussians); lower for a single object.
 ):
     """Fit the Gaussians to the images and return the optimized set.
 
@@ -251,7 +252,7 @@ def train_gaussians(
         optim_quaternions = torch.optim.Adam([quaternions], lr=lr_for["pose_quats"])
 
     # auto-densification strategy
-    strategy = gsplat.MCMCStrategy(cap_max=5_000_000)
+    strategy = gsplat.MCMCStrategy(cap_max=cap_max)
     strategy.check_sanity(params, optimizers)
     state = strategy.initialize_state()
 

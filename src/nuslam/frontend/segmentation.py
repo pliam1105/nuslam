@@ -163,6 +163,47 @@ class Sam3Segmenter:
         log.info("SAM3 segmented %d keyframes ('%s')", len(keyframes), self.config.prompt)
         return out
 
+    def segment_instances(
+        self, keyframes: Sequence[Keyframe]
+    ) -> list[tuple[str, np.ndarray, np.ndarray]]:
+        """Per-keyframe SAM3 instances (not unioned): ``(token, masks (N,H,W) bool, scores (N,))``.
+
+        Same inference as :meth:`segment_scene` but keeps every above-threshold instance separate,
+        for frame-to-frame association of dynamic objects.
+        """
+        self._ensure_loaded()
+        import torch
+        from PIL import Image
+
+        out: list[tuple[str, np.ndarray, np.ndarray]] = []
+        for kf in keyframes:
+            rgb = np.asarray(kf.image())
+            h, w = rgb.shape[:2]
+            inputs = self._processor(
+                images=Image.fromarray(rgb), text=self.config.prompt, return_tensors="pt"
+            ).to(self._device)
+            with torch.no_grad():
+                res = self._processor.post_process_instance_segmentation(
+                    self._model(**inputs),
+                    threshold=self.config.threshold,
+                    mask_threshold=self.mask_threshold,
+                    target_sizes=[(h, w)],
+                )[0]
+            m, s = res["masks"], res.get("scores")
+            if m is None or len(m) == 0:
+                masks = np.zeros((0, h, w), dtype=bool)
+                scores = np.zeros((0,), dtype=np.float32)
+            else:
+                masks = m.cpu().numpy().astype(bool)
+                scores = (
+                    s.cpu().numpy().astype(np.float32)
+                    if s is not None
+                    else np.ones(len(masks), dtype=np.float32)
+                )
+            out.append((kf.token, masks, scores))
+        log.info("SAM3 instance-segmented %d keyframes ('%s')", len(keyframes), self.config.prompt)
+        return out
+
     def release(self) -> None:
         """Drop the model/processor and free GPU memory (call before a training run)."""
         import torch
