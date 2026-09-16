@@ -102,8 +102,8 @@ reconstruction by minimizing two residual families that both read only the *tran
 $$r^{\text{ground}}_i = e_z^{\top}(sRp_i + t),\qquad r^{\text{cam}}_j = e_z^{\top}(sRc_j + t) - h$$
 
 over the road-segmented points $\{p_i\}$ and the camera centres $\{c_j\}$. This is the same
-height-residual scale disambiguation as the Theseus DEM tutorial, with the DEM degenerate to one
-plane.
+height-residual scale disambiguation as a DEM (digital-elevation-model) alignment, with the DEM
+degenerate to one plane.
 
 **Only 4 of the 7 DoF are observable.** $e_z^{\top}$ keeps only the third row of $sR$ and the third
 component of $t$, so the residuals depend on the transform through the up-direction $R^{\top}e_z$
@@ -847,11 +847,11 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   anchor); **frozen-pose 3DGS** on the masked van (SILog + absolute-depth variants) → a metric van that
   renders from held-out views; and the van **composited into the static-scene 3DGS**, both rendered
   together along the ego trajectory with the vehicle transformed per frame (`vehicle_in_scene.mp4`) —
-  the loop closed. **Next:** ICP / point-cloud registration on the per-frame globally-scaled van depth to
-  refine the poses (collapse the onion layers) so the van lands even tighter; a **genuinely moving**
-  second vehicle (this van is ~stationary, so the per-frame placement doesn't yet show real object
-  motion); a denser/cleaner van reconstruction and taming the sky→black artifact; then multi-vehicle,
-  and the tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
+  the loop closed — the van moving along the road is placed per frame, so the composition shows its real
+  motion through the static scene. **Next:** ICP / point-cloud registration on the per-frame
+  globally-scaled van depth to refine the poses (collapse the onion layers) so the van lands even
+  tighter; a denser/cleaner van reconstruction and taming the sky→black artifact; then multiple
+  simultaneous vehicles, and the tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
   are already near-GT, and — now tested inside the joint ground-anchor optimization (step 5) — it is
