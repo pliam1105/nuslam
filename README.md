@@ -801,9 +801,23 @@ by DA3's noisy van-depth *target*, not the fit. The trained van as Gaussian spla
 </p>
 
 `out/vehicle_gs.{npz,rrd}` + `vehicle_gs_flythrough.mp4` (SILog), and `out/vehicle_gs_depth.{npz,rrd}` +
-`vehicle_gs_depth_flythrough.mp4` (abs-depth). This is the dynamic-vehicle proof of concept end to end:
-association → tuned COLMAP poses → depth-anchor scale → frozen-pose 3DGS → a metric vehicle ready to
-compose into the static scene.
+`vehicle_gs_depth_flythrough.mp4` (abs-depth).
+
+**6. Composed into the static scene.** The trained van 3DGS is composited into the static-scene 3DGS
+(the no-pose run's `gs_final`, 979k Gaussians) by bridging their two coordinate frames **through the
+shared ego cameras**: `T_i = pose_scene[i] · diag(anchor_scale) · pose_van[i]⁻¹` maps the van (its own
+scaled-COLMAP frame) into the anchored scene frame, per frame. Both are then rasterized together along
+the ego trajectory, with the camera **and** the van's local trajectory interpolated so the van moves
+smoothly and stays composited every frame:
+
+<p align="center"><img src="docs/vehicle_in_scene.png" width="98%" alt="dynamic van 3DGS composited into the static-scene 3DGS, far to near as the ego approaches"></p>
+
+<!-- vehicle-in-scene video: upload docs/vehicle_in_scene.mp4 via the GitHub web UI here -->
+
+This closes the dynamic-vehicle loop end to end — association → tuned COLMAP poses → depth-anchor scale
+(no ground anchor) → frozen-pose 3DGS → a metric vehicle **composited back into the metric static scene
+and moving through it**, all monocular and GPS-free. (`out/vehicle_in_scene.mp4`. Residual artifacts —
+the dark sky→black blob and some van softness — are inherited from the underlying reconstructions.)
 
 *Planned refinement:* **point-cloud registration (ICP)** on the per-frame globally-scaled van-depth
 surfaces to refine the COLMAP poses — collapsing the onion layers onto one surface — so that when the
