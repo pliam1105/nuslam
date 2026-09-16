@@ -844,12 +844,14 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   onto the static scene. **Built so far** (see "Dynamic vehicles"): SAM3 per-instance masks + greedy
   nearest-centroid association → single-vehicle track; tuned COLMAP for the per-instance poses (DA3 fails
   on the isolated van); depth-anchor scale from the global metric depth at the van mask (no ground
-  anchor); and **frozen-pose 3DGS** on the masked van (SILog + absolute-depth variants) → a metric van
-  that renders from held-out views. **Next:** compose the trained van into the static-scene 3DGS and
-  render both together with the vehicle transformed per frame; ICP / point-cloud registration on the
-  per-frame globally-scaled van depth to refine the poses (collapse the onion layers) so the vehicle
-  lands correctly in the global scene; then multi-vehicle, and the
-  tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
+  anchor); **frozen-pose 3DGS** on the masked van (SILog + absolute-depth variants) → a metric van that
+  renders from held-out views; and the van **composited into the static-scene 3DGS**, both rendered
+  together along the ego trajectory with the vehicle transformed per frame (`vehicle_in_scene.mp4`) —
+  the loop closed. **Next:** ICP / point-cloud registration on the per-frame globally-scaled van depth to
+  refine the poses (collapse the onion layers) so the van lands even tighter; a **genuinely moving**
+  second vehicle (this van is ~stationary, so the per-frame placement doesn't yet show real object
+  motion); a denser/cleaner van reconstruction and taming the sky→black artifact; then multi-vehicle,
+  and the tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
   are already near-GT, and — now tested inside the joint ground-anchor optimization (step 5) — it is
