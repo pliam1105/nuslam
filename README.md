@@ -812,7 +812,7 @@ smoothly and stays composited every frame:
 
 <p align="center"><img src="docs/vehicle_in_scene.png" width="98%" alt="dynamic van 3DGS composited into the static-scene 3DGS, far to near as the ego approaches"></p>
 
-<!-- vehicle-in-scene video: upload docs/vehicle_in_scene.mp4 via the GitHub web UI here -->
+https://github.com/user-attachments/assets/b8e293aa-30f3-49c8-8066-9cbd32bb1fac
 
 This closes the dynamic-vehicle loop end to end — association → tuned COLMAP poses → depth-anchor scale
 (no ground anchor) → frozen-pose 3DGS → a metric vehicle **composited back into the metric static scene
