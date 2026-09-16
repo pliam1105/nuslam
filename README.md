@@ -776,9 +776,34 @@ near-stationary van:
 
 Caveats: the van depth is **onion-layered / drifts ~1.4 m** — DA3's depth on the van itself is noisy
 (reflective, moving) and the COLMAP poses carry some error — and the raw cloud needs outlier trimming
-(currently a blunt percentile box). The **scale is sound**; the next step is **frozen-pose
-depth-supervised 3DGS** (SILog, or metric depth supervision if SILog underconstrains) to densify the van
-into a clean metric object composed into the static scene. `out/vehicle_scaledposes.rrd`.
+(currently a blunt percentile box). The **scale is sound** — enough to seed the 3DGS below.
+`out/vehicle_scaledposes.rrd`.
+
+**5. Frozen-pose 3DGS (per-instance object).** With the scaled COLMAP poses **frozen** and the scaled
+COLMAP points as the seed, a per-instance 3DGS is fit on the masked-van images (the author's
+`train_gaussians`, `cap_max=100k`, batch 10): the van's global metric depth at the mask supervises the
+rendered depth, the black background is supervised toward black (the sky→black term) and blank-area
+pruned, and there's **no range mask** (everything off the van is blank). The result is a **metric van
+that renders from held-out views**:
+
+<p align="center"><img src="docs/vehicle_gs_render.png" width="95%" alt="target (top) vs 3DGS render (bottom) for held-out and train views of the van"></p>
+<p align="center"><sub>Target (top) vs render (bottom), held-out (f4/f12/f20) + train views — novel-view generalization on the metric van.</sub></p>
+
+Two supervision variants: **SILog** depth (scale-invariant) → 2,831 Gaussians with some floater streaks;
+**absolute metric-depth L1 + 10× black weight** → 3,528 Gaussians, floaters cleared and a touch crisper.
+Post-hoc rendered-depth-vs-target L1 is ~1.2 m (abs-depth) vs ~1.3 m (SILog) — the residual is dominated
+by DA3's noisy van-depth *target*, not the fit. The trained van as Gaussian splats + the frozen frustums
+(SILog left, abs-depth right):
+
+<p align="center">
+  <img src="docs/vehicle_gs_silog_rrd.png" width="49%" alt="SILog-trained van 3DGS splats with frozen camera frustums"/>
+  <img src="docs/vehicle_gs_depth_rrd.png" width="49%" alt="absolute-depth-trained van 3DGS splats, floaters cleared"/>
+</p>
+
+`out/vehicle_gs.{npz,rrd}` + `vehicle_gs_flythrough.mp4` (SILog), and `out/vehicle_gs_depth.{npz,rrd}` +
+`vehicle_gs_depth_flythrough.mp4` (abs-depth). This is the dynamic-vehicle proof of concept end to end:
+association → tuned COLMAP poses → depth-anchor scale → frozen-pose 3DGS → a metric vehicle ready to
+compose into the static scene.
 
 *Planned refinement:* **point-cloud registration (ICP)** on the per-frame globally-scaled van-depth
 surfaces to refine the COLMAP poses — collapsing the onion layers onto one surface — so that when the
@@ -805,9 +830,11 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   onto the static scene. **Built so far** (see "Dynamic vehicles"): SAM3 per-instance masks + greedy
   nearest-centroid association → single-vehicle track; tuned COLMAP for the per-instance poses (DA3 fails
   on the isolated van); depth-anchor scale from the global metric depth at the van mask (no ground
-  anchor). **Next:** frozen-pose depth-supervised 3DGS to densify the van into a clean metric object;
-  ICP / point-cloud registration on the per-frame globally-scaled van depth to refine the poses (collapse
-  the onion layers) so the vehicle lands correctly in the global scene; then multi-vehicle, and the
+  anchor); and **frozen-pose 3DGS** on the masked van (SILog + absolute-depth variants) → a metric van
+  that renders from held-out views. **Next:** compose the trained van into the static-scene 3DGS and
+  render both together with the vehicle transformed per frame; ICP / point-cloud registration on the
+  per-frame globally-scaled van depth to refine the poses (collapse the onion layers) so the vehicle
+  lands correctly in the global scene; then multi-vehicle, and the
   tracking upgrades (flow-predicted centroid, Hungarian, OpenCV trackers).
 - Pose refinement — built (`--optimize-poses`, recentered frame, first-pose anchor, pose logging +
   `pose_snapshots/`; see Results). On this scene it adds little because the GPS-anchored COLMAP poses
