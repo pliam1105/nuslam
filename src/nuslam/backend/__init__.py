@@ -15,24 +15,32 @@ plumbing and is complete.
 """
 from .sim3_graph import (
     Sim3GraphInputs,
-    Submap,
     SubmapGraphInputs,
+    SubmapOverlap,
+    SubmapRecon,
     build_sim3_graph,
     build_submap_graph,
     prepare_sim3_inputs,
     prepare_submap_inputs,
+    run_submap_colmap,
     solve,
     solve_incremental,
+    submap_daq,
+    submap_world_poses,
 )
 
 __all__ = [
     "Sim3GraphInputs",
     "prepare_sim3_inputs",
     "build_sim3_graph",
-    "Submap",
+    "SubmapRecon",
+    "SubmapOverlap",
     "SubmapGraphInputs",
     "prepare_submap_inputs",
+    "run_submap_colmap",
+    "submap_daq",
     "build_submap_graph",
+    "submap_world_poses",
     "solve",
     "solve_incremental",
 ]

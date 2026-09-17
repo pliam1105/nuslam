@@ -13,7 +13,10 @@
 gsplat>=1.5
 
 # --- factor-graph backend (staged extension, see CLAUDE.md s8) ---
-gtsam>=4.2                 # GTSAM / ISAM2, for the later factor-graph integration
+# 4.3 develop pre-release, NOT the 4.2 release: only 4.3 wraps Similarity3 as an
+# optimizable/Values-storable variable + PriorFactorSimilarity3 / BetweenFactorSimilarity3
+# (the §14 Sim(3) graph needs these). An exact ==pre specifier installs it without --pre.
+gtsam==4.3a1               # GTSAM / ISAM2 + Similarity3 factors, for the §14 factor graph
 
 # --- data ---
 nuscenes-devkit>=1.1.11    # nuScenes tables, calibration, CAN-bus expansion

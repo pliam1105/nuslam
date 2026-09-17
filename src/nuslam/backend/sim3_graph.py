@@ -1,31 +1,39 @@
 """§14 — unifying COLMAP and DA3 in one Sim(3) factor graph.
 
     ############################################################################
-    #  The FACTOR DESIGN is core estimator substance (CLAUDE.md §3 + §8):      #
-    #  the Sim(3) variables + rho scalar, the custom ground-anchor and         #
-    #  ego-on-ground residuals and their JACOBIANS, the COLMAP-relative and    #
-    #  depth-ratio measurements, and the graph connectivity are DERIVED AND    #
-    #  WRITTEN BY THE AUTHOR here -- NOT generated. This file provides only:    #
-    #    (a) the input contract `Sim3GraphInputs` and its plumbing prep, and    #
-    #    (b) the graph-build / solve HARNESS with the factors left as stubs.    #
+    #  The metric-anchor FACTOR DESIGN is core estimator substance (CLAUDE.md  #
+    #  §3 + §8): the custom ground-anchor and ego-on-ground residuals and their #
+    #  JACOBIANS (the scale-resolution geometry) are DERIVED AND WRITTEN BY THE  #
+    #  AUTHOR -- NOT generated. The generic factors (gauge, COLMAP-relative,     #
+    #  depth-ratio) are STOCK gtsam factors; this file wires them + the noise    #
+    #  knobs, provides the input contracts + prep, and leaves the two custom     #
+    #  anchor factors (backend.factors) as stubs.                               #
     ############################################################################
 
-GTSAM in this build exposes ``Similarity3`` and ``CustomFactor`` but NOT the
-templated ``BetweenFactorSimilarity3`` / ``PriorFactorSimilarity3`` -- so every
-§14.4 factor (gauge prior, COLMAP-relative, depth-ratio, ground-anchor,
-ego-on-ground) is written as a ``CustomFactor`` (residual + Jacobians into the
-passed ``H`` list). Variable layout follows §14.2/§14.3:
+gtsam>=4.3 wraps ``Similarity3`` as a first-class Values-storable / optimizable variable AND the
+templated ``PriorFactorSimilarity3`` / ``BetweenFactorSimilarity3`` (the 4.2 RELEASE wheel does NOT --
+requirements.txt pins the 4.3 pre-release). So the generic §14.4 factors are STOCK, and only the
+metric anchor is custom. Variable layout (§14.2/§14.3):
 
-    H_i = Similarity3(s_i, R_i, t_i)   per keyframe   -- s_i: COLMAP units -> metres
-    rho = log r_m                      one scalar     -- r_m: DA3 depth -> COLMAP units
+    H_i = Similarity3(R_i, t_i, s_i)   per keyframe   -- s_i: COLMAP units -> metres
+    rho = log r_m                      scalar(s)      -- r_m: DA3 depth -> COLMAP units (one per submap)
+
+    gauge prior      -> PriorFactorSimilarity3(H_0, init)                        (stock)
+    COLMAP relative  -> BetweenFactorSimilarity3(H_{i-1}, H_i, (rel_R,rel_t,1))  (stock; the Sim(3)
+                        between H_{i-1}^{-1}H_i carries the scale-coupled translation + scale
+                        constancy s_i=s_{i-1} natively)
+    depth-ratio      -> PriorFactorDouble(rho, log r_hat)                        (stock; sigma from MAD)
+    ground anchor    -> GroundAnchorSim3Factor(H_i, rho)    \  CustomFactor -- the §14 novelty,
+    ego-on-ground    -> EgoOnGroundFactor(H_i)              /  author core (backend.factors)
 
 World point (§14.3):  X = s_i R_i ( e^{rho} d K^{-1} u ) + t_i ,  camera centre C_i = t_i.
 
-Submap variant (§14 "DA3 runs per window"): the scene is split into overlapping windows, each
-with its OWN depth ratio rho_m; adjacent windows share cameras (shared H_i) that anchor them, and
-the incremental solve is iSAM2. `Sim3GraphInputs`/`prepare_sim3_inputs`/`build_sim3_graph` are the
-single-window version; `SubmapGraphInputs`/`prepare_submap_inputs`/`build_submap_graph`/
-`solve_incremental` are the submap version. Both keep the factors as author §3 stubs.
+Submap variant (§14 "DA3 runs per window"): overlapping windows, each with its OWN rho_m; adjacent
+windows share cameras (shared H_i) that anchor them; the incremental solve is iSAM2.
+`Sim3GraphInputs`/`prepare_sim3_inputs`/`build_sim3_graph` are single-window;
+`SubmapGraphInputs`/`prepare_submap_inputs`/`build_submap_graph`/`solve_incremental` are the submap
+version. Both wire the stock backbone; the ground-anchor/ego CustomFactors are author stubs (OFF in
+the anchor-free submap graph).
 """
 from __future__ import annotations
 
@@ -78,50 +86,61 @@ class Sim3GraphInputs:
 
 # ----------------------------------------------------------------------------- submap input contract (§14 "DA3 per window")
 @dataclass
-class Submap:
-    """One window of the scene. DA3 runs per window (§14), so each submap carries its OWN
-    COLMAP->DA3 depth-ratio r_m (its metric-up-to-scale factor) and its own slice of the DA3
-    point-cloud material. Frames are referenced by GLOBAL index into `SubmapGraphInputs.tokens`,
-    so an overlap frame is simply a frame that appears in two submaps (a SHARED camera)."""
+class SubmapRecon:
+    """One INDEPENDENTLY-reconstructed window (VGGT-SLAM 2.0 style). COLMAP and DA3 both run per
+    window, so this submap is in its OWN up-to-scale frame. Its frames are its OWN variables H^m_j
+    (an overlap frame is reconstructed in BOTH submaps -> two variables, tied by a submap-alignment
+    factor). Local index j indexes into frame_idx; global index = frame_idx[j]."""
     id: int
-    frame_idx: np.ndarray             # (n,) global frame indices into SubmapGraphInputs.tokens
-    tokens: list                      # (n,) the corresponding sample tokens
+    frame_idx: np.ndarray             # (n,) global frame indices in this window
+    tokens: list                      # (n,) sample tokens
 
-    # --- this submap's COLMAP->DA3 depth ratio (the per-window rho_m; §14.3 depth-ratio unary) ---
-    depth_ratio_median: float         # r_m = median(z_colmap / z_da3) over THIS window's COLMAP point-obs
-    depth_ratio_mad: float            # 1.4826*MAD of those ratios -> sigma for the rho_m unary
-    depth_ratio_n: int                # number of point-obs behind this window's median
+    # --- this window's COLMAP relatives (up-to-scale), for the within-submap §14.4 relative factors ---
+    rel_R: np.ndarray                 # (n-1,3,3) R_{j-1}^T R_j
+    rel_t: np.ndarray                 # (n-1,3)   R_{j-1}^T (c_j - c_{j-1}), submap-local COLMAP units
 
-    # --- DA3 metric point-cloud material per frame (strided full frame): rays + DA3 depths (the map) ---
-    da3_rays: list                    # per-frame (Nk, 3): K^{-1} [u, v, 1]
-    da3_depths: list                  # per-frame (Nk,):   DA3 depth d (DA3 units; * r_m -> COLMAP, then H_i -> world)
+    # --- init WORLD placement of this submap's per-frame H^m_j (from the submap-chain init) ---
+    init_R: np.ndarray                # (n,3,3) camera->world rotation
+    init_t: np.ndarray                # (n,3)   camera centre
+    init_s: np.ndarray                # (n,)    scale s init (constant within a submap; author sets convention)
+
+    # --- rho_m depth-ratio (§14.3): log median(z_colmap / z_da3) within this window + robust sigma ---
+    log_r: float                      # rho_m init = log median(z_colmap / z_da3)
+    log_r_sigma: float                # 1.4826 * MAD(log ratios)  -> sigma for the rho_m unary (log-space)
+    n_ratio: int                      # number of point-obs behind it
+
+    # --- DA3 metric point-cloud material per frame (strided full frame): rays + DA3 depths ---
+    da3_rays: list                    # per-frame (Nk,3): K^{-1}[u,v,1]
+    da3_depths: list                  # per-frame (Nk,):  DA3 depth (metric-up-to-scale via this window's DAQ)
+
+
+@dataclass
+class SubmapOverlap:
+    """The shared cameras between two adjacent submaps -> the §14.4 submap-alignment factor:
+    a pure-scaling Sim(3) between-factor (s_hat, I, 0) on the shared H variables, s_hat from the
+    DA3(n)/DA3(m) depth ratio at the overlap (log-space, robust sigma)."""
+    m: int                            # first submap id
+    n: int                            # second submap id (adjacent; usually m+1)
+    shared_frame_idx: np.ndarray      # (k,) global frame indices shared by both
+    m_local: np.ndarray               # (k,) local indices of the shared frames within submap m
+    n_local: np.ndarray               # (k,) local indices within submap n
+    log_s: float                      # log median DA3(n)/DA3(m) at the overlap  (the pure-scaling measurement)
+    log_s_sigma: float                # 1.4826 * MAD(log ratios)  -> sigma for the alignment factor
 
 
 @dataclass
 class SubmapGraphInputs:
-    """Factor-ready inputs for the SUBMAP §14 graph: a global per-frame initialization + global
-    consecutive COLMAP relatives (one per pair — a shared frame's relative is NOT double-counted),
-    plus the submap partition, its per-window depth ratios, and the overlap (shared-camera) bookkeeping
-    that anchors adjacent submaps. Absolute metric scale is left as the free gauge (no ground anchor in
-    this part). All §4 plumbing; produced by :func:`prepare_submap_inputs`."""
-    tokens: list                      # all N frames, graph order
+    """Factor-ready inputs for the SUBMAP §14 graph (VGGT-SLAM 2.0 style): a list of independently-
+    reconstructed submaps (each with its own per-frame H variables + rho_m) and the overlap graph that
+    aligns them by pure scaling. Absolute metric scale is left UNCONSTRAINED (no ground anchor here;
+    §14.5/§14.6) -- verify the log-scale gauge freedom afterwards. §4 plumbing; from
+    :func:`prepare_submap_inputs`."""
+    tokens: list                      # all N distinct frames, graph order (for reference/eval)
     K: np.ndarray                     # (3,3) true intrinsics
     sensor2ego: np.ndarray            # (4,4) camera->ego extrinsic
-    cam_height: float                 # sensor2ego[2,3] (carried for later; unused while ground anchor is off)
-
-    # --- global per-frame init for H_i (from the aligned COLMAP poses; consistent starting point) ---
-    init_R: np.ndarray                # (N,3,3) camera->world rotation
-    init_t: np.ndarray                # (N,3)   camera centre
-    init_s: np.ndarray                # (N,)    scale s_i init (ones; author sets the convention, as in Sim3GraphInputs)
-
-    # --- global consecutive COLMAP relatives (§14.4 relative-pose factor; one per (i-1,i) pair) ---
-    colmap_rel_R: np.ndarray          # (N-1,3,3) R_{i-1}^T R_i
-    colmap_rel_t: np.ndarray          # (N-1,3)   R_{i-1}^T (c_i - c_{i-1})
-
-    # --- the submap decomposition + overlap graph ---
-    submaps: list                     # list[Submap], in order; each frame's rho is its submap's depth_ratio
-    frame_submaps: list               # per-frame list of submap ids the frame belongs to (2 => a shared camera)
-    overlaps: list                    # list of (m, n, shared_frame_idx (k,) global) for each overlapping submap pair
+    cam_height: float                 # sensor2ego[2,3] (for the ego anchor later)
+    submaps: list                     # list[SubmapRecon]
+    overlaps: list                    # list[SubmapOverlap]
 
     @property
     def n_frames(self) -> int: return len(self.tokens)
@@ -130,15 +149,15 @@ class SubmapGraphInputs:
 
     def save(self, path):
         sm = np.array([dict(id=s.id, frame_idx=s.frame_idx, tokens=np.array(s.tokens),
-                            depth_ratio_median=s.depth_ratio_median, depth_ratio_mad=s.depth_ratio_mad,
-                            depth_ratio_n=s.depth_ratio_n,
+                            rel_R=s.rel_R, rel_t=s.rel_t, init_R=s.init_R, init_t=s.init_t, init_s=s.init_s,
+                            log_r=s.log_r, log_r_sigma=s.log_r_sigma, n_ratio=s.n_ratio,
                             da3_rays=np.array(s.da3_rays, dtype=object), da3_depths=np.array(s.da3_depths, dtype=object))
                        for s in self.submaps], dtype=object)
-        ov = np.array([(m, n, idx) for (m, n, idx) in self.overlaps], dtype=object)
+        ov = np.array([dict(m=o.m, n=o.n, shared_frame_idx=o.shared_frame_idx, m_local=o.m_local,
+                            n_local=o.n_local, log_s=o.log_s, log_s_sigma=o.log_s_sigma)
+                       for o in self.overlaps], dtype=object)
         np.savez(str(path), tokens=np.array(self.tokens), K=self.K, sensor2ego=self.sensor2ego,
-                 cam_height=self.cam_height, init_R=self.init_R, init_t=self.init_t, init_s=self.init_s,
-                 colmap_rel_R=self.colmap_rel_R, colmap_rel_t=self.colmap_rel_t, submaps=sm,
-                 frame_submaps=np.array(self.frame_submaps, dtype=object), overlaps=ov)
+                 cam_height=self.cam_height, submaps=sm, overlaps=ov)
 
 
 # ----------------------------------------------------------------------------- input prep (§4 plumbing, complete)
@@ -225,18 +244,80 @@ def _windows(n: int, window: int, step: int) -> list:
     return [np.arange(a, min(a + window, n)) for a in sorted(set(starts))]
 
 
+def _log_ratio_stats(ratios) -> tuple:
+    """(log-median, robust log-sigma, n) for positive ratios: sigma = 1.4826*MAD(log r) (§14.3, log-space)."""
+    r = np.asarray([x for x in ratios if x > 0], np.float64)
+    if r.size == 0: return 0.0, 1.0, 0
+    lr = np.log(r); med = float(np.median(lr))
+    sig = float(1.4826 * np.median(np.abs(lr - med)))
+    return med, max(sig, 1e-3), int(r.size)
+
+
+def run_submap_colmap(kfs_window, sky, veh, K, work_dir):
+    """Masked COLMAP SfM on ONE window -- no GPS/global alignment, so the window is in its OWN
+    up-to-scale frame (VGGT-SLAM style independence). Returns {local_j: cam->world (4x4, up-to-scale)}
+    for the registered frames + the pycolmap Reconstruction. This is the SLOW per-submap step; call it
+    when ready (short forward-driving windows can under-register -- see the endpoint windows)."""
+    import pycolmap
+    from PIL import Image
+    work = Path(work_dir); (work / "images").mkdir(parents=True, exist_ok=True); (work / "masks").mkdir(exist_ok=True)
+    for j, kf in enumerate(kfs_window):
+        Image.fromarray(np.asarray(kf.image())).save(work / "images" / f"{j:03d}.png")
+        keep = ~(sky[kf.token] | veh[kf.token])
+        Image.fromarray((keep.astype(np.uint8) * 255)).save(work / "masks" / f"{j:03d}.png.png")
+    db = work / "database.db"
+    if db.exists(): db.unlink()
+    ropts = pycolmap.ImageReaderOptions(); ropts.mask_path = str(work / "masks")
+    ropts.camera_model = "PINHOLE"; ropts.camera_params = f"{K[0,0]},{K[1,1]},{K[0,2]},{K[1,2]}"
+    eopts = pycolmap.FeatureExtractionOptions(); eopts.sift.max_num_features = 12000
+    pycolmap.extract_features(db, work / "images", camera_mode=pycolmap.CameraMode.SINGLE,
+                              reader_options=ropts, extraction_options=eopts)
+    pycolmap.match_exhaustive(db)
+    opts = pycolmap.IncrementalPipelineOptions()
+    opts.ba_refine_focal_length = opts.ba_refine_principal_point = opts.ba_refine_extra_params = False
+    opts.mapper.init_min_tri_angle = 2.0; opts.mapper.abs_pose_min_num_inliers = 15
+    (work / "sparse").mkdir(exist_ok=True)
+    maps = pycolmap.incremental_mapping(db, work / "images", work / "sparse", options=opts)
+    if not maps: return {}, None
+    rec = max(maps.values(), key=lambda r: r.num_reg_images())
+    c2w = {}
+    for im in rec.images.values():
+        j = int(im.name.rsplit(".", 1)[0]); T = np.eye(4); T[:3, :4] = im.cam_from_world().inverse().matrix()
+        c2w[j] = T
+    return c2w, rec
+
+
+def submap_daq(dep_window, tokens_window, K_true, *, m_weight: float = 1.0):
+    """Per-window DAQ metric upgrade (author core, called as infra): DA3 (K_da3, R, t) per frame ->
+    metric-up-to-scale cam->world poses. Mirrors scripts/run_metric_upgrade for one window."""
+    from ..recon import (normalized_projective_cameras, build_daq_system, solve_daq,
+                         plane_at_infinity, rectifying_homography, metric_cameras, decompose_metric_camera)
+    K_da3 = np.stack([dep_window[t].intrinsic for t in tokens_window])
+    R = np.stack([dep_window[t].extrinsic[:3, :3] for t in tokens_window])
+    t = np.stack([dep_window[t].extrinsic[:3, 3] for t in tokens_window])
+    M = np.linalg.inv(K_true) @ K_da3[0]                              # reference-camera mismatch
+    cams = normalized_projective_cameras(K_true, K_da3, R, t)
+    A = build_daq_system(cams, m_prior=(M if m_weight > 0 else None), m_weight=m_weight)
+    H = rectifying_homography(plane_at_infinity(solve_daq(A)), M)
+    poses = {}
+    for j, P in enumerate(metric_cameras(cams, H)):
+        Kj, Rj, tj = decompose_metric_camera(P); T = np.eye(4); T[:3, :3] = Rj.T; T[:3, 3] = -Rj.T @ tj
+        poses[j] = T
+    return poses
+
+
 def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/frontend_cache",
                           dataroot: str = "data/nuscenes", version: str = "v1.0-mini",
                           colmap_sparse: str = "out/colmap/sparse/0",
                           window: int = 11, step: int = 7, stride: int = 8) -> SubmapGraphInputs:
-    """Assemble the SUBMAP §14 inputs from the existing caches (pure plumbing, no estimation).
+    """Assemble the SUBMAP §14 inputs to the VGGT-SLAM-2.0 schema (per-window independent submaps).
 
-    Partitions the scene into overlapping windows, and for each window computes its OWN
-    COLMAP->DA3 median depth ratio (median of z_colmap / z_da3 over that window's COLMAP
-    point-observations) and gathers its strided full-frame DA3 point-cloud material. The
-    global per-frame init and consecutive COLMAP relatives come from the aligned COLMAP
-    poses; the overlaps are the shared cameras that anchor adjacent submaps. No ground
-    anchor here -- absolute metric scale is the free gauge the graph does not pin."""
+    NOTE: per-window COLMAP+DAQ (:func:`run_submap_colmap` / :func:`submap_daq`) are the genuine
+    per-submap reconstructions but are the SLOW step and not run here yet. For now this assembles the
+    to-spec structure from the GLOBAL caches as a STAND-IN (each submap = the global reconstruction
+    restricted to its window): correct schema + connectivity + per-window depth ratios, so the graph
+    builds/solves; swap in the per-window runners for true independence (the overlap log_s then becomes
+    the real DA3(n)/DA3(m) ratio instead of ~0). Pure plumbing, no estimation."""
     import pycolmap
     from ..data import NuScenesMonoSource
     from ..frontend import cache
@@ -249,19 +330,15 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
     K = np.asarray(mu.K_true, np.float64); Kinv = np.linalg.inv(K)
     s2e = frames[0].calib.sensor2ego.matrix(); h = float(s2e[2, 3])
 
-    # global per-frame init + consecutive relatives from the aligned COLMAP poses
     cg = np.load(f"{cache_root}/{scene}/colmap_poses_global.npz", allow_pickle=True)
     cmap = {str(t): P for t, P in zip(cg["tokens"], cg["poses"])}
-    cpose = np.stack([cmap[t] for t in tokens]).astype(np.float64)
-    init_R = cpose[:, :3, :3].copy(); init_t = cpose[:, :3, 3].copy(); init_s = np.ones(N)
-    rel_R = np.stack([cpose[i - 1, :3, :3].T @ cpose[i, :3, :3] for i in range(1, N)])
-    rel_t = np.stack([cpose[i - 1, :3, :3].T @ (cpose[i, :3, 3] - cpose[i - 1, :3, 3]) for i in range(1, N)])
+    cpose = np.stack([cmap[t] for t in tokens]).astype(np.float64)     # STAND-IN per-window geometry
 
-    # per-token COLMAP->DA3 depth ratios (z_colmap / z_da3), from the RAW sparse vs DA3 depth
+    # per-token COLMAP->DA3 ratios (z_colmap / z_da3) from the raw sparse vs DA3 depth
     rec = pycolmap.Reconstruction(colmap_sparse)
     def img_tok(im):
-        n = im.name.rsplit(".", 1)[0]
-        return n if n in pidx else (tokens[int(n[1:])] if n[1:].isdigit() and int(n[1:]) < N else None)
+        nm = im.name.rsplit(".", 1)[0]
+        return nm if nm in pidx else (tokens[int(nm[1:])] if nm[1:].isdigit() and int(nm[1:]) < N else None)
     tok_ratios = {t: [] for t in tokens}
     for p in rec.points3D.values():
         X = np.append(p.xyz, 1.0)
@@ -269,47 +346,55 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
             im = rec.images[el.image_id]; tok = img_tok(im)
             if tok is None or tok not in tset: continue
             rig = im.cam_from_world; rig = rig() if callable(rig) else rig
-            M = np.asarray(rig.matrix()) if hasattr(rig, "matrix") else np.hstack([np.asarray(rig.rotation.matrix()), np.asarray(rig.translation)[:, None]])
-            zc = (M @ X)[2]; u, v = im.points2D[el.point2D_idx].xy; dd = dep[tok].depth
+            Mx = np.asarray(rig.matrix()) if hasattr(rig, "matrix") else np.hstack([np.asarray(rig.rotation.matrix()), np.asarray(rig.translation)[:, None]])
+            zc = (Mx @ X)[2]; u, v = im.points2D[el.point2D_idx].xy; dd = dep[tok].depth
             if zc > 1e-6 and 0 <= int(v) < dd.shape[0] and 0 <= int(u) < dd.shape[1]:
                 zg = dd[int(v), int(u)]
                 if zg > 1e-6: tok_ratios[tok].append(zc / zg)
 
-    # strided full-frame DA3 rays + depths per frame (the DA3 point-cloud material)
-    da3_rays_all, da3_depths_all = {}, {}
-    for kf in frames:
-        d = dep[kf.token].depth; H, W = d.shape
-        vv, uu = np.mgrid[0:H:stride, 0:W:stride].reshape(2, -1); z = d[vv, uu]
+    def da3_material(tok):
+        d = dep[tok].depth; Hh, Ww = d.shape
+        vv, uu = np.mgrid[0:Hh:stride, 0:Ww:stride].reshape(2, -1); z = d[vv, uu]
         keep = z > 0; vv, uu, z = vv[keep], uu[keep], z[keep]
-        da3_rays_all[kf.token] = ((Kinv @ np.stack([uu, vv, np.ones_like(uu)], 0)).T).astype(np.float32)
-        da3_depths_all[kf.token] = z.astype(np.float32)
+        return ((Kinv @ np.stack([uu, vv, np.ones_like(uu)], 0)).T).astype(np.float32), z.astype(np.float32)
 
-    # build submaps over overlapping windows
-    submaps, frame_submaps = [], [[] for _ in range(N)]
-    for m, idx in enumerate(_windows(N, window, step)):
-        toks = [tokens[i] for i in idx]
-        r = np.array([x for t in toks for x in tok_ratios[t]])
-        med = float(np.median(r)) if r.size else float("nan")
-        mad = float(np.median(np.abs(r - med)) * 1.4826) if r.size else float("nan")
-        submaps.append(Submap(id=m, frame_idx=idx, tokens=toks, depth_ratio_median=med,
-                              depth_ratio_mad=mad, depth_ratio_n=int(r.size),
-                              da3_rays=[da3_rays_all[t] for t in toks],
-                              da3_depths=[da3_depths_all[t] for t in toks]))
-        for i in idx: frame_submaps[i].append(m)
+    wins = _windows(N, window, step)
+    submaps = []
+    for m, idx in enumerate(wins):
+        toks = [tokens[i] for i in idx]; P = cpose[idx]                 # stand-in world placement
+        rel_R = np.stack([P[j - 1, :3, :3].T @ P[j, :3, :3] for j in range(1, len(idx))])
+        rel_t = np.stack([P[j - 1, :3, :3].T @ (P[j, :3, 3] - P[j - 1, :3, 3]) for j in range(1, len(idx))])
+        log_r, sig, nr = _log_ratio_stats([x for t in toks for x in tok_ratios[t]])
+        mats = [da3_material(t) for t in toks]
+        submaps.append(SubmapRecon(id=m, frame_idx=idx, tokens=toks, rel_R=rel_R, rel_t=rel_t,
+                                   init_R=P[:, :3, :3].copy(), init_t=P[:, :3, 3].copy(), init_s=np.ones(len(idx)),
+                                   log_r=log_r, log_r_sigma=sig, n_ratio=nr,
+                                   da3_rays=[a for a, _ in mats], da3_depths=[b for _, b in mats]))
 
-    # overlap (shared-camera) bookkeeping for every pair of submaps that share frames
+    # overlaps: shared cameras -> submap-alignment. log_s = DA3(n)/DA3(m) ratio at the shared frames
+    # (median over shared pixels). STAND-IN uses the same global DA3 -> ~0; per-window DAQ makes it real.
     overlaps = []
     for a in range(len(submaps)):
         for b in range(a + 1, len(submaps)):
             sh = np.intersect1d(submaps[a].frame_idx, submaps[b].frame_idx)
-            if sh.size: overlaps.append((a, b, sh))
+            if not sh.size: continue
+            ma = {int(g): j for j, g in enumerate(submaps[a].frame_idx)}
+            mb = {int(g): j for j, g in enumerate(submaps[b].frame_idx)}
+            ratios = []
+            for g in sh:
+                za = submaps[b].da3_depths[mb[int(g)]]; zb = submaps[a].da3_depths[ma[int(g)]]
+                k = min(len(za), len(zb))
+                if k: ratios.extend((za[:k] / np.where(zb[:k] > 0, zb[:k], np.nan)).tolist())
+            log_s, ssig, _ = _log_ratio_stats([r for r in ratios if r == r])
+            overlaps.append(SubmapOverlap(m=a, n=b, shared_frame_idx=sh,
+                                          m_local=np.array([ma[int(g)] for g in sh]),
+                                          n_local=np.array([mb[int(g)] for g in sh]),
+                                          log_s=log_s, log_s_sigma=ssig))
 
-    return SubmapGraphInputs(
-        tokens=tokens, K=K, sensor2ego=s2e, cam_height=h, init_R=init_R, init_t=init_t, init_s=init_s,
-        colmap_rel_R=rel_R, colmap_rel_t=rel_t, submaps=submaps, frame_submaps=frame_submaps, overlaps=overlaps)
+    return SubmapGraphInputs(tokens=tokens, K=K, sensor2ego=s2e, cam_height=h, submaps=submaps, overlaps=overlaps)
 
 
-# ----------------------------------------------------------------------------- graph build harness (factors are §3 stubs)
+# ----------------------------------------------------------------------------- graph build harness
 def _H(i: int) -> int:
     import gtsam
     return int(gtsam.symbol("h", i))          # Similarity3 key for frame i
@@ -318,48 +403,72 @@ def _RHO() -> int:
     import gtsam
     return int(gtsam.symbol("r", 0))          # scalar rho key
 
-def build_sim3_graph(inputs: Sim3GraphInputs):
-    """Build the §14 factor graph and its initial Values from `inputs`.
+def _sim3(R, t, s):
+    """Similarity3(R, t, s) from numpy init (rotation, translation/centre, scale)."""
+    import gtsam
+    return gtsam.Similarity3(gtsam.Rot3(np.asarray(R, float)), np.asarray(t, float).reshape(3), float(s))
 
-    HARNESS ONLY. The variables + initial values are inserted here (plumbing); the
-    FACTORS are the author's core work and are left as stubs. Fill each stub with a
-    ``gtsam.CustomFactor(noise, keys, error_func)`` whose ``error_func`` returns the
-    residual and writes the analytic Jacobians into the passed ``H`` list.
+def _rho_sigma(median: float, mad: float) -> float:
+    """Data-driven 1-sigma on rho = log r from the ratio MAD (§5.6 honest noise); floored."""
+    s = abs(mad / median) if median else 1.0     # d(log r) ~ dr / r
+    return float(max(s, 1e-3))
 
-    Returns ``(graph, values)`` ready for :func:`solve` once the factors are added.
+def _gauge_noise(scale_sigma: float = 1e-3):
+    """Gauge prior noise on the first pose. GTSAM's sim(3) tangent = [omega(3), rho(3), lambda(1)] with
+    lambda = log s LAST, and scale couples into translation (GetV), so this must be a Diagonal on the
+    genuine 7-DoF variable -- not a zeroed column.
+
+    §14.5 says leave scale FREE (sigma 1e6) so the anchors determine it. But with NO anchor yet, that
+    leaves the system underconstrained in log-scale (the marginal is indeterminate). So FOR NOW we also
+    gauge-fix scale with a small sigma (default 1e-3) to keep it well-posed; the recovered global scale
+    is then arbitrary (= init), pending the anchors.
+
+    LATER, once the ground/ego anchors are added: pass scale_sigma=1e6 (free, §14.5), AND replace this
+    whole gauge prior with a HORIZONTAL-translation + rotation-only prior -- the ego anchor pins t_z and
+    the anchors pin scale, so only (x, y, yaw/rotation) remain gauge. That is a CUSTOM factor, since scale
+    couples into translation on Sim(3) and cannot be a zeroed column."""
+    import gtsam
+    return gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-6] * 6 + [scale_sigma]))
+
+def build_sim3_graph(inputs: Sim3GraphInputs, *, rel_sigma: float = 1e-2):
+    """Build the single-window §14 graph + initial Values from `inputs`.
+
+    Wires the STOCK backbone (§14.4): the §14.5 gauge prior on H_0 (SE(3)-tight, scale-FREE), the
+    per-consecutive COLMAP ``BetweenFactorSimilarity3`` relatives, and the ``PriorFactorDouble`` depth-
+    ratio unary on rho. The metric-anchor CustomFactors (``GroundAnchorSim3Factor`` / ``EgoOnGroundFactor``)
+    are the author's core, added once written. ``rel_sigma`` + the rho sigma (from the MAD) are noise knobs.
+
+    Absolute scale: §14.5 leaves it free for the anchors to fix, but with no anchor yet that is
+    underconstrained -- so the gauge prior gauge-FIXES scale for now (``_gauge_noise`` default), giving an
+    arbitrary (= init) global scale. Pass a free-scale gauge + the anchors later (see ``_gauge_noise``).
+
+    Returns ``(graph, values)`` ready for :func:`solve`.
     """
     import gtsam
 
-    graph = gtsam.NonlinearFactorGraph()
-    values = gtsam.Values()
-    # --- variables + initial values (plumbing) ---
-    # NOTE (this GTSAM build): Similarity3 is a MATH helper only -- it is NOT Values-storable
-    # (no atSimilarity3 / insert overload), and there is no insertDouble (use insert(key, float)).
-    # The scalar rho IS storable and is inserted here. The per-frame Sim(3) VARIABLE representation
-    # is author core (§3): choose a storable form -- Pose3 H_i + Double s_i (7-DoF split), or a
-    # Vector7 in sim(3) coords -- init values are in inputs.init_R/init_t/init_s. Insert them under
-    # that representation and wire the CustomFactor keys to match.
+    graph = gtsam.NonlinearFactorGraph(); values = gtsam.Values()
+    # --- variables + initial values: per-frame Similarity3 H_i + scalar rho ---
+    for i in range(inputs.n_frames):
+        values.insert(_H(i), _sim3(inputs.init_R[i], inputs.init_t[i], inputs.init_s[i]))
     values.insert(_RHO(), float(inputs.init_log_r))
 
-    # ======================================================================== §3 AUTHOR: VARIABLES + FACTORS (§14.4)
-    # First insert the per-frame Sim(3) variable H_i under a Values-storable representation (see the
-    # note above -- Similarity3 is not storable here), initialized from inputs.init_R/init_t/init_s.
-    # Then each factor is a gtsam.CustomFactor(noise_model, [keys], error_func); the factor DEFINITIONS
-    # (design notes) live in backend.factors -- derive the residuals + Jacobians (§14.2/§14.3/§5.4) there
-    # and add instances here, in order:
-    #
-    #   1. Sim3GaugePriorFactor(H_0)          -- tight prior to init; fixes the 7-DoF gauge (incl. scale).
-    #   2. ColmapRelativeSim3Factor(H_{i-1},H_i) -- (rel_R[i], rel_t[i]); rotation + local-unit translation +
-    #                                            scale constancy s_i = s_{i-1}, in one factor.
-    #   3. DepthRatioPriorFactor(rho)         -- residual rho - log(depth_ratio_median); sigma = |MAD|.
-    #   4. GroundAnchorSim3Factor(H_i, rho)   -- per road obs k: e_z^T( s_i R_i (e^{rho} depth_k ray_k) + t_i ) -> 0.
-    #   5. EgoOnGroundFactor(H_i)             -- e_z^T ego centre via H_i, sensor2ego -> cam_height;
-    #                                            Jacobian sparsity d/ds = 0, d/drho = 0 (the §5.4 thesis).
-    #
-    raise NotImplementedError(
-        "§14 variable representation + factors are author core (CLAUDE.md §3/§8): pick a Values-storable "
-        "Sim(3) form (Similarity3 is not storable in this GTSAM build), insert H_i from inputs.init_*, add "
-        "the CustomFactors above, then remove this guard. rho is already inserted.")
+    # --- STOCK backbone (§14.4) ---
+    rel_noise = gtsam.noiseModel.Isotropic.Sigma(7, rel_sigma)       # COLMAP relative confidence (author knob)
+    rho_noise = gtsam.noiseModel.Isotropic.Sigma(1, _rho_sigma(inputs.depth_ratio_median, inputs.depth_ratio_mad))
+    graph.add(gtsam.PriorFactorSimilarity3(                          # §14.5 gauge: frame only, scale FREE
+        _H(0), _sim3(inputs.init_R[0], inputs.init_t[0], inputs.init_s[0]), _gauge_noise()))
+    for i in range(1, inputs.n_frames):
+        meas = _sim3(inputs.colmap_rel_R[i - 1], inputs.colmap_rel_t[i - 1], 1.0)   # (1, rel_R, rel_t) = H_{i-1}^{-1}H_i
+        graph.add(gtsam.BetweenFactorSimilarity3(_H(i - 1), _H(i), meas, rel_noise))
+    graph.add(gtsam.PriorFactorDouble(_RHO(), float(inputs.init_log_r), rho_noise))
+
+    # ======================================================================== §3 AUTHOR: metric-anchor CustomFactors
+    # The backbone pins the FRAME gauge (not scale), chains the COLMAP relatives, and priors rho. What
+    # makes it metric-FROM-SEMANTICS is the anchor -- author core (backend.factors), the only hand-written
+    # Jacobians (§14.8): GroundAnchorSim3Factor(_H(i), _RHO()) + EgoOnGroundFactor(_H(i)). With the anchors
+    # present every scale is observable (§14.6). NOTE (author): once anchors are on, the §14.5 gauge prior
+    # is replaced by a horizontal-translation + rotation-only prior (ego anchor already pins t_z, the
+    # anchors pin scale) -- a CUSTOM factor, since scale couples into translation on Sim(3).
     return graph, values
 
 
@@ -372,57 +481,87 @@ def solve(graph, values, *, max_iters: int = 100, verbose: bool = False):
     return gtsam.LevenbergMarquardtOptimizer(graph, values, params).optimize()
 
 
-# --------------------------------------------------------------------- submap graph build harness (factors are §3 stubs)
+# --------------------------------------------------------------------- submap graph build harness
+def _HM(m: int, j: int) -> int:
+    import gtsam
+    return int(gtsam.symbol("h", m * 1000 + j))   # Sim3 for submap m's LOCAL frame j (overlap frame -> two variables)
+
 def _RHO_M(m: int) -> int:
     import gtsam
-    return int(gtsam.symbol("r", m))          # per-submap depth-ratio scalar rho_m = log r_m (§14, DA3 per window)
+    return int(gtsam.symbol("r", m))              # per-submap depth-ratio scalar rho_m = log r_m (§14, DA3 per window)
 
-def build_submap_graph(inputs: SubmapGraphInputs):
-    """Build the SUBMAP §14 graph + initial Values from `inputs`.
+def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, align_pose_sigma: float = 1e-3):
+    """Build the SUBMAP §14 graph (VGGT-SLAM 2.0 style) + initial Values from `inputs`.
 
-    HARNESS ONLY (plumbing): inserts one scalar ``rho_m`` per submap with its initial value. The
-    per-frame Sim(3) variable H_i and all FACTORS are the author's core work (§3/§8) — see the note
-    in :func:`build_sim3_graph` (Similarity3 is a math helper only in this GTSAM build, not
-    Values-storable, so H_i needs a storable representation the author picks). Frames in an overlap
-    are SHARED variables — both submaps' factors reference the same H_i, which is what anchors
-    adjacent submaps (§14.2); the overlaps list is provided for the per-submap scale cross-check /
-    any explicit submap-alignment factor.
+    Each submap is INDEPENDENT: its frames are its OWN ``Similarity3`` variables ``H^m_j``, so an
+    overlap frame has TWO variables (one per submap). Factors (all STOCK; §14.4):
 
-    Returns ``(graph, values)`` ready for :func:`solve` (batch) once H_i + the factors are added.
+      * gauge prior on H^0_0 -- fixes the frame gauge (and scale, for now; see :func:`_gauge_noise`);
+      * within-submap COLMAP relatives ``BetweenFactorSimilarity3(H^m_{j-1}, H^m_j, (1, rel_R, rel_t))``;
+      * per-submap depth-ratio ``PriorFactorDouble(rho_m, log r_hat_m)``, sigma = 1.4826*MAD(log r);
+      * SUBMAP-ALIGNMENT ``BetweenFactorSimilarity3(H^m_a, H^n_b, (s_hat, I, 0))`` on each shared camera --
+        a PURE-SCALING measurement (§14.2), tight on the 6 SE(3) dims (the shared camera coincides),
+        s_hat = exp(log_s) from the DA3(n)/DA3(m) ratio at the overlap, sigma from its log-MAD.
+
+    The metric-anchor CustomFactors (per frame) are the author's core; off here. Returns ``(graph, values)``.
     """
     import gtsam
 
     graph = gtsam.NonlinearFactorGraph(); values = gtsam.Values()
-    # --- storable variables + initial values (plumbing): one rho_m per submap ---
+    # --- variables: per-(submap, frame) Similarity3 H^m_j (overlap frame -> two) + per-submap rho_m ---
     for sm in inputs.submaps:
-        r = sm.depth_ratio_median
-        values.insert(_RHO_M(sm.id), float(np.log(r)) if r and r > 0 else 0.0)   # insert(key, float): no insertDouble here
+        for j in range(len(sm.frame_idx)):
+            values.insert(_HM(sm.id, j), _sim3(sm.init_R[j], sm.init_t[j], sm.init_s[j]))
+        values.insert(_RHO_M(sm.id), float(sm.log_r))
 
-    # ======================================================================== §3 AUTHOR: H_i VARIABLE + FACTORS (§14.4)
-    # Insert per-frame H_i under a Values-storable Sim(3) representation (init from inputs.init_*), then add:
-    #   1. Gauge prior on H_0                 -- fixes the 7-DoF gauge (absolute scale stays free w/o a ground anchor).
-    #   2. COLMAP relative (i-1,i)            -- inputs.colmap_rel_R/T[i-1]; rotation + local-unit translation + scale
-    #                                            constancy s_i = s_{i-1}, one CustomFactor per consecutive pair.
-    #   3. Depth-ratio unary on rho_m         -- per submap: rho_m - log(depth_ratio_median); sigma from |MAD|.
-    #   4. (optional) submap-alignment / cross-check on the overlaps -- each submap's scale should agree; a shared
-    #                                            camera H_i already couples the two windows, so this is a soft check.
-    # The absolute-scale factors (ground anchor, ego-on-ground) are intentionally OFF for this part.
-    raise NotImplementedError(
-        "§14 submap H_i representation + factors are author core (CLAUDE.md §3/§8): insert H_i, add the "
-        "CustomFactors above, then remove this guard. Per-submap rho_m + initial values are already inserted.")
+    rel_noise = gtsam.noiseModel.Isotropic.Sigma(7, rel_sigma)
+    s0 = inputs.submaps[0]                                            # gauge prior on the very first pose
+    graph.add(gtsam.PriorFactorSimilarity3(_HM(s0.id, 0), _sim3(s0.init_R[0], s0.init_t[0], s0.init_s[0]), _gauge_noise()))
+    for sm in inputs.submaps:
+        for j in range(1, len(sm.frame_idx)):                        # within-submap COLMAP relatives
+            meas = _sim3(sm.rel_R[j - 1], sm.rel_t[j - 1], 1.0)      # (1, rel_R, rel_t) = H^m_{j-1}^{-1} H^m_j
+            graph.add(gtsam.BetweenFactorSimilarity3(_HM(sm.id, j - 1), _HM(sm.id, j), meas, rel_noise))
+        graph.add(gtsam.PriorFactorDouble(_RHO_M(sm.id), float(sm.log_r),      # per-window depth-ratio (log-space MAD)
+                                          gtsam.noiseModel.Isotropic.Sigma(1, sm.log_r_sigma)))
+    for o in inputs.overlaps:                                        # submap-alignment: pure scaling (s_hat, I, 0)
+        meas = _sim3(np.eye(3), np.zeros(3), float(np.exp(o.log_s)))
+        align_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([align_pose_sigma] * 6 + [max(o.log_s_sigma, 1e-3)]))
+        for ml, nl in zip(o.m_local, o.n_local):
+            graph.add(gtsam.BetweenFactorSimilarity3(_HM(o.m, int(ml)), _HM(o.n, int(nl)), meas, align_noise))
+
+    # ==== §3 AUTHOR: metric anchors, per submap+frame -- GroundAnchorSim3Factor(_HM(m,j), _RHO_M(m)) +
+    # EgoOnGroundFactor(_HM(m,j)); OFF here. With them present, every submap's scale is observable from
+    # its own road plane + camera height (§14.6), so the submap-alignment becomes a consistency check and
+    # the gauge prior relaxes to horizontal-translation + rotation only (see _gauge_noise).
     return graph, values
+
+
+def submap_world_poses(inputs: SubmapGraphInputs, values) -> dict:
+    """Per-submap solved world poses {submap_id: (n,4,4)} from a Values (each submap's own H^m_j)."""
+    out = {}
+    for sm in inputs.submaps:
+        Ps = []
+        for j in range(len(sm.frame_idx)):
+            S = values.atSimilarity3(_HM(sm.id, j)); T = np.eye(4)
+            T[:3, :3] = np.asarray(S.rotation().matrix()); T[:3, 3] = np.asarray(S.translation())
+            Ps.append(T)
+        out[sm.id] = np.stack(Ps)
+    return out
 
 
 def solve_incremental(inputs: SubmapGraphInputs, *, relinearize_skip: int = 1):
     """iSAM2 driver stub for the INCREMENTAL submap solve (§14 "incremental SAM").
 
-    HARNESS ONLY: the author feeds the graph submap-by-submap — for each submap, add its new
-    H_i / rho_m variables + factors (from :func:`build_submap_graph`'s factor set restricted to
-    that submap, plus the shared-camera factors linking it to the previous submap) and call
-    ``isam.update(new_factors, new_values)``. The factor construction is §3 author core."""
+    HARNESS ONLY: feed the graph submap-by-submap. For each new submap m, build a
+    ``gtsam.NonlinearFactorGraph`` + ``Values`` with its NEW variables (its H^m_j + rho_m) and factors
+    from :func:`build_submap_graph` restricted to that window -- the gauge only for submap 0, the
+    within-submap relatives, the depth-ratio prior, and the submap-alignment factors to the PREVIOUS
+    submap's overlap variables (already in iSAM) -- then ``isam.update(new_graph, new_values)``. The
+    incremental factor set + any metric-anchor CustomFactors are author core (§8); this stub only
+    constructs the ISAM2 object."""
     import gtsam
     isam = gtsam.ISAM2(gtsam.ISAM2Params())
     _ = relinearize_skip
     raise NotImplementedError(
-        "incremental submap solve is author core (§8): drive `isam.update(...)` per submap with the "
-        "author's factors. This stub only constructs the ISAM2 object.")
+        "incremental submap solve is author core (§8): drive `isam.update(new_graph, new_values)` per "
+        "submap with the stock backbone + submap-alignment factors. This stub only constructs ISAM2.")
