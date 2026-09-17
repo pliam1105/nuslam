@@ -275,7 +275,14 @@ def run_submap_colmap(kfs_window, sky, veh, K, work_dir):
     pycolmap.match_exhaustive(db)
     opts = pycolmap.IncrementalPipelineOptions()
     opts.ba_refine_focal_length = opts.ba_refine_principal_point = opts.ba_refine_extra_params = False
-    opts.mapper.init_min_tri_angle = 2.0; opts.mapper.abs_pose_min_num_inliers = 15
+    # tuned for short FORWARD-DRIVING windows: the defaults reject every init pair because motion is
+    # ~100% forward (init_max_forward_motion 0.95) and parallax is low (init_min_tri_angle 16, inliers 100).
+    opts.mapper.init_max_forward_motion = 1.0      # allow fully-forward init pairs (the key fix)
+    opts.mapper.init_min_num_inliers = 30          # short masked window -> fewer inliers
+    opts.mapper.init_min_tri_angle = 1.0           # low forward-motion parallax
+    opts.mapper.init_max_error = 8.0               # looser epipolar for the init pair
+    opts.mapper.init_max_reg_trials = 5
+    opts.mapper.abs_pose_min_num_inliers = 15
     (work / "sparse").mkdir(exist_ok=True)
     maps = pycolmap.incremental_mapping(db, work / "images", work / "sparse", options=opts)
     if not maps: return {}, None
@@ -308,71 +315,69 @@ def submap_daq(dep_window, tokens_window, K_true, *, m_weight: float = 1.0):
 
 def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/frontend_cache",
                           dataroot: str = "data/nuscenes", version: str = "v1.0-mini",
-                          colmap_sparse: str = "out/colmap/sparse/0",
-                          window: int = 11, step: int = 7, stride: int = 8) -> SubmapGraphInputs:
-    """Assemble the SUBMAP §14 inputs to the VGGT-SLAM-2.0 schema (per-window independent submaps).
+                          submap_cache: str = "out/submap_cache",
+                          window: int = 11, step: int = 7) -> SubmapGraphInputs:
+    """Assemble the SUBMAP §14 inputs (VGGT-SLAM 2.0) from the REAL per-window reconstructions.
 
-    NOTE: per-window COLMAP+DAQ (:func:`run_submap_colmap` / :func:`submap_daq`) are the genuine
-    per-submap reconstructions but are the SLOW step and not run here yet. For now this assembles the
-    to-spec structure from the GLOBAL caches as a STAND-IN (each submap = the global reconstruction
-    restricted to its window): correct schema + connectivity + per-window depth ratios, so the graph
-    builds/solves; swap in the per-window runners for true independence (the overlap log_s then becomes
-    the real DA3(n)/DA3(m) ratio instead of ~0). Pure plumbing, no estimation."""
-    import pycolmap
+    Requires the per-window DA3+DAQ+COLMAP cache ``{submap_cache}/sm{m}.npz`` (one INDEPENDENT
+    reconstruction per window: re-run DA3-Base, DAQ metric upgrade, tuned masked COLMAP). There is NO
+    global-COLMAP fallback -- if a window is missing/under-registered this raises. Each submap keeps its
+    own up-to-scale frame; they are chain-PLACED into a common world by Umeyama on the shared cameras
+    (init only). The overlap ``log_s`` is the genuine median DA3(n)/DA3(m) ratio at the shared frames.
+    Pure plumbing, no estimation."""
     from ..data import NuScenesMonoSource
-    from ..frontend import cache
+    from ..frontend import cache as fcache
+    from ..transforms import umeyama
 
     src = NuScenesMonoSource(dataroot, version, camera="CAM_FRONT"); kfs = src.load_scene(scene)
-    mu = cache.load_metric_upgrade(cache_root, scene); dep = cache.load_depth(cache_root, scene)
-    pidx = {t: i for i, t in enumerate(mu.tokens)}
-    frames = [kf for kf in kfs if kf.token in dep and kf.token in pidx]
-    tokens = [kf.token for kf in frames]; tset = set(tokens); N = len(frames)
-    K = np.asarray(mu.K_true, np.float64); Kinv = np.linalg.inv(K)
+    dep = fcache.load_depth(cache_root, scene)
+    frames = [kf for kf in kfs if kf.token in dep]; tokens = [kf.token for kf in frames]; N = len(frames)
+    K = np.asarray(frames[0].calib.intrinsic, np.float64)
     s2e = frames[0].calib.sensor2ego.matrix(); h = float(s2e[2, 3])
 
-    cg = np.load(f"{cache_root}/{scene}/colmap_poses_global.npz", allow_pickle=True)
-    cmap = {str(t): P for t, P in zip(cg["tokens"], cg["poses"])}
-    cpose = np.stack([cmap[t] for t in tokens]).astype(np.float64)     # STAND-IN per-window geometry
+    wins = _windows(N, window, step); sc = Path(submap_cache)
+    missing = [m for m in range(len(wins)) if not (sc / f"sm{m}.npz").exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"per-window recon cache missing for submaps {missing} under {sc} -- run the per-submap "
+            f"DA3+DAQ+COLMAP pass first (scratchpad/submap_recon.py). No global-COLMAP fallback.")
+    recons = []
+    for m in range(len(wins)):
+        d = np.load(sc / f"sm{m}.npz", allow_pickle=True)
+        c2w = d["colmap_c2w"].astype(np.float64)
+        if not np.isfinite(c2w).all():
+            raise ValueError(f"submap {m}: COLMAP under-registered ({int(d['nreg'])}/{len(d['tokens'])}) -- "
+                             f"NaN poses. Re-run that window's COLMAP; no fallback.")
+        recons.append(dict(idx=np.asarray(d["frame_idx"]), toks=list(d["tokens"]), c2w=c2w,
+                           da3_rays=list(d["da3_rays"]), da3_depths=list(d["da3_depths"]), ratios=list(d["ratios"])))
 
-    # per-token COLMAP->DA3 ratios (z_colmap / z_da3) from the raw sparse vs DA3 depth
-    rec = pycolmap.Reconstruction(colmap_sparse)
-    def img_tok(im):
-        nm = im.name.rsplit(".", 1)[0]
-        return nm if nm in pidx else (tokens[int(nm[1:])] if nm[1:].isdigit() and int(nm[1:]) < N else None)
-    tok_ratios = {t: [] for t in tokens}
-    for p in rec.points3D.values():
-        X = np.append(p.xyz, 1.0)
-        for el in p.track.elements:
-            im = rec.images[el.image_id]; tok = img_tok(im)
-            if tok is None or tok not in tset: continue
-            rig = im.cam_from_world; rig = rig() if callable(rig) else rig
-            Mx = np.asarray(rig.matrix()) if hasattr(rig, "matrix") else np.hstack([np.asarray(rig.rotation.matrix()), np.asarray(rig.translation)[:, None]])
-            zc = (Mx @ X)[2]; u, v = im.points2D[el.point2D_idx].xy; dd = dep[tok].depth
-            if zc > 1e-6 and 0 <= int(v) < dd.shape[0] and 0 <= int(u) < dd.shape[1]:
-                zg = dd[int(v), int(u)]
-                if zg > 1e-6: tok_ratios[tok].append(zc / zg)
+    # chain-place each submap into a common world by Umeyama (with scale) on shared cameras (init only).
+    # World = submap-0's own COLMAP frame; init_s of window m = its local-COLMAP -> world scale.
+    world_by_global = {}; placed = []
+    for m, rc in enumerate(recons):
+        c2w = rc["c2w"]; idx = list(rc["idx"])
+        if m == 0:
+            s_a, R_a, t_a = 1.0, np.eye(3), np.zeros(3)
+        else:
+            shared = [g for g in idx if int(g) in world_by_global]
+            jm = [idx.index(g) for g in shared]
+            s_a, R_a, t_a = umeyama(c2w[jm, :3, 3], np.stack([world_by_global[int(g)] for g in shared]), with_scale=True)
+        Rw = R_a[None] @ c2w[:, :3, :3]
+        Cw = c2w[:, :3, 3] @ (s_a * R_a).T + t_a
+        placed.append((Rw, Cw, np.full(len(idx), float(s_a))))
+        for j, g in enumerate(idx): world_by_global.setdefault(int(g), Cw[j])
 
-    def da3_material(tok):
-        d = dep[tok].depth; Hh, Ww = d.shape
-        vv, uu = np.mgrid[0:Hh:stride, 0:Ww:stride].reshape(2, -1); z = d[vv, uu]
-        keep = z > 0; vv, uu, z = vv[keep], uu[keep], z[keep]
-        return ((Kinv @ np.stack([uu, vv, np.ones_like(uu)], 0)).T).astype(np.float32), z.astype(np.float32)
-
-    wins = _windows(N, window, step)
     submaps = []
-    for m, idx in enumerate(wins):
-        toks = [tokens[i] for i in idx]; P = cpose[idx]                 # stand-in world placement
-        rel_R = np.stack([P[j - 1, :3, :3].T @ P[j, :3, :3] for j in range(1, len(idx))])
-        rel_t = np.stack([P[j - 1, :3, :3].T @ (P[j, :3, 3] - P[j - 1, :3, 3]) for j in range(1, len(idx))])
-        log_r, sig, nr = _log_ratio_stats([x for t in toks for x in tok_ratios[t]])
-        mats = [da3_material(t) for t in toks]
-        submaps.append(SubmapRecon(id=m, frame_idx=idx, tokens=toks, rel_R=rel_R, rel_t=rel_t,
-                                   init_R=P[:, :3, :3].copy(), init_t=P[:, :3, 3].copy(), init_s=np.ones(len(idx)),
-                                   log_r=log_r, log_r_sigma=sig, n_ratio=nr,
-                                   da3_rays=[a for a, _ in mats], da3_depths=[b for _, b in mats]))
+    for m, rc in enumerate(recons):
+        idx = rc["idx"]; c2w = rc["c2w"]; Rw, Cw, sw = placed[m]
+        rel_R = np.stack([c2w[j - 1, :3, :3].T @ c2w[j, :3, :3] for j in range(1, len(idx))])
+        rel_t = np.stack([c2w[j - 1, :3, :3].T @ (c2w[j, :3, 3] - c2w[j - 1, :3, 3]) for j in range(1, len(idx))])
+        log_r, sig, nr = _log_ratio_stats(rc["ratios"])
+        submaps.append(SubmapRecon(id=m, frame_idx=idx, tokens=list(rc["toks"]), rel_R=rel_R, rel_t=rel_t,
+                                   init_R=Rw, init_t=Cw, init_s=sw, log_r=log_r, log_r_sigma=sig, n_ratio=nr,
+                                   da3_rays=rc["da3_rays"], da3_depths=rc["da3_depths"]))
 
-    # overlaps: shared cameras -> submap-alignment. log_s = DA3(n)/DA3(m) ratio at the shared frames
-    # (median over shared pixels). STAND-IN uses the same global DA3 -> ~0; per-window DAQ makes it real.
+    # overlaps -> submap-alignment. log_s = median DA3(n)/DA3(m) at shared frames (pixel-aligned strided depths).
     overlaps = []
     for a in range(len(submaps)):
         for b in range(a + 1, len(submaps)):
@@ -382,10 +387,9 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
             mb = {int(g): j for j, g in enumerate(submaps[b].frame_idx)}
             ratios = []
             for g in sh:
-                za = submaps[b].da3_depths[mb[int(g)]]; zb = submaps[a].da3_depths[ma[int(g)]]
-                k = min(len(za), len(zb))
-                if k: ratios.extend((za[:k] / np.where(zb[:k] > 0, zb[:k], np.nan)).tolist())
-            log_s, ssig, _ = _log_ratio_stats([r for r in ratios if r == r])
+                zm = submaps[a].da3_depths[ma[int(g)]]; zn = submaps[b].da3_depths[mb[int(g)]]
+                msk = (zm > 0) & (zn > 0); ratios.extend((zn[msk] / zm[msk]).tolist())    # DA3(n)/DA3(m)
+            log_s, ssig, _ = _log_ratio_stats(ratios)
             overlaps.append(SubmapOverlap(m=a, n=b, shared_frame_idx=sh,
                                           m_local=np.array([ma[int(g)] for g in sh]),
                                           n_local=np.array([mb[int(g)] for g in sh]),
@@ -403,10 +407,12 @@ def _RHO() -> int:
     import gtsam
     return int(gtsam.symbol("r", 0))          # scalar rho key
 
-def _sim3(R, t, s):
-    """Similarity3(R, t, s) from numpy init (rotation, translation/centre, scale)."""
+def _sim3(R, C, s):
+    """gtsam Similarity3 whose CAMERA CENTRE is C, i.e. transformFrom(0) = C, with rotation R, scale s.
+    gtsam's action is p -> s(R p + t) so centre = s*t; the §14.3 math uses X = sRp + t with centre = t.
+    To place the centre at C we must store t = C/s (identity for s=1, so single-window init_s=ones is unaffected)."""
     import gtsam
-    return gtsam.Similarity3(gtsam.Rot3(np.asarray(R, float)), np.asarray(t, float).reshape(3), float(s))
+    return gtsam.Similarity3(gtsam.Rot3(np.asarray(R, float)), np.asarray(C, float).reshape(3) / float(s), float(s))
 
 def _rho_sigma(median: float, mad: float) -> float:
     """Data-driven 1-sigma on rho = log r from the ratio MAD (§5.6 honest noise); floored."""
@@ -490,7 +496,7 @@ def _RHO_M(m: int) -> int:
     import gtsam
     return int(gtsam.symbol("r", m))              # per-submap depth-ratio scalar rho_m = log r_m (§14, DA3 per window)
 
-def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, align_pose_sigma: float = 1e-3):
+def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, align_pose_sigma: float = 3e-2):
     """Build the SUBMAP §14 graph (VGGT-SLAM 2.0 style) + initial Values from `inputs`.
 
     Each submap is INDEPENDENT: its frames are its OWN ``Similarity3`` variables ``H^m_j``, so an
@@ -524,7 +530,12 @@ def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, al
         graph.add(gtsam.PriorFactorDouble(_RHO_M(sm.id), float(sm.log_r),      # per-window depth-ratio (log-space MAD)
                                           gtsam.noiseModel.Isotropic.Sigma(1, sm.log_r_sigma)))
     for o in inputs.overlaps:                                        # submap-alignment: pure scaling (s_hat, I, 0)
-        meas = _sim3(np.eye(3), np.zeros(3), float(np.exp(o.log_s)))
+        # s_hat = s_n/s_m at the shared camera. NOT the raw DA3 ratio: the two-scale model (§14.3) makes
+        # s_m e^{rho_m} z_da3_m = s_n e^{rho_n} z_da3_n at a shared point, so s_n/s_m = e^{rho_m-rho_n}*(z_da3_m/
+        # z_da3_n) = exp((log_r_m - log_r_n) - log_s). Uses the INIT rho here (stock BetweenFactorSimilarity3);
+        # the EXACT factor couples the rho_m/rho_n VARIABLES -> backend.factors.SubmapAlignmentFactor (author §3).
+        s_hat = float(np.exp((inputs.submaps[o.m].log_r - inputs.submaps[o.n].log_r) - o.log_s))
+        meas = _sim3(np.eye(3), np.zeros(3), s_hat)
         align_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([align_pose_sigma] * 6 + [max(o.log_s_sigma, 1e-3)]))
         for ml, nl in zip(o.m_local, o.n_local):
             graph.add(gtsam.BetweenFactorSimilarity3(_HM(o.m, int(ml)), _HM(o.n, int(nl)), meas, align_noise))
@@ -543,7 +554,8 @@ def submap_world_poses(inputs: SubmapGraphInputs, values) -> dict:
         Ps = []
         for j in range(len(sm.frame_idx)):
             S = values.atSimilarity3(_HM(sm.id, j)); T = np.eye(4)
-            T[:3, :3] = np.asarray(S.rotation().matrix()); T[:3, 3] = np.asarray(S.translation())
+            T[:3, :3] = np.asarray(S.rotation().matrix())
+            T[:3, 3] = np.asarray(S.transformFrom(np.zeros(3)))    # actual camera centre = s*t (see _sim3)
             Ps.append(T)
         out[sm.id] = np.stack(Ps)
     return out

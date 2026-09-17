@@ -10,7 +10,8 @@
 
 This module holds only the CUSTOM §14 factors -- the ones no stock gtsam factor expresses:
 ``GroundAnchorSim3Factor`` and ``EgoOnGroundFactor`` (the ground/ego-height scale anchor,
-CLAUDE.md rung 2). The GENERIC §14.4 factors are stock and are wired in ``sim3_graph``:
+CLAUDE.md rung 2), and ``SubmapAlignmentFactor`` (the submap-alignment that couples the two rho
+scales, §14.3). The GENERIC §14.4 factors are stock and are wired in ``sim3_graph``:
 
   * gauge prior     -> ``gtsam.PriorFactorSimilarity3(H_0, init)``
   * COLMAP relative -> ``gtsam.BetweenFactorSimilarity3(H_{i-1}, H_i, (rel_R, rel_t, s=1))``
@@ -112,3 +113,29 @@ class EgoOnGroundFactor(_Sim3Factor):
         super().__init__([hi_key], noise)
         self.sensor2ego = np.asarray(sensor2ego, float)   # (4,4)
         self.cam_height = float(cam_height)
+
+
+class SubmapAlignmentFactor(_Sim3Factor):
+    """Submap-alignment on a shared camera (§14.2/§14.4), coupling BOTH scales -- the reason it must be
+    custom, not a stock ``BetweenFactorSimilarity3``.
+
+    The H variables are on each submap's COLMAP frame, but the measurable overlap quantity is the DA3
+    depth ratio. The two-scale consistency (§14.3) makes the true H-scale ratio depend on the rho
+    VARIABLES: s_n/s_m = e^{rho_m - rho_n} * (z_da3_m/z_da3_n) = exp((rho_m - rho_n) - log_s). Because it
+    depends on rho_m, rho_n (optimized), a fixed-measurement between-factor is only an approximation
+    (build_submap_graph uses one with the init rho); the exact factor is here.
+
+    INPUTS:  ``hm_key``, ``hn_key`` (the two submaps' shared-camera ``Similarity3``), ``rho_m_key``,
+             ``rho_n_key`` (Doubles); ``log_s`` = log median(z_da3_n/z_da3_m) at the overlap; ``noise``
+             (7-DoF Diagonal: tight on the 6 SE(3) dims -- the shared camera coincides -- and the DA3
+             log-MAD on the scale row).
+    OUTPUT:  residual (7,) = Logmap( meas^{-1} . (H^m^{-1} H^n) ), meas = Similarity3(I, 0, s_hat) with
+             s_hat = exp((rho_m - rho_n) - log_s). Only the scale (lambda) component depends on rho.
+    IMPLEMENT ``error``: Jacobians H[0] (7,7) on H^m, H[1] (7,7) on H^n, H[2] (7,1) and H[3] (7,1) on
+             rho_m/rho_n -- nonzero only in the lambda row (d s_hat/d rho_m = s_hat, d/d rho_n = -s_hat).
+    """
+    DIM = 7
+
+    def __init__(self, hm_key, hn_key, rho_m_key, rho_n_key, log_s, noise) -> None:
+        super().__init__([hm_key, hn_key, rho_m_key, rho_n_key], noise)
+        self.log_s = float(log_s)                         # log median DA3(n)/DA3(m) at the overlap
