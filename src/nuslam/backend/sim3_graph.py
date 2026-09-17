@@ -344,16 +344,17 @@ def build_sim3_graph(inputs: Sim3GraphInputs):
     # ======================================================================== §3 AUTHOR: VARIABLES + FACTORS (§14.4)
     # First insert the per-frame Sim(3) variable H_i under a Values-storable representation (see the
     # note above -- Similarity3 is not storable here), initialized from inputs.init_R/init_t/init_s.
-    # Then each factor is a gtsam.CustomFactor(noise_model, [keys], error_func); derive the residuals +
-    # Jacobians (§14.2/§14.3/§5.4) and add them, in order:
+    # Then each factor is a gtsam.CustomFactor(noise_model, [keys], error_func); the factor DEFINITIONS
+    # (design notes) live in backend.factors -- derive the residuals + Jacobians (§14.2/§14.3/§5.4) there
+    # and add instances here, in order:
     #
-    #   1. Gauge prior on H_0        -- Sim(3) identity-to-init, tight sigma; fixes the 7-DoF gauge.
-    #   2. COLMAP relative (i-1,i)   -- measurement (1, rel_R[i], rel_t[i]); rotation + translation-in-
-    #                                   local-units + scale constancy s_i = s_{i-1}, in one factor.
-    #   3. Depth-ratio unary on rho  -- residual rho - log(depth_ratio_median); sigma = |MAD|.
-    #   4. Ground anchor (H_i, rho)  -- per road obs k: e_z^T( s_i R_i (e^{rho} depth_k ray_k) + t_i ) -> 0.
-    #   5. Ego-on-ground (H_i)       -- e_z^T applied to the ego centre via H_i and sensor2ego -> cam_height;
-    #                                   Jacobian sparsity: d/ds = 0, d/drho = 0 (the §5.4 thesis).
+    #   1. Sim3GaugePriorFactor(H_0)          -- tight prior to init; fixes the 7-DoF gauge (incl. scale).
+    #   2. ColmapRelativeSim3Factor(H_{i-1},H_i) -- (rel_R[i], rel_t[i]); rotation + local-unit translation +
+    #                                            scale constancy s_i = s_{i-1}, in one factor.
+    #   3. DepthRatioPriorFactor(rho)         -- residual rho - log(depth_ratio_median); sigma = |MAD|.
+    #   4. GroundAnchorSim3Factor(H_i, rho)   -- per road obs k: e_z^T( s_i R_i (e^{rho} depth_k ray_k) + t_i ) -> 0.
+    #   5. EgoOnGroundFactor(H_i)             -- e_z^T ego centre via H_i, sensor2ego -> cam_height;
+    #                                            Jacobian sparsity d/ds = 0, d/drho = 0 (the §5.4 thesis).
     #
     raise NotImplementedError(
         "§14 variable representation + factors are author core (CLAUDE.md §3/§8): pick a Values-storable "

@@ -6,9 +6,8 @@
 
 Runs prompt-based road segmentation (CLIPSeg) and point tracking (CoTracker) over
 a scene's CAM_FRONT keyframes and writes ``tracks.npz`` / ``masks.npz`` under the
-cache root, ready for ``scripts/run_slam.py``. With ``--preview DIR`` it also
-writes a few overlay PNGs so the mask and tracks can be verified visually before
-the graph is built on them.
+cache root. With ``--preview DIR`` it also writes a few overlay PNGs so the mask
+and tracks can be verified visually.
 
 First run downloads the CLIPSeg (~150 MB) and CoTracker weights.
 """
@@ -133,7 +132,7 @@ def main() -> int:
                                 max_shift_px=args.refine_max_shift),
         ))
         tracks = tracker.track_scene(keyframes, masks=mask_dict)
-        cache.save_tracks(args.cache_root, scene_name, tracks)                       # canonical (run_slam)
+        cache.save_tracks(args.cache_root, scene_name, tracks)                       # canonical
         cache.save_tracks(args.cache_root, scene_name, tracks, variant=args.tracker)  # tagged copy
         ng = "n/a" if tracks.is_ground is None else int(tracks.is_ground.sum())
         seeds = "1 (frame 0)" if tracks.seed_frame is None else f"{len(np.unique(tracks.seed_frame))} frames"
