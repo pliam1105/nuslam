@@ -953,9 +953,12 @@ lie on the ground plane $z=0$,
 
 $$r = e_z^\top\big(H_i\cdot e^{\rho_m} d\,K^{-1}\tilde u\big)\ \to\ 0.$$
 
-Road pixels come from the segmentation frontend (road minus sky/vehicle); per frame they are
-RANSAC-plane-gated in the camera frame (rejecting curb/low-object mask bleed — RANSAC, not
-least-squares), Huber-robustified, and the noise is **normalized by the surviving point count**
+Road pixels come from the segmentation frontend (SAM3 road minus sky/vehicle). Per frame they are first
+cut to rays **≥10° below the (leveled-camera) horizon** — the camera only sees ~19.5° down at the bottom
+row, so this drops the far-horizon road where monocular depth is unreliable (a small tilt error × 100 m
+ahead is a large height error) without touching the masks, which are clean. They are then
+RANSAC-plane-gated in the camera frame (a cheap robustifier; on these clean masks it keeps ~all of them),
+Huber-robustified, and the noise is **normalized by the surviving point count**
 ($\sigma\propto\sqrt{N}$) so a frame's ground evidence carries a fixed weight regardless of how many
 pixels survive. This factor fixes the plane ($z$, roll, pitch) but is **scale-free**: a plane at $z=0$
 is unchanged by a global rescale, so it cannot pin $s$ alone.
@@ -996,13 +999,13 @@ purely as a diagnostic: it absorbs scale, and its fitted scale is the residual s
 
 | Alignment | ATE rmse | ATE median | RPE trans | RPE rot | fitted scale |
 |---|---|---|---|---|---|
-| **se2** (SO(2)+t, scale = 1) — the metric score | **2.38 m** | 1.52 m | 0.52 m | 0.69° | 1.000 |
-| se3 (SE(3), scale = 1) | 2.38 m | 1.52 m | — | — | 1.000 |
-| sim3 (7-DoF, absorbs scale) — diagnostic | 1.43 m | 0.96 m | — | — | 1.086 |
+| **se2** (SO(2)+t, scale = 1) — the metric score | **2.32 m** | 1.59 m | 0.53 m | 0.69° | 1.000 |
+| se3 (SE(3), scale = 1) | 2.32 m | 1.59 m | — | — | 1.000 |
+| sim3 (7-DoF, absorbs scale) — diagnostic | 1.39 m | 0.85 m | — | — | 1.084 |
 
 That `se2 ≈ se3` confirms the frame is genuinely gravity-aligned (nothing tilts to reduce the error),
-and that `sim3` only improves to 1.43 m by fitting `scale = 1.086` shows the metric scale is correct to
-**~9%** — the gap between the rows *is* that scale error. Recovered camera heights are 1.14–1.60 m
+and that `sim3` only improves to 1.39 m by fitting `scale = 1.084` shows the metric scale is correct to
+**~8%** — the gap between the rows *is* that scale error. Recovered camera heights are 1.22–1.62 m
 against a true mounting height of 1.51 m.
 
 ![se2-aligned trajectory vs GT](docs/factorgraph_traj_se2.png)
@@ -1013,9 +1016,9 @@ submap 4 (purple), consistent with the height plot below.
 ![Post-alignment camera & ground heights](docs/factorgraph_camera_heights.png)
 
 Per-frame, se2-aligned: the camera height (blue) tracks the desired 1.51 m (dotted) across the run,
-drifting only in the final submap; the road points (orange median, min–max band) sit at the $z=0$ plane
-the ground anchor enforces. The tail drift and the band spread are the visible form of the residual 9%
-scale error.
+drifting only in the final submap; the road points (orange median, min–max band) sit tight on the $z=0$
+plane the ground anchor enforces (±0.3–0.5 m, after the ≥10° horizon cut removes the far-horizon depth
+tail). The camera-height dip in the last submap is the visible form of the residual ~8% scale error.
 
 The full SO(2)-aligned reconstruction — per-submap point clouds and camera trajectories (one colour per
 submap) overlaid on the GT track (white) — is in `docs/factorgraph_se2.rrd`
@@ -1028,13 +1031,14 @@ Top: the coloured per-submap point clouds and camera trajectories overlaid on GT
 coincide and the submaps tile the scene. Bottom: the side view shows the reconstruction is flat on the
 ground plane with the cameras floating at the metric mounting height.
 
-**Ground-mask quality (a limitation).** The ground anchor consumes **SAM3** road masks
-(`sam3-road-0.35`, minus sky and vehicle). They are imperfect — `docs/ground_masks.mp4` overlays the
-anchor's ground mask on every frame — and worst in the last submap, where the road label bleeds across
-the curb onto the raised sidewalk/median (with traffic cones) that is **not coplanar** with the
-drivable road. Those off-plane points noise up the ground-plane fit there, which is part of why the
-residual scale/tilt error concentrates in submap 4. The RANSAC per-frame plane gate rejects the worst
-of it, but a tighter road label (or an explicit curb/kerb exclusion) is the clean fix.
+**What actually limits it (not the masks).** The **SAM3** road masks (`sam3-road-0.35`, minus sky and
+vehicle; `docs/ground_masks.mp4` overlays them) are clean and correctly applied — the selected rays land
+in the road region and the RANSAC gate keeps ~all of them. The real error source is **unreliable
+monocular depth at the far horizon**: road pixels near the horizon back-project ~100 m ahead, where a
+small residual tilt becomes a large height error (the ground-point height band ran to ±2 m before, driven
+entirely by that tail, not by any mask bleed). The **≥10° horizon cut** removes it — the band collapses to
+±0.3–0.5 m and the median sits on the plane. A minor curb/median bleed does remain in the last submap, but
+it is second-order next to the depth tail; a tighter road label or explicit kerb exclusion would clean it.
 
 ## Roadmap
 
@@ -1092,9 +1096,10 @@ of it, but a tighter road label (or an explicit curb/kerb exclusion) is the clea
   joint optimization.
 - Factor-graph SLAM — the **submap Sim(3) metric factor graph is built and evaluated** (GTSAM; see
   "Metric factor-graph SLAM"): 5 submaps, 1-frame overlap, semantic-ground + ego-height anchors, GT-free
-  metric init, **se2 ATE 2.38 m** on `scene-0061` with scale locked to ~9%. Near-term on it: tighter road
-  masks / kerb exclusion (the SAM3 bleed that concentrates the residual scale error in the last submap),
-  a wheel-contact anchor beside the camera height, and inverse-covariance ground weighting. Still the
+  metric init, **se2 ATE 2.32 m** on `scene-0061` with scale locked to ~8%. Near-term on it: a
+  wheel-contact anchor beside the camera height, inverse-covariance ground weighting, and pushing the
+  residual scale error in the last submap (the ≥10° horizon cut already removed the far-depth tail that
+  dominated it). Still the
   parked extension — each a standard factor on the same Sim(3) variables at no structural cost: the
   **3DGS render as a factor** (one term among several, never the sole pose authority — §"Pose
   refinement" shows it fails alone), **IMU** (gravity→roll/pitch, gyro→yaw — the DoF that drift under

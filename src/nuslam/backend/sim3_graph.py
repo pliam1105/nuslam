@@ -612,6 +612,17 @@ def metric_init(inputs, values, *, down_axis=(0., 1., 0.)) -> tuple:
     return R_align, alpha
 
 
+def _horizon_below_mask(rays: np.ndarray, horizon_deg: float) -> np.ndarray:
+    """Boolean mask keeping camera-frame rays that point at least ``horizon_deg`` BELOW the horizon,
+    assuming a leveled camera (OpenCV convention: x right, y down, z forward, so the horizon is y=0).
+    Drops the far/near-horizon road (where monocular depth is worst); a geometric cut, not mask-gating."""
+    rays = np.asarray(rays, float)
+    if len(rays) == 0:
+        return np.zeros(0, bool)
+    below_deg = np.degrees(np.arctan2(rays[:, 1], np.hypot(rays[:, 0], rays[:, 2])))   # +ve = below horizon
+    return below_deg >= horizon_deg
+
+
 def _ransac_ground_inliers(P: np.ndarray, *, thresh: float = 0.10, iters: int = 200, seed: int = 0):
     """RANSAC plane fit to camera-frame road points P (n,3); returns an inlier boolean mask. Frame-local
     and gauge-independent -- rejects mask bleed (curbs, low objects) before they poison the ground anchor
@@ -634,6 +645,8 @@ def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, al
                        use_anchors: bool = False, ground_sigma: float = 0.6, ego_sigma: float = 0.20,
                        horiz_pos_sigma: float = 1e-2, horiz_head_sigma: float = 1e-3,
                        first_pose_rot_sigma: float = None, apply_metric_init: bool = True,
+                       horizon_deg: float = 10.0,     # keep road >=10 deg below the (leveled) horizon; the
+                       # camera only sees ~19.5 deg down at the bottom row, so this drops the noisy far tail
                        max_ground_per_frame: int = 100, ground_ransac_thresh: float = 0.10):
     """Build the SUBMAP §14 graph (VGGT-SLAM 2.0 style) + initial Values from `inputs`.
 
@@ -708,6 +721,8 @@ def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, al
             for j in range(len(sm.frame_idx)):
                 graph.add(EgoOnGroundFactor(_HM(sm.id, j), s2e, ego_noise).as_custom_factor())
                 rays = np.asarray(sm.ground_rays[j], float); depths = np.asarray(sm.ground_depths[j], float)
+                hb = _horizon_below_mask(rays, horizon_deg)      # keep road >= horizon_deg below the horizon
+                rays, depths = rays[hb], depths[hb]
                 if len(rays) < 3: continue                       # skip weakly-supported frames
                 P = depths[:, None] * rays                       # camera-frame road points (metric up to window scale)
                 inl = _ransac_ground_inliers(P, thresh=ground_ransac_thresh)
