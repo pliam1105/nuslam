@@ -395,6 +395,27 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
         recons.append(dict(idx=np.asarray(d["frame_idx"]), toks=list(d["tokens"]), c2w=c2w,
                            da3_rays=list(d["da3_rays"]), da3_depths=list(d["da3_depths"]), ratios=list(d["ratios"])))
 
+    # --- ONE-FRAME overlap. Re-slice each source window to a contiguous sub-range so adjacent submaps share
+    # EXACTLY the single boundary frame -- reconstructed in BOTH source windows, hence two variables. The
+    # boundary is picked from the source-window overlap (so it exists in both). No multi-frame overlap exists
+    # by construction; the alignment and the 6-DOF init init are then one shared frame, one composition. ---
+    full = [list(np.asarray(rc["idx"]).astype(int)) for rc in recons]
+    bounds = []
+    for m in range(len(recons) - 1):
+        sh = [f for f in full[m] if f in set(full[m + 1])]
+        if not sh:
+            raise ValueError(f"source windows {m},{m + 1} do not overlap -- cannot form a 1-frame boundary")
+        bounds.append(int(sh[len(sh) // 2]))                 # a frame present in BOTH source windows
+    for m, rc in enumerate(recons):
+        lo = bounds[m - 1] if m > 0 else full[m][0]
+        hi = bounds[m] if m < len(recons) - 1 else full[m][-1]
+        keep = [k for k, f in enumerate(full[m]) if lo <= f <= hi]
+        rc["idx"] = np.asarray(full[m])[keep]
+        rc["c2w"] = rc["c2w"][keep]
+        rc["toks"] = [rc["toks"][k] for k in keep]
+        rc["da3_rays"] = [rc["da3_rays"][k] for k in keep]
+        rc["da3_depths"] = [rc["da3_depths"][k] for k in keep]
+
     # chain-place each submap into a common world by composing ONE shared frame's full 6-DOF (SE(3)) pose.
     # World = submap-0's own COLMAP frame. Placement is rotation+translation only (no scale fit): the SE(3)
     # that carries that one shared camera's local pose onto its already-placed world pose, applied rigidly to
@@ -431,18 +452,19 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
                                    da3_rays=rc["da3_rays"], da3_depths=rc["da3_depths"],
                                    ground_rays=g_rays, ground_depths=g_depths))
 
-    # overlaps -> submap-alignment. log_s = median DA3(n)/DA3(m) at shared frames (pixel-aligned strided depths).
+    # overlaps -> submap-alignment. EXACTLY one shared frame per adjacent pair (the boundary); the alignment
+    # is one factor per overlap on that single shared camera. log_s = median DA3(n)/DA3(m) at that frame.
     overlaps = []
     for a in range(len(submaps)):
         for b in range(a + 1, len(submaps)):
             sh = np.intersect1d(submaps[a].frame_idx, submaps[b].frame_idx)
             if not sh.size: continue
+            assert sh.size == 1, f"1-frame overlap only: submaps {a},{b} share {sh.size} frames ({sh.tolist()})"
             ma = {int(g): j for j, g in enumerate(submaps[a].frame_idx)}
             mb = {int(g): j for j, g in enumerate(submaps[b].frame_idx)}
-            ratios = []
-            for g in sh:
-                zm = submaps[a].da3_depths[ma[int(g)]]; zn = submaps[b].da3_depths[mb[int(g)]]
-                msk = (zm > 0) & (zn > 0); ratios.extend((zn[msk] / zm[msk]).tolist())    # DA3(n)/DA3(m)
+            g = int(sh[0])
+            zm = submaps[a].da3_depths[ma[g]]; zn = submaps[b].da3_depths[mb[g]]
+            msk = (zm > 0) & (zn > 0); ratios = (zn[msk] / zm[msk]).tolist()          # DA3(n)/DA3(m) at the boundary
             log_s, ssig, _ = _log_ratio_stats(ratios)
             overlaps.append(SubmapOverlap(m=a, n=b, shared_frame_idx=sh,
                                           m_local=np.array([ma[int(g)] for g in sh]),

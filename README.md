@@ -343,7 +343,8 @@ correction, leaving roll/pitch/$z$ to the ground anchor.
 | 3DGS representation, gsplat calls, training loop, photometric + depth + sky losses, MCMC regularizers, sky/vehicle masking | `nuslam.recon.gaussians` | core — built |
 | Rerun logging (images, frusta, point clouds, splats) + figures | `nuslam.viz` | infrastructure |
 | Trajectory eval (Umeyama Sim(3)/SE(3), ATE/RPE) — GT as oracle | `nuslam.eval` | infrastructure |
-| Factor-graph SLAM integration (render-as-a-factor + fusion) | `nuslam.backend` | parked |
+| Metric submap Sim(3) factor graph (semantic-ground anchors, GTSAM) | `nuslam.backend` | core — built + evaluated (see "Metric factor-graph SLAM") |
+| Factor-graph SLAM extension (render-as-a-factor + IMU/wheel/GPS fusion + loop closure) | `nuslam.backend` | parked |
 
 The reconstruction core — the Gaussian representation and initialization, the gsplat rasterizer
 calls, the training loop, the pose refinement, the losses, the DAQ metric-upgrade solve, and the
@@ -833,6 +834,200 @@ Produced by the viz scripts (into the gitignored `out/`), each pose-source aware
   stitched across iterations (correct for any pose source, no re-render).
 - `scripts/replay_gs_rrd.py` — the full-density Gaussian evolution (all snapshots + the final) +
   curves + GT/render images as a Rerun `.rrd`, scrubbable on the `iter` timeline.
+
+## Metric factor-graph SLAM (submap Sim(3) graph)
+
+The stages above resolve metric scale inside a single batch reconstruction. This section lifts that
+into a **factor graph** over a chain of overlapping submaps — the structure a real incremental SLAM
+system needs — while keeping the same principle: metric geometry from calibration plus a semantic
+ground anchor, never from ground truth. It is built and evaluated end-to-end on `scene-0061`
+(`nuslam.backend`); the render-as-a-factor / IMU / GPS fusion is the remaining parked extension.
+
+### Why a factor graph, and the relation to VGGT-SLAM
+
+A batch solve over one window does not scale: drift accumulates, the linear system grows, and there
+is no incremental relinearization. The standard answer is a **factor graph** — variables (camera
+poses, scales) tied by **factors** (measurements, each a residual with a noise model), solved by
+sparse nonlinear least squares (GTSAM / Levenberg–Marquardt here, iSAM2 later).
+
+The submap structure follows **VGGT-SLAM**. VGGT-SLAM (1.0) does dense SLAM over feed-forward VGGT
+reconstructions by splitting the stream into overlapping **submaps** and aligning them on their shared
+frames — but, being uncalibrated feed-forward, it aligns in **SL(4)** (a projective homography per
+submap) and inherits the full projective ambiguity: no metric, no gravity. The **2.0** architecture
+replaces the projective alignment with **Sim(3)** — one similarity per pose, an overlap frame carried
+as **two** variables (one per submap) tied by an alignment factor — which is calibrated and
+scale-aware but still up-to-a-global-scale.
+
+This work adopts the VGGT-SLAM 2.0 submap-and-Sim(3) skeleton and makes it **monocular and metric**:
+each submap is reconstructed independently (per-window COLMAP for up-to-scale poses + DA3-Base depth +
+DAQ metric upgrade), and the global scale gauge is broken **from semantics** — a road-plane ground
+anchor plus the known camera-mounting height — inside the graph itself. That semantic-metric anchor in
+a Sim(3) submap graph is the contribution; the alignment machinery is adapted, not invented.
+
+### Submap architecture
+
+`scene-0061` (39 CAM_FRONT keyframes) is split into 5 submaps, each an **independent** reconstruction in
+its own up-to-scale COLMAP frame (COLMAP + DA3 + DAQ per window). Adjacent submaps overlap by **exactly
+one frame** — the boundary frame (here frames 9, 16, 23, 30) — which is reconstructed **twice**, once in
+each submap, and so becomes two variables tied by a submap-alignment factor. That single shared camera is
+the only thing coupling two submaps, which is the minimal, honest test of the alignment. Submaps are
+chain-placed into a common world for initialization only, by **one** $\mathrm{SE}(3)$ composition per
+overlap: the full 6-DoF pose that carries that one boundary camera's local pose onto its already-placed
+world pose, applied rigidly to the whole submap (no scale fit, no Umeyama over multiple centres — scale
+is left entirely to the anchors).
+
+### Variables
+
+| Variable | Type | Meaning |
+|---|---|---|
+| $H^m_j$ | `gtsam.Similarity3` | submap $m$'s camera $j$: local COLMAP frame → world. Its scale $s$ is COLMAP-units → metres. Overlap frame ⇒ one $H$ per submap. |
+| $\rho_m$ | `double` | $\log\big(\mathrm{median}(z^{\text{colmap}}/z^{\text{da3}})\big)$, the DA3-depth → COLMAP-units log-ratio, one per submap. |
+
+Two scales, deliberately (this is the crux of a monocular metric submap graph): $\rho_m$ converts DA3
+depth into that window's arbitrary COLMAP units; $s_i$ (inside $H_i$) converts COLMAP units into
+metres. The world point of a pixel $\tilde u$ at DA3 depth $d$ is
+
+$$X \;=\; s_i R_i\,\big(e^{\rho_m}\, d\, K^{-1}\tilde u\big) \;+\; s_i t_i \;=\; H_i \cdot \big(e^{\rho_m} d\,K^{-1}\tilde u\big).$$
+
+Log-scale, not scale: positivity is free and the ratio factor becomes linear. GTSAM's `Similarity3`
+stores $H=\left[\begin{smallmatrix}R&t\\0&1/s\end{smallmatrix}\right]$ and acts as
+$\mathrm{transformFrom}(p)=s(Rp+t)$, so the **camera centre is $s\,t=\mathrm{transformFrom}(0)$, not
+$t$** — a convention that has to be respected everywhere a centre is read or a factor Jacobian written.
+
+### Factors
+
+The generic backbone is stock GTSAM; the semantic-metric couplings are custom factors in
+`nuslam.backend.factors` (residual + analytic Jacobians written by hand — the Python wrapper of this
+build exposes no `OptionalJacobian`/`numericalDerivative` for `Similarity3`, so the Jacobians are
+derived in closed form; see the GTSAM handbook for the full derivations, verified against numerical
+differentiation to $\sim\!10^{-10}$).
+
+**COLMAP relative (within-submap)** — stock `BetweenFactorSimilarity3`. Consecutive poses are tied by
+the window's COLMAP relative pose with scale ratio $1$: $\ \mathrm{meas}=H^m_{j-1}{}^{-1}H^m_j=(R_{\text{rel}},t_{\text{rel}},1)$.
+This pins the trajectory **shape** in COLMAP units; it says nothing about absolute scale (all $s$ within
+a submap share one value).
+
+**Depth-ratio prior** — stock `PriorFactorDouble`: $\rho_m \sim \log\hat r_m$, $\sigma = 1.4826\cdot\mathrm{MAD}(\log r)$
+(the outlier-robust spread of the per-point COLMAP/DA3 depth ratios in the window).
+
+**Submap-alignment** — custom, on the two $H$ variables of a shared camera **and both** $\rho$'s. A
+shared camera coincides, so the two submaps' poses must be equal up to the pure scale ratio $s_n/s_m$.
+The subtlety is that this ratio is **not** the raw DA3 depth ratio: a shared 3-D point has one metric
+depth computed either way, $s_m e^{\rho_m} z^{\text{da3}}_m = s_n e^{\rho_n} z^{\text{da3}}_n$, so
+
+$$\hat s = \frac{s_n}{s_m} = \exp\!\big((\rho_m-\rho_n) - \log\hat r\big),\qquad \log\hat r=\log\mathrm{median}\,\tfrac{z^{\text{da3}}_n}{z^{\text{da3}}_m},$$
+
+which depends on the **variables** $\rho_m,\rho_n$ — hence a custom factor, not a fixed-measurement
+between-factor. Residual $r=\mathrm{Log}\big(\mathrm{meas}^{-1}(H^m{}^{-1}H^n)\big)$ with
+$\mathrm{meas}=(I,0,\hat s)$; the two $H$ columns are the ordinary between-factor Jacobians
+($J_r^{-1}(r)$ side), and the two $\rho$ columns enter through the measurement on the left, giving
+$\partial r/\partial\rho_m=-J_l^{-1}(r)\,e_\lambda$, $\partial r/\partial\rho_n=+J_l^{-1}(r)\,e_\lambda$
+(left Jacobian inverse — not right; they agree only at $r=0$). Empirically the $\rho_m$ span 2.1–2.7
+across the five windows, so dropping the $e^{\rho_m-\rho_n}$ correction puts $\hat s$ off by up to
+$2\times$ and the solve diverges.
+
+**Gauge (first pose)** — the reconstruction has a free 7-DoF $\mathrm{Sim}(3)$ gauge that must be
+pinned, but **only where the anchors cannot**. A horizontal ground plane is invariant to horizontal
+translation and yaw, so those 3 DoF are pure gauge; $z$, roll, pitch are what the plane *measures* and
+scale is what ego measures — pinning them would fight the anchors. So the first-pose gauge is a custom
+**horizontal-translation + heading** factor, built with a rotated-axis-normalization construction:
+
+$$r_{\text{pos}} = (H_0\,e_0)_{xy}-(0,0),\qquad r_{\text{head}} = \frac{(H_0 e_z - H_0 e_0)_{xy}}{\lVert\cdot\rVert}-(1,0),$$
+
+i.e. the camera centre's horizontal position, and the forward axis projected to the ground and
+normalized to a unit heading. Both are scale-free by construction (the position's zero-set $t_{xy}=0$ is
+independent of $s$; the heading is a unit direction, so normalization divides $s$ out and its $\lambda$
+column is exactly $0$). It fixes $(x,y,\text{yaw})$ and nothing else. A twin **upright** factor (down
+axis normalized, targets zero horizontal component → roll/pitch) exists for robustness but is **off by
+default** — see the collapse discussion below.
+
+**Ground anchor** — custom, binary on $(H_i,\rho_m)$: a road pixel back-projected to its DA3 depth must
+lie on the ground plane $z=0$,
+
+$$r = e_z^\top\big(H_i\cdot e^{\rho_m} d\,K^{-1}\tilde u\big)\ \to\ 0.$$
+
+Road pixels come from the segmentation frontend (road minus sky/vehicle); per frame they are
+RANSAC-plane-gated in the camera frame (rejecting curb/low-object mask bleed — RANSAC, not
+least-squares), Huber-robustified, and the noise is **normalized by the surviving point count**
+($\sigma\propto\sqrt{N}$) so a frame's ground evidence carries a fixed weight regardless of how many
+pixels survive. This factor fixes the plane ($z$, roll, pitch) but is **scale-free**: a plane at $z=0$
+is unchanged by a global rescale, so it cannot pin $s$ alone.
+
+**Ego-on-ground anchor** — custom, unary on $H_i$: the ego origin sits on the road plane,
+
+$$r = e_z^\top\big(\underbrace{s_i t_i}_{\text{metric centre}} + \underbrace{R_i\,p_{\text{local}}}_{\text{metric lever, unscaled}}\big)\ \to\ 0,\qquad p_{\text{local}}=(\text{sensor}\to\text{ego})^{-1}_{:3,3},$$
+
+where $p_{\text{local}}$ is the camera→ego-origin offset from the extrinsics, **in metres and rotated but
+not scaled** (feeding it through `transformFrom` would double-scale a metric quantity). This is the one
+metric length in the graph: the camera floats a known height above the road, so it is what breaks the
+scale gauge. Its Jacobian is $\big[-R_i[p_{\text{local}}]_\times \mid s_iR_i \mid 0\big]_{z,:}$ — the
+$\lambda$ column is $0$ (the centre is scale-invariant in the right tangent), so scale is observed
+*through the ground+ego pair jointly*, not through this factor's scale column. The ground fixes the
+plane; ego supplies the metre; neither alone observes scale.
+
+### Resolving the scale-collapse: a GT-free metric init
+
+Turning the anchors on exposes a spurious minimum at $s\to0$: as scale vanishes every world point
+$s(Rp+t)\to0$, so **all** ground residuals are satisfied by collapse (and, satisfied, stop constraining
+roll/pitch, freeing the rotation to null the ego lever too). It is a competing basin, not a missing
+constraint — initialized at metric scale the solve stays there (ATE ~5 m); initialized at $s=1$ it
+slides into collapse. The fix is a **one-time, GT-free metric init**: (1) rotate the world so the first
+camera's down axis maps to world $-z$ (upright, making $z$ up), then (2) set the global scale from the
+ego constraint itself, $\alpha = \text{cam\_height} / \mathrm{median}_i\big(C_{i,z}-z^{\text{ground}}_i\big)$
+— the up-to-scale camera-height-above-road driven to metres. No RANSAC, no GT: just the median
+camera-vs-ground height. With this init the upright factor is redundant (identical ATE on or off), so
+it is off by default; the anchor covariances are then tuned once, offline, by starting everything soft
+except the gauge and tightening the ground/ego balance until scale locks without collapsing.
+
+### Results
+
+`scene-0061`, 5 submaps, anchors on, GT-free metric init, evaluated against nuScenes GT ego poses.
+Because the reconstruction is **metric and gravity-aligned**, it is scored under an **SO(2) ("se2")**
+alignment — yaw + translation, **scale fixed to 1** — which removes only the horizontal gauge the graph
+leaves free and lets any scale or tilt error survive into the error. A Sim(3) alignment is reported too,
+purely as a diagnostic: it absorbs scale, and its fitted scale is the residual scale error.
+
+| Alignment | ATE rmse | ATE median | RPE trans | RPE rot | fitted scale |
+|---|---|---|---|---|---|
+| **se2** (SO(2)+t, scale = 1) — the metric score | **2.38 m** | 1.52 m | 0.52 m | 0.69° | 1.000 |
+| se3 (SE(3), scale = 1) | 2.38 m | 1.52 m | — | — | 1.000 |
+| sim3 (7-DoF, absorbs scale) — diagnostic | 1.43 m | 0.96 m | — | — | 1.086 |
+
+That `se2 ≈ se3` confirms the frame is genuinely gravity-aligned (nothing tilts to reduce the error),
+and that `sim3` only improves to 1.43 m by fitting `scale = 1.086` shows the metric scale is correct to
+**~9%** — the gap between the rows *is* that scale error. Recovered camera heights are 1.14–1.60 m
+against a true mounting height of 1.51 m.
+
+![se2-aligned trajectory vs GT](docs/factorgraph_traj_se2.png)
+
+Top-down, se2-aligned: the five submaps (coloured) track the GT ego track (grey); the tail drift is
+submap 4 (purple), consistent with the height plot below.
+
+![Post-alignment camera & ground heights](docs/factorgraph_camera_heights.png)
+
+Per-frame, se2-aligned: the camera height (blue) tracks the desired 1.51 m (dotted) across the run,
+drifting only in the final submap; the road points (orange median, min–max band) sit at the $z=0$ plane
+the ground anchor enforces. The tail drift and the band spread are the visible form of the residual 9%
+scale error.
+
+The full SO(2)-aligned reconstruction — per-submap point clouds and camera trajectories (one colour per
+submap) overlaid on the GT track (white) — is in `docs/factorgraph_se2.rrd`
+(`rerun docs/factorgraph_se2.rrd`):
+
+![RRD top-down](docs/factorgraph_rrd_topdown.png)
+![RRD ground plane and camera height](docs/factorgraph_rrd_groundplane.png)
+
+Top: the coloured per-submap point clouds and camera trajectories overlaid on GT (white) — the tracks
+coincide and the submaps tile the scene. Bottom: the side view shows the reconstruction is flat on the
+ground plane with the cameras floating at the metric mounting height.
+
+**Ground-mask quality (a limitation).** The ground anchor consumes **SAM3** road masks
+(`sam3-road-0.35`, minus sky and vehicle). They are imperfect — `docs/ground_masks.mp4` overlays the
+anchor's ground mask on every frame — and worst in the last submap, where the road label bleeds across
+the curb onto the raised sidewalk/median (with traffic cones) that is **not coplanar** with the
+drivable road. Those off-plane points noise up the ground-plane fit there, which is part of why the
+residual scale/tilt error concentrates in submap 4. The RANSAC per-frame plane gate rejects the worst
+of it, but a tighter road label (or an explicit curb/kerb exclusion) is the clean fix.
 
 ## Roadmap
 
