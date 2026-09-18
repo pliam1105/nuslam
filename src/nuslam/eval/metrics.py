@@ -26,19 +26,46 @@ import numpy as np
 from ..transforms import umeyama
 
 
+def _align_se2(est: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Yaw-only (rotation about world +z) + 3D translation, scale = 1. Closed-form 2D Procrustes on the
+    horizontal (x,y) track, z factored out by a pure offset. This is the alignment for a gravity-aligned
+    METRIC reconstruction ("SO(2) w/ GPS"): it removes only the horizontal gauge the HorizontalGaugeFactor
+    leaves free (x, y, yaw) plus the vertical datum, so scale and tilt error survive into the ATE."""
+    ex, gt_c = est[:, :2], gt[:, :2]
+    mu_e, mu_g = ex.mean(0), gt_c.mean(0)
+    ec, gc = ex - mu_e, gt_c - mu_g
+    # theta minimizing ||Rz(theta) ec - gc||: from the 2x2 cross-covariance (SVD-free 2D form)
+    a = float((ec[:, 0] * gc[:, 0] + ec[:, 1] * gc[:, 1]).sum())   # sum ec . gc
+    b = float((ec[:, 0] * gc[:, 1] - ec[:, 1] * gc[:, 0]).sum())   # sum ec x gc
+    theta = np.arctan2(b, a)
+    c, s = np.cos(theta), np.sin(theta)
+    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    t = np.zeros(3)
+    t[:2] = mu_g - R[:2, :2] @ mu_e
+    t[2] = float(gt[:, 2].mean() - est[:, 2].mean())              # z datum offset only (no scale, no tilt)
+    T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
+    return T, np.array([theta])
+
+
 def align_trajectories(
     est_positions: np.ndarray, gt_positions: np.ndarray, *, mode: str = "sim3"
 ) -> tuple[np.ndarray, float, np.ndarray]:
-    """Align ``est`` positions to ``gt``. ``mode`` in {"none", "se3", "sim3"}.
+    """Align ``est`` positions to ``gt``. ``mode`` in {"none", "se2", "se3", "sim3"}.
 
     Returns ``(aligned_positions, scale, T)`` where ``T`` is the 4x4 matrix such
     that ``aligned = est @ T[:3,:3].T + T[:3,3]`` (its rotation block folds in the
-    scale for sim3, so the same ``T`` also maps landmarks consistently).
+    scale for sim3, so the same ``T`` also maps landmarks consistently). ``se2`` is
+    yaw + translation only (scale = 1): the metric-run alignment that keeps scale and
+    tilt as error instead of absorbing them.
     """
     est = np.asarray(est_positions, dtype=np.float64)
     gt = np.asarray(gt_positions, dtype=np.float64)
     if mode == "none":
         return est.copy(), 1.0, np.eye(4)
+    if mode == "se2":
+        T, _ = _align_se2(est, gt)
+        aligned = est @ T[:3, :3].T + T[:3, 3]
+        return aligned, 1.0, T
     scale, R, t = umeyama(est, gt, with_scale=(mode == "sim3"))
     T = np.eye(4)
     T[:3, :3] = scale * R

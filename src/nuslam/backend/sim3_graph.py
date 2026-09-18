@@ -113,6 +113,10 @@ class SubmapRecon:
     da3_rays: list                    # per-frame (Nk,3): K^{-1}[u,v,1]
     da3_depths: list                  # per-frame (Nk,):  DA3 depth (metric-up-to-scale via this window's DAQ)
 
+    # --- ROAD-masked subset for the ground anchor (§14.4): road minus sky/veh, subsampled per frame ---
+    ground_rays: list                 # per-frame (Mk,3): K^{-1}[u,v,1] for road pixels only
+    ground_depths: list               # per-frame (Mk,):  this window's DA3 depth at those road pixels
+
 
 @dataclass
 class SubmapOverlap:
@@ -141,6 +145,7 @@ class SubmapGraphInputs:
     cam_height: float                 # sensor2ego[2,3] (for the ego anchor later)
     submaps: list                     # list[SubmapRecon]
     overlaps: list                    # list[SubmapOverlap]
+    gt_c2w: np.ndarray = None         # (N,4,4) GT camera->global (ego2global_gt @ sensor2ego), eval only
 
     @property
     def n_frames(self) -> int: return len(self.tokens)
@@ -151,13 +156,35 @@ class SubmapGraphInputs:
         sm = np.array([dict(id=s.id, frame_idx=s.frame_idx, tokens=np.array(s.tokens),
                             rel_R=s.rel_R, rel_t=s.rel_t, init_R=s.init_R, init_t=s.init_t, init_s=s.init_s,
                             log_r=s.log_r, log_r_sigma=s.log_r_sigma, n_ratio=s.n_ratio,
-                            da3_rays=np.array(s.da3_rays, dtype=object), da3_depths=np.array(s.da3_depths, dtype=object))
+                            da3_rays=np.array(s.da3_rays, dtype=object), da3_depths=np.array(s.da3_depths, dtype=object),
+                            ground_rays=np.array(s.ground_rays, dtype=object),
+                            ground_depths=np.array(s.ground_depths, dtype=object))
                        for s in self.submaps], dtype=object)
         ov = np.array([dict(m=o.m, n=o.n, shared_frame_idx=o.shared_frame_idx, m_local=o.m_local,
                             n_local=o.n_local, log_s=o.log_s, log_s_sigma=o.log_s_sigma)
                        for o in self.overlaps], dtype=object)
         np.savez(str(path), tokens=np.array(self.tokens), K=self.K, sensor2ego=self.sensor2ego,
-                 cam_height=self.cam_height, submaps=sm, overlaps=ov)
+                 cam_height=self.cam_height, submaps=sm, overlaps=ov,
+                 gt_c2w=(self.gt_c2w if self.gt_c2w is not None else np.zeros(0)))
+
+    @classmethod
+    def load(cls, path) -> "SubmapGraphInputs":
+        """Inverse of :func:`save` -- rebuild the dataclasses from the npz (pure numpy, no nuScenes)."""
+        d = np.load(str(path), allow_pickle=True)
+        submaps = [SubmapRecon(id=int(s["id"]), frame_idx=s["frame_idx"], tokens=list(s["tokens"]),
+                               rel_R=s["rel_R"], rel_t=s["rel_t"], init_R=s["init_R"], init_t=s["init_t"],
+                               init_s=s["init_s"], log_r=float(s["log_r"]), log_r_sigma=float(s["log_r_sigma"]),
+                               n_ratio=int(s["n_ratio"]), da3_rays=list(s["da3_rays"]), da3_depths=list(s["da3_depths"]),
+                               ground_rays=list(s.get("ground_rays", [])) if hasattr(s, "get") else list(s["ground_rays"]),
+                               ground_depths=list(s.get("ground_depths", [])) if hasattr(s, "get") else list(s["ground_depths"]))
+                   for s in d["submaps"]]
+        overlaps = [SubmapOverlap(m=int(o["m"]), n=int(o["n"]), shared_frame_idx=o["shared_frame_idx"],
+                                  m_local=o["m_local"], n_local=o["n_local"], log_s=float(o["log_s"]),
+                                  log_s_sigma=float(o["log_s_sigma"])) for o in d["overlaps"]]
+        gt = d["gt_c2w"] if "gt_c2w" in d.files else None
+        if gt is not None and gt.size == 0: gt = None
+        return cls(tokens=list(d["tokens"]), K=d["K"], sensor2ego=d["sensor2ego"],
+                   cam_height=float(d["cam_height"]), submaps=submaps, overlaps=overlaps, gt_c2w=gt)
 
 
 # ----------------------------------------------------------------------------- input prep (§4 plumbing, complete)
@@ -316,24 +343,41 @@ def submap_daq(dep_window, tokens_window, K_true, *, m_weight: float = 1.0):
 def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/frontend_cache",
                           dataroot: str = "data/nuscenes", version: str = "v1.0-mini",
                           submap_cache: str = "out/submap_cache",
+                          road_tag: str = "sam3-road-0.35", sky_tag: str = "sam3-sky-0.5",
+                          veh_tag: str = "sam3-moving-vehicle-0.5", ground_stride: int = 4,
                           window: int = 11, step: int = 7) -> SubmapGraphInputs:
     """Assemble the SUBMAP §14 inputs (VGGT-SLAM 2.0) from the REAL per-window reconstructions.
 
     Requires the per-window DA3+DAQ+COLMAP cache ``{submap_cache}/sm{m}.npz`` (one INDEPENDENT
     reconstruction per window: re-run DA3-Base, DAQ metric upgrade, tuned masked COLMAP). There is NO
     global-COLMAP fallback -- if a window is missing/under-registered this raises. Each submap keeps its
-    own up-to-scale frame; they are chain-PLACED into a common world by Umeyama on the shared cameras
-    (init only). The overlap ``log_s`` is the genuine median DA3(n)/DA3(m) ratio at the shared frames.
+    own up-to-scale frame; they are chain-PLACED into a common world by composing ONE shared frame's full
+    6-DOF pose (SE(3), no scale fit; init only). The overlap ``log_s`` is the genuine median DA3(n)/DA3(m)
+    ratio at the shared frames.
     Pure plumbing, no estimation."""
     from ..data import NuScenesMonoSource
     from ..frontend import cache as fcache
-    from ..transforms import umeyama
 
     src = NuScenesMonoSource(dataroot, version, camera="CAM_FRONT"); kfs = src.load_scene(scene)
     dep = fcache.load_depth(cache_root, scene)
     frames = [kf for kf in kfs if kf.token in dep]; tokens = [kf.token for kf in frames]; N = len(frames)
     K = np.asarray(frames[0].calib.intrinsic, np.float64)
     s2e = frames[0].calib.sensor2ego.matrix(); h = float(s2e[2, 3])
+    gt_c2w = np.stack([kf.ego2global_gt.matrix() @ kf.calib.sensor2ego.matrix() for kf in frames])  # (N,4,4) GT cam->global
+
+    # road masks for the ground anchor (road minus sky/veh); a helper selects road DA3 rays for a frame
+    road = fcache.load_seg_masks(cache_root, scene, road_tag)
+    sky = fcache.load_seg_masks(cache_root, scene, sky_tag); veh = fcache.load_seg_masks(cache_root, scene, veh_tag)
+    def _road_select(rays, depths, tok):
+        rays = np.asarray(rays, float); depths = np.asarray(depths, float)
+        uv = (K @ rays.T)                                        # rays = K^-1[u,v,1] -> uv = [u,v,1]
+        u = np.round(uv[0]).astype(int); v = np.round(uv[1]).astype(int)
+        Hm, Wm = road[tok].shape
+        ib = (u >= 0) & (u < Wm) & (v >= 0) & (v < Hm)
+        keep = np.zeros(len(rays), bool)
+        keep[ib] = (road[tok][v[ib], u[ib]] & ~sky[tok][v[ib], u[ib]] & ~veh[tok][v[ib], u[ib]] & (depths[ib] > 0))
+        idx = np.where(keep)[0][::ground_stride]
+        return rays[idx].astype(np.float32), depths[idx].astype(np.float32)
 
     wins = _windows(N, window, step); sc = Path(submap_cache)
     missing = [m for m in range(len(wins)) if not (sc / f"sm{m}.npz").exists()]
@@ -351,21 +395,26 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
         recons.append(dict(idx=np.asarray(d["frame_idx"]), toks=list(d["tokens"]), c2w=c2w,
                            da3_rays=list(d["da3_rays"]), da3_depths=list(d["da3_depths"]), ratios=list(d["ratios"])))
 
-    # chain-place each submap into a common world by Umeyama (with scale) on shared cameras (init only).
-    # World = submap-0's own COLMAP frame; init_s of window m = its local-COLMAP -> world scale.
-    world_by_global = {}; placed = []
+    # chain-place each submap into a common world by composing ONE shared frame's full 6-DOF (SE(3)) pose.
+    # World = submap-0's own COLMAP frame. Placement is rotation+translation only (no scale fit): the SE(3)
+    # that carries that one shared camera's local pose onto its already-placed world pose, applied rigidly to
+    # the whole submap. init_s stays 1 -- the per-submap relative scale is NOT fitted here; it is resolved by
+    # the submap-alignment factor (via rho + log_s). Init only; does not affect the optimum.
+    world_pose = {}; placed = []
     for m, rc in enumerate(recons):
         c2w = rc["c2w"]; idx = list(rc["idx"])
         if m == 0:
-            s_a, R_a, t_a = 1.0, np.eye(3), np.zeros(3)
+            R_a, t_a = np.eye(3), np.zeros(3)
         else:
-            shared = [g for g in idx if int(g) in world_by_global]
-            jm = [idx.index(g) for g in shared]
-            s_a, R_a, t_a = umeyama(c2w[jm, :3, 3], np.stack([world_by_global[int(g)] for g in shared]), with_scale=True)
+            g = next(int(gg) for gg in idx if int(gg) in world_pose)   # one shared frame (the first)
+            jl = idx.index(g); Rl, Cl = c2w[jl, :3, :3], c2w[jl, :3, 3]
+            Rw_g, Cw_g = world_pose[g]                                  # its full world pose already placed
+            R_a = Rw_g @ Rl.T                                           # SE(3) compose: world = R_a @ local + t_a
+            t_a = Cw_g - R_a @ Cl
         Rw = R_a[None] @ c2w[:, :3, :3]
-        Cw = c2w[:, :3, 3] @ (s_a * R_a).T + t_a
-        placed.append((Rw, Cw, np.full(len(idx), float(s_a))))
-        for j, g in enumerate(idx): world_by_global.setdefault(int(g), Cw[j])
+        Cw = c2w[:, :3, 3] @ R_a.T + t_a                                # s_a = 1
+        placed.append((Rw, Cw, np.ones(len(idx))))
+        for j, g in enumerate(idx): world_pose.setdefault(int(g), (Rw[j], Cw[j]))
 
     submaps = []
     for m, rc in enumerate(recons):
@@ -373,9 +422,14 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
         rel_R = np.stack([c2w[j - 1, :3, :3].T @ c2w[j, :3, :3] for j in range(1, len(idx))])
         rel_t = np.stack([c2w[j - 1, :3, :3].T @ (c2w[j, :3, 3] - c2w[j - 1, :3, 3]) for j in range(1, len(idx))])
         log_r, sig, nr = _log_ratio_stats(rc["ratios"])
+        g_rays, g_depths = [], []                                        # road-masked ground rays per frame
+        for j, tok in enumerate(rc["toks"]):
+            gr, gd = _road_select(rc["da3_rays"][j], rc["da3_depths"][j], tok)
+            g_rays.append(gr); g_depths.append(gd)
         submaps.append(SubmapRecon(id=m, frame_idx=idx, tokens=list(rc["toks"]), rel_R=rel_R, rel_t=rel_t,
                                    init_R=Rw, init_t=Cw, init_s=sw, log_r=log_r, log_r_sigma=sig, n_ratio=nr,
-                                   da3_rays=rc["da3_rays"], da3_depths=rc["da3_depths"]))
+                                   da3_rays=rc["da3_rays"], da3_depths=rc["da3_depths"],
+                                   ground_rays=g_rays, ground_depths=g_depths))
 
     # overlaps -> submap-alignment. log_s = median DA3(n)/DA3(m) at shared frames (pixel-aligned strided depths).
     overlaps = []
@@ -395,7 +449,8 @@ def prepare_submap_inputs(scene: str = "scene-0061", *, cache_root: str = "out/f
                                           n_local=np.array([mb[int(g)] for g in sh]),
                                           log_s=log_s, log_s_sigma=ssig))
 
-    return SubmapGraphInputs(tokens=tokens, K=K, sensor2ego=s2e, cam_height=h, submaps=submaps, overlaps=overlaps)
+    return SubmapGraphInputs(tokens=tokens, K=K, sensor2ego=s2e, cam_height=h, submaps=submaps,
+                             overlaps=overlaps, gt_c2w=gt_c2w)
 
 
 # ----------------------------------------------------------------------------- graph build harness
@@ -496,7 +551,68 @@ def _RHO_M(m: int) -> int:
     import gtsam
     return int(gtsam.symbol("r", m))              # per-submap depth-ratio scalar rho_m = log r_m (§14, DA3 per window)
 
-def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, align_pose_sigma: float = 3e-2):
+def _align_rot(a, b) -> np.ndarray:
+    """Rotation mapping unit vector a onto unit vector b (Rodrigues from the cross product)."""
+    a = np.asarray(a, float); a = a / np.linalg.norm(a)
+    b = np.asarray(b, float); b = b / np.linalg.norm(b)
+    v = np.cross(a, b); c = float(a @ b); n = np.linalg.norm(v)
+    if n < 1e-9:
+        return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+
+def metric_init(inputs, values, *, down_axis=(0., 1., 0.)) -> tuple:
+    """ONE-TIME GT-free metric init of the anchored graph's initial `values` (§14.5): (1) rotate the whole
+    world so the FIRST camera is upright (its down axis -> world -z), then (2) set the global scale so the
+    camera floats cam_height above the road, from the median (camera_z - ground_point_z) over all frames.
+    Places the init in the metric basin so the solve does not slide into the s->0 collapse. Applies the
+    global similarity (alpha, R_align, 0) to every H_i in place; returns (R_align, alpha)."""
+    s0 = inputs.submaps[0]
+    R0 = np.asarray(values.atSimilarity3(_HM(s0.id, 0)).rotation().matrix())
+    R_align = _align_rot(R0 @ np.asarray(down_axis, float), np.array([0., 0., -1.]))   # first cam down -> world down
+    diffs = []                                                    # up-to-scale camera height above the road
+    for sm in inputs.submaps:
+        for j in range(len(sm.frame_idx)):
+            S = values.atSimilarity3(_HM(sm.id, j))
+            C = R_align @ np.asarray(S.transformFrom(np.zeros(3))); R = R_align @ np.asarray(S.rotation().matrix())
+            rays = np.asarray(sm.ground_rays[j], float); depths = np.asarray(sm.ground_depths[j], float)
+            if len(rays) == 0: continue
+            gp = (R @ (np.exp(sm.log_r) * depths[:, None] * rays).T).T + C            # ground points in world (s=1)
+            diffs.append(C[2] - gp[:, 2])
+    dz = float(np.median(np.concatenate(diffs))) if diffs else 1.0
+    alpha = inputs.cam_height / dz if abs(dz) > 1e-6 else 1.0
+    for sm in inputs.submaps:                                     # apply global similarity (alpha, R_align, 0)
+        for j in range(len(sm.frame_idx)):
+            S = values.atSimilarity3(_HM(sm.id, j))
+            C = np.asarray(S.transformFrom(np.zeros(3))); R = np.asarray(S.rotation().matrix())
+            values.update(_HM(sm.id, j), _sim3(R_align @ R, alpha * (R_align @ C), alpha * S.scale()))
+    return R_align, alpha
+
+
+def _ransac_ground_inliers(P: np.ndarray, *, thresh: float = 0.10, iters: int = 200, seed: int = 0):
+    """RANSAC plane fit to camera-frame road points P (n,3); returns an inlier boolean mask. Frame-local
+    and gauge-independent -- rejects mask bleed (curbs, low objects) before they poison the ground anchor
+    (CLAUDE.md guardrail: RANSAC, not least-squares). Returns all-False if n < 3."""
+    n = len(P)
+    if n < 3:
+        return np.zeros(n, bool)
+    rng = np.random.default_rng(seed); best = np.zeros(n, bool)
+    for _ in range(iters):
+        i, j, k = rng.choice(n, 3, replace=False)
+        nrm = np.cross(P[j] - P[i], P[k] - P[i]); nn = np.linalg.norm(nrm)
+        if nn < 1e-9: continue
+        nrm /= nn; d = -nrm @ P[i]
+        inl = np.abs(P @ nrm + d) < thresh
+        if inl.sum() > best.sum(): best = inl
+    return best
+
+
+def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, align_pose_sigma: float = 3e-2,
+                       use_anchors: bool = False, ground_sigma: float = 0.6, ego_sigma: float = 0.20,
+                       horiz_pos_sigma: float = 1e-2, horiz_head_sigma: float = 1e-3,
+                       first_pose_rot_sigma: float = None, apply_metric_init: bool = True,
+                       max_ground_per_frame: int = 100, ground_ransac_thresh: float = 0.10):
     """Build the SUBMAP §14 graph (VGGT-SLAM 2.0 style) + initial Values from `inputs`.
 
     Each submap is INDEPENDENT: its frames are its OWN ``Similarity3`` variables ``H^m_j``, so an
@@ -505,9 +621,10 @@ def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, al
       * gauge prior on H^0_0 -- fixes the frame gauge (and scale, for now; see :func:`_gauge_noise`);
       * within-submap COLMAP relatives ``BetweenFactorSimilarity3(H^m_{j-1}, H^m_j, (1, rel_R, rel_t))``;
       * per-submap depth-ratio ``PriorFactorDouble(rho_m, log r_hat_m)``, sigma = 1.4826*MAD(log r);
-      * SUBMAP-ALIGNMENT ``BetweenFactorSimilarity3(H^m_a, H^n_b, (s_hat, I, 0))`` on each shared camera --
-        a PURE-SCALING measurement (§14.2), tight on the 6 SE(3) dims (the shared camera coincides),
-        s_hat = exp(log_s) from the DA3(n)/DA3(m) ratio at the overlap, sigma from its log-MAD.
+      * SUBMAP-ALIGNMENT ``SubmapAlignmentFactor(H^m_a, H^n_b, rho_m, rho_n, log_s)`` on each shared camera --
+        the author's §3 CustomFactor (backend.factors): a PURE-SCALING residual (§14.2) tight on the 6 SE(3)
+        dims (the shared camera coincides), whose s_hat = exp((rho_m - rho_n) - log_s) is formed from the rho
+        VARIABLES so the two-scale coupling is EXACT (not the stock-between init-rho approximation).
 
     The metric-anchor CustomFactors (per frame) are the author's core; off here. Returns ``(graph, values)``.
     """
@@ -519,31 +636,71 @@ def build_submap_graph(inputs: SubmapGraphInputs, *, rel_sigma: float = 1e-2, al
         for j in range(len(sm.frame_idx)):
             values.insert(_HM(sm.id, j), _sim3(sm.init_R[j], sm.init_t[j], sm.init_s[j]))
         values.insert(_RHO_M(sm.id), float(sm.log_r))
+    if use_anchors and apply_metric_init:                        # place the init in the metric basin (GT-free)
+        metric_init(inputs, values)
 
+    from nuslam.backend.factors import (SubmapAlignmentFactor, HorizontalGaugeFactor, EgoOnGroundFactor,
+                                         GroundAnchorSim3Factor, UprightGaugeFactor)
     rel_noise = gtsam.noiseModel.Isotropic.Sigma(7, rel_sigma)
-    s0 = inputs.submaps[0]                                            # gauge prior on the very first pose
-    graph.add(gtsam.PriorFactorSimilarity3(_HM(s0.id, 0), _sim3(s0.init_R[0], s0.init_t[0], s0.init_s[0]), _gauge_noise()))
+    s0 = inputs.submaps[0]                                            # gauge on the very first pose
+    if use_anchors:
+        # anchors present -> horizontal-translation + heading gauge only (x,y,yaw); ground sets z/roll/pitch,
+        # ego sets scale. Replaces the scale-fixing prior, which would fight the ground for z/roll/pitch.
+        horiz_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([horiz_pos_sigma, horiz_pos_sigma, horiz_head_sigma, horiz_head_sigma]))
+        graph.add(HorizontalGaugeFactor(_HM(s0.id, 0), horiz_noise).as_custom_factor())
+        # soft UPRIGHT constraint on the first pose's DOWN axis (roll/pitch only). Removes the zero-cost
+        # collapse minimum: at s->0 the ground factors vanish and free the global roll/pitch, letting
+        # rotation null the ego lever. Pinning the down axis toward vertical denies that freedom, soft
+        # enough not to fight the ground's roll/pitch at the true (near-upright) solution. Scale-, yaw- and
+        # position-invariant, so it never touches what the other anchors resolve.
+        if first_pose_rot_sigma is not None:   # OFF by default: the metric init handles the collapse basin,
+            # so the upright factor is redundant (identical ATE with/without). Kept as an option for robustness.
+            graph.add(UprightGaugeFactor(_HM(s0.id, 0),
+                                         gtsam.noiseModel.Isotropic.Sigma(2, first_pose_rot_sigma)).as_custom_factor())
+    else:                                                            # anchor-free: full scale-fixing gauge prior
+        graph.add(gtsam.PriorFactorSimilarity3(_HM(s0.id, 0), _sim3(s0.init_R[0], s0.init_t[0], s0.init_s[0]), _gauge_noise()))
     for sm in inputs.submaps:
         for j in range(1, len(sm.frame_idx)):                        # within-submap COLMAP relatives
             meas = _sim3(sm.rel_R[j - 1], sm.rel_t[j - 1], 1.0)      # (1, rel_R, rel_t) = H^m_{j-1}^{-1} H^m_j
             graph.add(gtsam.BetweenFactorSimilarity3(_HM(sm.id, j - 1), _HM(sm.id, j), meas, rel_noise))
         graph.add(gtsam.PriorFactorDouble(_RHO_M(sm.id), float(sm.log_r),      # per-window depth-ratio (log-space MAD)
                                           gtsam.noiseModel.Isotropic.Sigma(1, sm.log_r_sigma)))
-    for o in inputs.overlaps:                                        # submap-alignment: pure scaling (s_hat, I, 0)
-        # s_hat = s_n/s_m at the shared camera. NOT the raw DA3 ratio: the two-scale model (§14.3) makes
-        # s_m e^{rho_m} z_da3_m = s_n e^{rho_n} z_da3_n at a shared point, so s_n/s_m = e^{rho_m-rho_n}*(z_da3_m/
-        # z_da3_n) = exp((log_r_m - log_r_n) - log_s). Uses the INIT rho here (stock BetweenFactorSimilarity3);
-        # the EXACT factor couples the rho_m/rho_n VARIABLES -> backend.factors.SubmapAlignmentFactor (author §3).
-        s_hat = float(np.exp((inputs.submaps[o.m].log_r - inputs.submaps[o.n].log_r) - o.log_s))
-        meas = _sim3(np.eye(3), np.zeros(3), s_hat)
+    for o in inputs.overlaps:                                        # submap-alignment: pure scaling, EXACT
+        # The measurement s_hat = s_n/s_m at the shared camera is NOT the raw DA3 ratio: the two-scale model
+        # (§14.3) makes s_m e^{rho_m} z_da3_m = s_n e^{rho_n} z_da3_n at a shared point, so s_n/s_m =
+        # e^{rho_m-rho_n}*(z_da3_m/z_da3_n) = exp((rho_m - rho_n) - log_s). SubmapAlignmentFactor forms that
+        # s_hat from the rho_m/rho_n VARIABLES inside its residual (so the coupling is exact, not the init-rho
+        # approximation of a stock BetweenFactorSimilarity3); we pass only the constant log_s = log DA3(n)/DA3(m).
         align_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([align_pose_sigma] * 6 + [max(o.log_s_sigma, 1e-3)]))
         for ml, nl in zip(o.m_local, o.n_local):
-            graph.add(gtsam.BetweenFactorSimilarity3(_HM(o.m, int(ml)), _HM(o.n, int(nl)), meas, align_noise))
+            graph.add(SubmapAlignmentFactor(_HM(o.m, int(ml)), _HM(o.n, int(nl)),
+                                            _RHO_M(o.m), _RHO_M(o.n), o.log_s, align_noise).as_custom_factor())
 
-    # ==== §3 AUTHOR: metric anchors, per submap+frame -- GroundAnchorSim3Factor(_HM(m,j), _RHO_M(m)) +
-    # EgoOnGroundFactor(_HM(m,j)); OFF here. With them present, every submap's scale is observable from
-    # its own road plane + camera height (§14.6), so the submap-alignment becomes a consistency check and
-    # the gauge prior relaxes to horizontal-translation + rotation only (see _gauge_noise).
+    # ==== metric anchors, per submap+frame (§14.4): ego-height (scale) + RANSAC-gated ground (z/roll/pitch).
+    if use_anchors:
+        ego_noise = gtsam.noiseModel.Isotropic.Sigma(1, ego_sigma)
+        huber = gtsam.noiseModel.mEstimator.Huber.Create(1.345)   # robust against residual road-mask bleed
+        s2e = inputs.sensor2ego
+        for sm in inputs.submaps:
+            for j in range(len(sm.frame_idx)):
+                graph.add(EgoOnGroundFactor(_HM(sm.id, j), s2e, ego_noise).as_custom_factor())
+                rays = np.asarray(sm.ground_rays[j], float); depths = np.asarray(sm.ground_depths[j], float)
+                if len(rays) < 3: continue                       # skip weakly-supported frames
+                P = depths[:, None] * rays                       # camera-frame road points (metric up to window scale)
+                inl = _ransac_ground_inliers(P, thresh=ground_ransac_thresh)
+                idx = np.where(inl)[0]
+                if len(idx) > max_ground_per_frame:              # subsample the inliers to keep the graph light
+                    idx = idx[np.linspace(0, len(idx) - 1, max_ground_per_frame).astype(int)]
+                if len(idx) == 0: continue
+                # NORMALIZE by point count: scale sigma by sqrt(N) so the frame's N ground factors carry a
+                # FIXED total information (= one constraint at ground_sigma), independent of how many road
+                # pixels survived. Without this the ground weight grows with N and drowns the per-frame ego.
+                gsig = ground_sigma * np.sqrt(len(idx))
+                gnoise = gtsam.noiseModel.Robust.Create(huber, gtsam.noiseModel.Isotropic.Sigma(1, gsig))
+                for k in idx:
+                    graph.add(GroundAnchorSim3Factor(_HM(sm.id, j), _RHO_M(sm.id),
+                                                     rays[k], float(depths[k]), gnoise).as_custom_factor())
     return graph, values
 
 
