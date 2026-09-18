@@ -850,19 +850,26 @@ is no incremental relinearization. The standard answer is a **factor graph** —
 poses, scales) tied by **factors** (measurements, each a residual with a noise model), solved by
 sparse nonlinear least squares (GTSAM / Levenberg–Marquardt here, iSAM2 later).
 
-The submap structure follows **VGGT-SLAM**. VGGT-SLAM (1.0) does dense SLAM over feed-forward VGGT
-reconstructions by splitting the stream into overlapping **submaps** and aligning them on their shared
-frames — but, being uncalibrated feed-forward, it aligns in **SL(4)** (a projective homography per
-submap) and inherits the full projective ambiguity: no metric, no gravity. The **2.0** architecture
-replaces the projective alignment with **Sim(3)** — one similarity per pose, an overlap frame carried
-as **two** variables (one per submap) tied by an alignment factor — which is calibrated and
-scale-aware but still up-to-a-global-scale.
+The submap structure follows **VGGT-SLAM**. VGGT-SLAM 1.0 ([Maggio et al., *Dense RGB SLAM Optimized on
+the SL(4) Manifold*](https://arxiv.org/abs/2505.12549)) does dense SLAM over feed-forward VGGT
+reconstructions by splitting the stream into overlapping submaps and aligning them — but, being
+uncalibrated, it optimizes **15-DoF SL(4)** homographies between submaps and inherits the full projective
+ambiguity (no metric, no gravity). VGGT-SLAM 2.0 ([*Real-Time Dense Scene
+Reconstruction*, arXiv:2601.19887](https://arxiv.org/abs/2601.19887)) **keeps the SL(4) factor graph** but
+removes the 15-DoF drift *by construction*: consecutive submaps share a single **common keyframe** (the
+last of one is the first of the next), which by construction has the **same pose and camera
+calibration**, so the alignment is constrained to a subset of SL(4) rather than a free 15-DoF fit. It
+stays on SL(4) — it does **not** switch to Sim(3).
 
-This work adopts the VGGT-SLAM 2.0 submap-and-Sim(3) skeleton and makes it **monocular and metric**:
-each submap is reconstructed independently (per-window COLMAP for up-to-scale poses + DA3-Base depth +
-DAQ metric upgrade), and the global scale gauge is broken **from semantics** — a road-plane ground
-anchor plus the known camera-mounting height — inside the graph itself. That semantic-metric anchor in
-a Sim(3) submap graph is the contribution; the alignment machinery is adapted, not invented.
+This work adopts 2.0's **single-shared-keyframe (one-frame) overlap** structure, but because we have
+**known intrinsics** and the DAQ metric upgrade, the projective mismatch is already gone — so *our*
+submap-alignment variables collapse from SL(4) to **Sim(3)** (7-DoF), the reduction VGGT-SLAM cannot make
+while uncalibrated. On top of that, the global scale gauge is broken **from semantics** — a road-plane
+ground anchor plus the known camera-mounting height — inside the graph, and each submap is reconstructed
+independently (per-window COLMAP + DA3-Base + DAQ) so the shared boundary frame is reconstructed twice
+and carried as **two** Sim(3) variables tied by the alignment factor. The Sim(3) reduction and the
+semantic-metric anchor are the contribution; the submap-and-shared-keyframe skeleton is adapted from
+VGGT-SLAM 2.0.
 
 ### Submap architecture
 
@@ -1083,8 +1090,16 @@ of it, but a tighter road label (or an explicit curb/kerb exclusion) is the clea
   depth variance + camera-height variance; see "Ground-plane pre-alignment"), which also returns a
   covariance on $(g,s)$. De-risked with the explicit pre-alignment above; **not yet** folded into the
   joint optimization.
-- Factor-graph SLAM — lift the batch optimization into a GTSAM/iSAM2 graph with the render as a
-  factor, plus IMU/GPS/wheel fusion and loop closure.
+- Factor-graph SLAM — the **submap Sim(3) metric factor graph is built and evaluated** (GTSAM; see
+  "Metric factor-graph SLAM"): 5 submaps, 1-frame overlap, semantic-ground + ego-height anchors, GT-free
+  metric init, **se2 ATE 2.38 m** on `scene-0061` with scale locked to ~9%. Near-term on it: tighter road
+  masks / kerb exclusion (the SAM3 bleed that concentrates the residual scale error in the last submap),
+  a wheel-contact anchor beside the camera height, and inverse-covariance ground weighting. Still the
+  parked extension — each a standard factor on the same Sim(3) variables at no structural cost: the
+  **3DGS render as a factor** (one term among several, never the sole pose authority — §"Pose
+  refinement" shows it fails alone), **IMU** (gravity→roll/pitch, gyro→yaw — the DoF that drift under
+  photometric pose-opt), **wheel odometry**, robustified **GPS** as a drift correction (not a scale
+  source — the GPS-free claim survives), **loop closure**, and the lift from batch LM to **iSAM2**.
 
 ## How to run
 
